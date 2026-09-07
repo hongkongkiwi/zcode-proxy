@@ -1,0 +1,26 @@
+# 运行时数据（含账号凭证，绝不提交）
+data/
+*.db
+*.db-*
+
+# 日志
+*.log
+server.log
+
+# 构建产物
+*.exe
+*.exe~
+*.dll
+*.so
+
+# 运行时生成的配置
+config/config.json
+
+# 参考仓库（他人代码，不入库）
+refs/
+
+# 编辑器/系统
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

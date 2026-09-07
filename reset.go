@@ -1,0 +1,314 @@
+package main
+
+import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"io"
+	"log"
+	"net/http"
+	"time"
+
+	"github.com/google/uuid"
+)
+
+// ---- Coding Plan 配额手动重置（app.asar 审计发现）----
+// base = zcode.z.ai；仅付费 Coding Plan 账号可用（Start Plan 返回 3101）。
+// 额度耗尽时可消耗「5 小时窗口重置」或「周重置」机会恢复配额。
+// 请求头（createCodingPlanResetHeaders 移植）：
+//   Authorization: Bearer <zcodejwttoken>
+//   X-Bigmodel-Authorization: <coding-plan apiKey>
+//   Bigmodel-Target-Type: PERSONAL | TEAM（TEAM 时附 Organization/Project）
+
+const CodingPlanResetBase = "https://zcode.z.ai/api/v1/coding-plan/reset"
+
+// ResetSlot 重置机会槽位
+type ResetSlot struct {
+	ExpireAt int64 `json:"expire_at"`
+}
+
+// ResetUsed 重置历史
+type ResetUsed struct {
+	UsedAt int64 `json:"used_at"`
+}
+
+// ResetStatus 重置状态
+type ResetStatus struct {
+	AvailableFiveHourResets  []ResetSlot `json:"available_five_hour_resets"`
+	AvailableWeekResets      []ResetSlot `json:"available_week_resets"`
+	LatestFiveHourReset      *ResetUsed  `json:"latest_five_hour_reset_history"`
+	LatestWeekReset          *ResetUsed  `json:"latest_week_reset_history"`
+	HasUnreadHistory         bool        `json:"has_unread_history"`
+}
+
+// resetHeaders AC() 移植：双凭证 + 团队上下文
+func (z *ZCodeAPI) resetHeaders(a *Account) map[string]string {
+	h := map[string]string{
+		"Authorization": "Bearer " + a.ZCodeJWT,
+		"User-Agent":    "ZCode/" + z.appVersion,
+		"accept":        "application/json",
+	}
+	if a.APIKey != "" {
+		h["X-Bigmodel-Authorization"] = a.APIKey
+	}
+	// 团队上下文：账号备注/分组中以 team:orgId:projId 形式声明时启用
+	if org, proj, ok := parseTeamContext(a); ok {
+		h["Bigmodel-Target-Type"] = "TEAM"
+		h["Bigmodel-Organization"] = org
+		h["Bigmodel-Project"] = proj
+	} else {
+		h["Bigmodel-Target-Type"] = "PERSONAL"
+	}
+	return h
+}
+
+// parseTeamContext 从账号备注解析 team:<orgId>:<projId>
+func parseTeamContext(a *Account) (org, proj string, ok bool) {
+	var t struct {
+		Team struct {
+			Org  string `json:"org"`
+			Proj string `json:"proj"`
+		} `json:"team"`
+	}
+	if a.Remark != "" && json.Unmarshal([]byte(a.Remark), &t) == nil && t.Team.Org != "" && t.Team.Proj != "" {
+		return t.Team.Org, t.Team.Proj, true
+	}
+	return "", "", false
+}
+
+func (z *ZCodeAPI) resetRequest(a *Account, method, path string, body map[string]interface{}) (map[string]interface{}, int, error) {
+	var reader io.Reader
+	if body != nil {
+		b, _ := json.Marshal(body)
+		reader = bytes.NewReader(b)
+	}
+	urlStr := CodingPlanResetBase + path
+	req, err := http.NewRequest(method, urlStr, reader)
+	if err != nil {
+		return nil, 0, err
+	}
+	for k, v := range z.resetHeaders(a) {
+		req.Header.Set(k, v)
+	}
+	if body != nil {
+		req.Header.Set("content-type", "application/json")
+	}
+	client := ClientForURL(z.egress.ProxyURLForAccount(a), urlStr, 15*time.Second)
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	var v map[string]interface{}
+	json.Unmarshal(raw, &v)
+	return v, resp.StatusCode, nil
+}
+
+// FetchResetStatus GET reset/status
+func (z *ZCodeAPI) FetchResetStatus(a *Account) (*ResetStatus, int, string, error) {
+	if a.ZCodeJWT == "" {
+		return nil, 0, "", fmt.Errorf("需要 ZCode JWT")
+	}
+	v, status, err := z.resetRequest(a, "GET", "/status", nil)
+	if err != nil {
+		return nil, status, "", err
+	}
+	code := jsonInt(v, "code")
+	if code != 0 {
+		return nil, status, firstNonEmpty(jsonStr(v, "msg"), jsonStr(v, "message")), fmt.Errorf("业务码 %d: %s", code, firstNonEmpty(jsonStr(v, "msg"), jsonStr(v, "message")))
+	}
+	data, _ := v["data"].(map[string]interface{})
+	if data == nil {
+		return nil, status, "", fmt.Errorf("响应缺少 data")
+	}
+	raw, _ := json.Marshal(data)
+	var st ResetStatus
+	json.Unmarshal(raw, &st)
+	return &st, status, "", nil
+}
+
+// UseReset POST reset/use {idempotency_key, reset_type}
+func (z *ZCodeAPI) UseReset(a *Account, resetType string) (bool, int64, string, error) {
+	idem := uuid.NewString()
+	v, _, err := z.resetRequest(a, "POST", "/use", map[string]interface{}{
+		"idempotency_key": idem,
+		"reset_type":      resetType,
+	})
+	if err != nil {
+		return false, 0, "", err
+	}
+	code := jsonInt(v, "code")
+	msg := firstNonEmpty(jsonStr(v, "msg"), jsonStr(v, "message"))
+	if code != 0 {
+		return false, 0, msg, fmt.Errorf("业务码 %d: %s", code, msg)
+	}
+	data, _ := v["data"].(map[string]interface{})
+	used := false
+	if d, ok := data["used"].(bool); ok {
+		used = d
+	}
+	return used, 0, msg, nil
+}
+
+// RequestResetOpportunity POST reset/opportunity（3301=机会授予）
+func (z *ZCodeAPI) RequestResetOpportunity(a *Account) (granted bool, nextTry int64, msg string, err error) {
+	idem := uuid.NewString()
+	v, status, err := z.resetRequest(a, "POST", "/opportunity", map[string]interface{}{
+		"idempotency_key": idem,
+	})
+	if err != nil {
+		return false, 0, "", err
+	}
+	if status == 429 {
+		return false, 0, "重置机会请求被限流", fmt.Errorf("HTTP 429 throttled")
+	}
+	code := jsonInt(v, "code")
+	data, _ := v["data"].(map[string]interface{})
+	if d, ok := data["granted"].(bool); ok && d {
+		return true, 0, firstNonEmpty(jsonStr(v, "msg"), "机会已授予"), nil
+	}
+	if d, ok := data["granted"].(bool); ok && !d {
+		if n := jsonNum(data, "next_try_at"); n != nil {
+			return false, int64(*n) * 1000, "机会未授予", nil
+		}
+		return false, 0, "机会未授予", nil
+	}
+	if code == 3301 {
+		return true, 0, "机会已授予（3301）", nil
+	}
+	return false, 0, firstNonEmpty(jsonStr(v, "msg"), jsonStr(v, "message")), fmt.Errorf("业务码 %d", code)
+}
+
+// ResetForAccount 组合流程：查状态 → 选 five_hour 优先否则 week → use → 刷新额度 → 落记录。
+// 账号级互斥：手动 + cron 并发时不会双重消耗重置机会。
+func (z *ZCodeAPI) ResetForAccount(a *Account) *ClaimResult {
+	mu := z.claimLockFor(a.ID)
+	if !mu.TryLock() {
+		return &ClaimResult{Code: -1, Message: "该账号已有领取/重置任务在执行中（本地互斥）"}
+	}
+	defer mu.Unlock()
+	return z.resetForAccountLocked(a)
+}
+
+func (z *ZCodeAPI) resetForAccountLocked(a *Account) *ClaimResult {
+	record := &ClaimRecord{AccountID: a.ID, Email: a.Email, TaskType: "reset"}
+	st, _, bizMsg, err := z.FetchResetStatus(a)
+	if err != nil {
+		record.Message = fmt.Sprintf("重置状态查询失败: %v", err)
+		if bizMsg != "" {
+			record.Message = bizMsg
+		}
+		z.db.InsertClaimRecord(record)
+		return &ClaimResult{Code: -1, Message: record.Message}
+	}
+	resetType := ""
+	switch {
+	case len(st.AvailableFiveHourResets) > 0:
+		resetType = "five_hour"
+	case len(st.AvailableWeekResets) > 0:
+		resetType = "week"
+	}
+	if resetType == "" {
+		record.Success = true
+		record.Message = "无可用重置机会（five_hour/week 均已用完）"
+		z.db.InsertClaimRecord(record)
+		return &ClaimResult{OK: true, Message: record.Message}
+	}
+	used, _, msg, err := z.UseReset(a, resetType)
+	if err != nil || !used {
+		record.Message = fmt.Sprintf("重置执行失败(%s): %v %s", resetType, err, msg)
+		z.db.InsertClaimRecord(record)
+		z.db.SetAccountClaimResult(a.ID, "配额重置", record.Message)
+		return &ClaimResult{Code: -1, Message: record.Message}
+	}
+	record.Success = true
+	record.PlanName = "配额重置(" + resetType + ")"
+	record.Message = "重置成功，配额已恢复"
+	z.db.InsertClaimRecord(record)
+	z.db.SetAccountClaimResult(a.ID, record.PlanName, record.Message)
+	log.Printf("[reset] account %s quota reset via %s", a.Email, resetType)
+	go func() {
+		time.Sleep(2 * time.Second)
+		z.RefreshAccountQuota(a)
+	}()
+	return &ClaimResult{OK: true, PlanName: record.PlanName, Message: record.Message}
+}
+
+// ---- 官方模型目录同步（client/configs）----
+
+// CatalogModel 目录模型
+type CatalogModel struct {
+	ModelID       string `json:"modelId"`
+	Name          string `json:"name"`
+	ContextWindow int    `json:"contextWindow"`
+	Priority      int    `json:"priority"`
+	Vision        bool   `json:"vision"`
+}
+
+// SyncModelCatalog 拉取官方模型目录（builtinModels）并刷新 captcha 配置缓存
+func (z *ZCodeAPI) SyncModelCatalog() ([]CatalogModel, error) {
+	urlStr := fmt.Sprintf("%s?version=%s&os=%s", ClientConfigsURL, z.appVersion, NodePlatform())
+	client := ClientForURL("", urlStr, 20*time.Second)
+	req, _ := http.NewRequest("GET", urlStr, nil)
+	id := NewClientIdentity(z.appVersion, "")
+	for k, v := range ZaiClientHeaders(id) {
+		req.Header.Set(k, v)
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+	var v struct {
+		Code int    `json:"code"`
+		Msg  string `json:"msg"`
+		Data struct {
+			BuiltinModels []CatalogModel `json:"builtinModels"`
+			Providers     []struct {
+				ID      string `json:"id"`
+				BaseURL string `json:"baseUrl"`
+				Models  []CatalogModel `json:"models"`
+			} `json:"providers"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(raw, &v); err != nil {
+		return nil, fmt.Errorf("目录解析失败: %w", err)
+	}
+	if v.Code != 0 {
+		return nil, fmt.Errorf("业务码 %d: %s", v.Code, v.Msg)
+	}
+	models := v.Data.BuiltinModels
+	if len(models) == 0 {
+		for _, p := range v.Data.Providers {
+			models = append(models, p.Models...)
+		}
+	}
+	// 缓存目录 + 去重
+	seen := map[string]bool{}
+	var uniq []CatalogModel
+	for _, m := range models {
+		if m.ModelID == "" || seen[m.ModelID] {
+			continue
+		}
+		seen[m.ModelID] = true
+		uniq = append(uniq, m)
+	}
+	if cj, err := json.Marshal(uniq); err == nil {
+		z.db.SetSetting("model_catalog", string(cj))
+	}
+	log.Printf("[catalog] synced %d models from client/configs", len(uniq))
+	return uniq, nil
+}
+
+// GetModelCatalog 读取缓存目录
+func (z *ZCodeAPI) GetModelCatalog() []CatalogModel {
+	raw, _ := z.db.GetSetting("model_catalog")
+	if raw == "" {
+		return nil
+	}
+	var out []CatalogModel
+	json.Unmarshal([]byte(raw), &out)
+	return out
+}
