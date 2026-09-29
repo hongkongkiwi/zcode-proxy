@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"regexp"
 	"runtime"
 	"strings"
 	"sync"
@@ -28,7 +29,7 @@ const (
 	zcodeOrigin       = "https://zcode.z.ai"
 	zcodeLang         = "zh-CN"
 	zcodeChannel      = "stable"
-	fallbackAppVer    = "3.11.2"
+	fallbackAppVer    = "3.14.4"
 	screenResolution  = "2560x1440"
 	anthropicVersionH = "2023-06-01"
 )
@@ -124,12 +125,47 @@ func detectOSVersion() string {
 	return "10.0.19044"
 }
 
-// DetectZCodeAppVersion 从注册表卸载信息探测已安装 ZCode 版本（zcode-switch 同款逻辑），
-// 找不到时回退内置版本号。
+// DetectZCodeAppVersion 探测已安装 ZCode 客户端版本：Windows 读注册表卸载信息
+// （zcode-switch 同款逻辑），macOS 读 /Applications/ZCode.app 的 Info.plist，
+// 找不到时回退内置版本号（与官方 zai-org/ZCode 当前发布版本对齐）。
 func DetectZCodeAppVersion() string {
-	if runtime.GOOS != "windows" {
-		return fallbackAppVer
+	switch runtime.GOOS {
+	case "windows":
+		if v := detectWindowsAppVersion(); v != "" {
+			return v
+		}
+	case "darwin":
+		if v := detectDarwinAppVersion(); v != "" {
+			return v
+		}
 	}
+	return fallbackAppVer
+}
+
+// detectDarwinAppVersion 从应用包 Info.plist 读取 CFBundleShortVersionString
+func detectDarwinAppVersion() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		home = ""
+	}
+	paths := []string{
+		"/Applications/ZCode.app/Contents/Info.plist",
+		home + "/Applications/ZCode.app/Contents/Info.plist",
+	}
+	re := regexp.MustCompile(`CFBundleShortVersionString</key>\s*<string>([0-9]+(?:\.[0-9]+)+)</string>`)
+	for _, path := range paths {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			continue
+		}
+		if m := re.FindSubmatch(data); m != nil {
+			return normalizeVersion(string(m[1]))
+		}
+	}
+	return ""
+}
+
+func detectWindowsAppVersion() string {
 	hives := []string{
 		`HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall`,
 		`HKLM\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall`,
@@ -166,7 +202,7 @@ func DetectZCodeAppVersion() string {
 			return normalizeVersion(ver)
 		}
 	}
-	return fallbackAppVer
+	return ""
 }
 
 func stripPrefix(s, prefix string) (string, bool) {
@@ -228,17 +264,17 @@ func LocalDeviceMid() string {
 func ZaiClientHeaders(id ClientIdentity) map[string]string {
 	clientInfoOnce.Do(initClientInfo)
 	h := map[string]string{
-		"User-Agent":         "ZCode/" + id.AppVersion,
-		"HTTP-Referer":       zcodeOrigin,
-		"X-Title":            "Z Code@electron",
+		"User-Agent":          "ZCode/" + id.AppVersion,
+		"HTTP-Referer":        zcodeOrigin,
+		"X-Title":             "Z Code@electron",
 		"X-ZCode-App-Version": id.AppVersion,
-		"X-Platform":         cachedPlatform,
-		"X-Release-Channel":  zcodeChannel,
-		"X-Client-Language":  zcodeLang,
-		"X-Client-Timezone":  cachedTZ,
-		"X-Os-Category":      cachedOSCat,
-		"x-request-id":       id.RequestID,
-		"Content-Type":       "application/json",
+		"X-Platform":          cachedPlatform,
+		"X-Release-Channel":   zcodeChannel,
+		"X-Client-Language":   zcodeLang,
+		"X-Client-Timezone":   cachedTZ,
+		"X-Os-Category":       cachedOSCat,
+		"x-request-id":        id.RequestID,
+		"Content-Type":        "application/json",
 	}
 	if cachedOSVer != "" {
 		h["X-Os-Version"] = cachedOSVer

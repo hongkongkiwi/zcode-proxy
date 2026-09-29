@@ -160,7 +160,7 @@ Go 单二进制实现的 **ZCode（Z.AI / GLM Coding Plan）多账号管理 + OA
 ## 2. `/v1/messages` 请求生命周期
 
 1. **鉴权**：`x-api-key` 或 `Authorization: Bearer` → 与 DB `settings.api_key` 做 `subtle.ConstantTimeCompare`。
-2. **规范化**：模型名大小写/前缀映射（`glm-5.3`→`GLM-5.3`、`bigmodel/x`→provider 路由）；GLM-5.3 强制注入 `thinking{type:enabled,budget}` + `reasoning_effort:max`（上游不允许禁思考）；string content 桥接为 `[{type:text}]`；body 上限 8MB。
+2. **规范化**：模型名大小写/前缀映射（`glm-5.3`→`GLM-5.3`、`bigmodel/x`→provider 路由）；GLM-5.3 思考归一化为上游现行格式（对齐 zai-org/ZCode 3.14.x）：思考开启 → `{thinking:{type:adaptive},output_config:{effort:low|high|max}}`（由 budget_tokens/reasoning_effort 映射），未请求思考 → `{thinking:{type:disabled}}`；string content 桥接为 `[{type:text}]`；body 上限 8MB。
 3. **选号**：`AccountPool.Select(provider, group, skip)` 按策略（round_robin 游标 / random / best_quota）过滤 `enabled && 状态可选 && 有凭证`；冷却中账号到期自动可选。
 4. **降级链**（每账号）：
    - 路径1 `JWT + X-Aliyun-Captcha-Verify-Param` → `zcode.z.ai/.../anthropic/v1/messages`（验证码被拒则失效缓存重解，最多 3 次；无验证码参数（mode=off 或求解失败）时跳过）；
@@ -201,8 +201,8 @@ Go 单二进制实现的 **ZCode（Z.AI / GLM Coding Plan）多账号管理 + OA
 |---|---|---|
 | 消息（免费通道） | `POST zcode.z.ai/api/v1/zcode-plan/anthropic/v1/messages` | Bearer JWT + 验证码头 |
 | 消息（Key 通道） | `POST api.z.ai/api/anthropic/v1/messages` | `x-api-key` |
-| 额度 | `GET zcode.z.ai/api/v1/zcode-plan/billing/current|balance?app_version=` | Bearer JWT |
-| Key 通道额度 | `GET api.z.ai/api/monitor/usage/quota/limit` + `/api/biz/subscription/list` | Bearer key |
+| 额度 | `GET zcode.z.ai/api/v1/zcode-plan/billing/balance?app_version=`（现行端点；`billing/current` 已废弃仅兜底） | Bearer JWT |
+| Key 通道额度 | `GET api.z.ai/api/monitor/usage/quota/limit` + `/api/biz/subscription/list` | Authorization 直传 Key（无 Bearer 前缀，对齐官方客户端） |
 | 活动预览 | `GET zcode.z.ai/api/v1/zcode-plan/billing/preview?app_version&platform` | Bearer JWT |
 | 领取 | `POST zcode.z.ai/api/v1/zcode-plan/billing/claim` `{plan_id}` | Bearer JWT + 验证码头 |
 | 激活 | `POST zcode.z.ai/api/v1/event/report`（app_launch + app_daily_active） | Bearer JWT |
@@ -214,7 +214,7 @@ Go 单二进制实现的 **ZCode（Z.AI / GLM Coding Plan）多账号管理 + OA
 ### 5.2 请求头（与官方客户端一致）
 
 身份头：`User-Agent: ZCode/{ver}`、`X-ZCode-App-Version`、`X-Title: Z Code@electron`、`X-Platform: win32-x64`、`X-Release-Channel: stable`、`X-Client-Language`(Intl locale)、`X-Client-Timezone`(Intl tz)、`X-Os-Category`(win32→windows)、`X-Os-Version`(10.0.build)、`X-Device-Mid`(telemetry-state.json)、`x-request-id`(uuid)。
-消息通道追加：`anthropic-version: 2023-06-01`、`X-ZCode-Agent: glm`、`HTTP-Referer: https://zcode.z.ai`、`X-Aliyun-Captcha-Verify-Param`(+Region)。
+消息通道追加：`anthropic-version: 2023-06-01`、`X-ZCode-Agent: glm`、`HTTP-Referer: https://zcode.z.ai`、`X-Aliyun-Captcha-Verify-Param`(+Region)（注：官方客户端 3.14.x 已移除模型请求验证码，该头仅在 `client/configs` 报告 captcha.enabled 时发送）。
 
 ### 5.3 错误码语义
 
@@ -239,6 +239,8 @@ Go 单二进制实现的 **ZCode（Z.AI / GLM Coding Plan）多账号管理 + OA
 - **健壮性**：SSE 解析缓冲上限 16MB（超限按流失败处理，不静默清空）、跨 chunk 断帧兼容 LF/CRLF；命名 `event:error`、匿名 `data:` 错误帧（顶层 `error` 字段或 `type=error`）与 `err!=io.EOF` 均按失败处理（不伪装成功）。
 
 ## 7. 验证码子系统（阿里云无痕）
+
+> 官方客户端自 3.14.3 起源码中已无任何验证码逻辑（模型请求免验证），本子系统仅在 `client/configs` 报告 `captcha.enabled` 时参与请求，否则自动跳过；保留用于领取等仍可能触发的场景。
 
 - 配置：`client/configs` → `{enabled,prefix,region,sceneId}`，缓存 10min。
 - 求解：rod 启动**本机真实 Chrome/Edge**（捆绑 Chromium 会被风控识别），先访问 `zcode.z.ai` 建立同源，注入 SDK HTML（配置值经 JSON 转义防注入），`startTracelessVerification` → `__onCaptcha` 回调捕获 param；持久化 user-data-dir 保留风控 cookie。
@@ -281,7 +283,8 @@ go vet .
 - utls v1.8.2 无法表达 PQ 曲线 4588 与新 ALPS id（17613），自定义 JA3 的 key_share 仅 X25519；
 - OAuth 环回 redirect_uri 未被 Z.AI 注册（`Redirect URI not registered`），默认手动粘贴模式；
 - 多出口代理下验证码参数按代理分组缓存，跨组不共享；
-- `/v1/messages/count_tokens` 为保守估算（字符/4+开销）。
+- `/v1/messages/count_tokens` 为保守估算（字符/4+开销；官方客户端 3.14.x 已不调用该端点，仅为兼容保留）。
+- GLM-5.3 思考参数对上游按官方 3.14.x wire 格式发送（`thinking:{type:adaptive}` + `output_config.effort`）；上游若回退旧版可能需重新调整。
 - 账号包导出使用 PBKDF2 60 万轮；旧 12 万轮加密包仅支持导入（自动回退），不再生成。
 - 库内凭证已静态加密（`vault1:`），密钥默认绑定本机（平台/home/用户名）；跨机器迁移 `data/` 时请同设 `ZCODE_PROXY_VAULT_SECRET`。
 - `/async/v1/messages` 闲时通道为一次性应答、无会话记忆（上游语义）；多轮对话请在请求内携带历史。

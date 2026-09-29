@@ -14,8 +14,8 @@ import (
 
 // ---- 额度查询与归一化 ----
 // 两个通道：
-//   jwt    → zcode.z.ai /api/v1/zcode-plan/billing/current（失败再试 /billing/balance）
-//   apikey → api.z.ai /api/monitor/usage/quota/limit + /api/biz/subscription/list
+//   jwt    → zcode.z.ai /api/v1/zcode-plan/billing/balance（current 已废弃仅兜底）
+//   apikey → api.z.ai /api/monitor/usage/quota/limit + /api/biz/subscription/list（Authorization 直传 Key）
 // 归一化逻辑移植 zcode-switch quota.rs（plans/balances 双结构 + 防御式字段别名）。
 
 const (
@@ -77,14 +77,19 @@ type apiResponse struct {
 	RawText    string
 }
 
-// doGetJSON 带客户端身份头的 GET 请求
+// doGetJSON 带客户端身份头的 GET 请求（billing 端点：Bearer JWT）
 func (z *ZCodeAPI) doGetJSON(a *Account, urlStr string, extraHeaders map[string]string) (*apiResponse, error) {
-	return z.doGetJSONAuth(a, urlStr, "", extraHeaders)
+	token := z.billingToken(a)
+	if token == "" {
+		return nil, fmt.Errorf("账号缺少有效凭证")
+	}
+	return z.doGetJSONAuth(a, urlStr, "Bearer "+token, extraHeaders)
 }
 
-// doGetJSONAuth 同 doGetJSON，但显式指定 Bearer 凭证；
-// bearerToken 为空时回退 billingToken（zcode.z.ai 计费端点语义）。
-func (z *ZCodeAPI) doGetJSONAuth(a *Account, urlStr, bearerToken string, extraHeaders map[string]string) (*apiResponse, error) {
+// doGetJSONAuth 同 doGetJSON，但显式指定完整 Authorization 头值。
+// monitor 端点（quota/limit、subscription/list）要求直传 API Key、不带 Bearer 前缀
+// （对齐 zai-org/ZCode createBigModelUsageHeaders）；authValue 为空时回退 billingToken。
+func (z *ZCodeAPI) doGetJSONAuth(a *Account, urlStr, authValue string, extraHeaders map[string]string) (*apiResponse, error) {
 	client := ClientForURL(z.egress.ProxyURLForAccount(a), urlStr, 25*time.Second)
 	req, err := http.NewRequest("GET", urlStr, nil)
 	if err != nil {
@@ -94,14 +99,14 @@ func (z *ZCodeAPI) doGetJSONAuth(a *Account, urlStr, bearerToken string, extraHe
 	for k, v := range ZaiClientHeaders(id) {
 		req.Header.Set(k, v)
 	}
-	token := bearerToken
-	if token == "" {
-		token = z.billingToken(a)
+	if authValue == "" {
+		token := z.billingToken(a)
+		if token == "" {
+			return nil, fmt.Errorf("账号缺少有效凭证")
+		}
+		authValue = "Bearer " + token
 	}
-	if token == "" {
-		return nil, fmt.Errorf("账号缺少有效凭证")
-	}
-	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Authorization", authValue)
 	for k, v := range extraHeaders {
 		req.Header.Set(k, v)
 	}
@@ -232,55 +237,52 @@ func (z *ZCodeAPI) FetchQuotaRaw(a *Account) (*QuotaOverview, error) {
 	return nil, fmt.Errorf("账号缺少凭证")
 }
 
-// fetchZaiBilling JWT 通道：billing/current → billing/balance
+// fetchZaiBilling JWT 通道：billing/balance（现行端点，官方客户端唯一在用）优先，
+// billing/current 已废弃仅兜底
 func (z *ZCodeAPI) fetchZaiBilling(a *Account) (*QuotaOverview, error) {
-	urlCurrent := fmt.Sprintf("%s/billing/current?app_version=%s", BillingBaseURL, z.appVersion)
-	resp, err := z.doGetJSON(a, urlCurrent, nil)
-	if err != nil {
-		return nil, err
+	urls := []string{
+		fmt.Sprintf("%s/billing/balance?app_version=%s", BillingBaseURL, z.appVersion),
+		fmt.Sprintf("%s/billing/current?app_version=%s", BillingBaseURL, z.appVersion),
 	}
-	if resp.StatusCode == 401 || resp.StatusCode == 403 {
-		return &QuotaOverview{AuthFailed: true}, fmt.Errorf("HTTP %d 鉴权失败", resp.StatusCode)
-	}
-	if resp.Body != nil {
-		if code := jsonInt(resp.Body, "code"); code == 401 {
-			return &QuotaOverview{AuthFailed: true}, fmt.Errorf("业务码 401 令牌失效")
+	var primary, last *apiResponse
+	for i, u := range urls {
+		resp, err := z.doGetJSON(a, u, nil)
+		if err != nil {
+			return nil, err
 		}
+		if resp.StatusCode == 401 || resp.StatusCode == 403 {
+			return &QuotaOverview{AuthFailed: true}, fmt.Errorf("HTTP %d 鉴权失败", resp.StatusCode)
+		}
+		if resp.Body != nil {
+			if code := jsonInt(resp.Body, "code"); code == 401 {
+				return &QuotaOverview{AuthFailed: true}, fmt.Errorf("业务码 401 令牌失效")
+			}
+		}
+		if resp.StatusCode == 200 && businessOK(resp.Body) {
+			ov := normalizeBalanceResponse(resp.Body, "zcode.z.ai/billing")
+			ov.RefreshedAt = time.Now().Unix()
+			return ov, nil
+		}
+		if i == 0 {
+			primary = resp
+		}
+		last = resp
 	}
-	if resp.StatusCode == 200 && businessOK(resp.Body) {
-		ov := normalizeBalanceResponse(resp.Body, "zcode.z.ai/billing")
-		ov.RefreshedAt = time.Now().Unix()
-		return ov, nil
-	}
-	// current 失败 → balance 兜底
-	urlBalance := fmt.Sprintf("%s/billing/balance?app_version=%s", BillingBaseURL, z.appVersion)
-	resp2, err := z.doGetJSON(a, urlBalance, nil)
-	if err != nil {
-		return nil, err
-	}
-	if resp2.StatusCode == 401 || resp2.StatusCode == 403 {
-		return &QuotaOverview{AuthFailed: true}, fmt.Errorf("HTTP %d 鉴权失败", resp2.StatusCode)
-	}
-	if resp2.StatusCode == 200 && businessOK(resp2.Body) {
-		ov := normalizeBalanceResponse(resp2.Body, "zcode.z.ai/billing")
-		ov.RefreshedAt = time.Now().Unix()
-		return ov, nil
-	}
-	msg := extractErrMsg(resp2.Body)
+	msg := extractErrMsg(primary.Body)
 	if msg == "" {
-		msg = extractErrMsg(resp.Body)
+		msg = extractErrMsg(last.Body)
 	}
 	if strings.Contains(msg, "不存在coding plan") || strings.Contains(msg, "没有资格") {
 		return &QuotaOverview{NotEntitled: true, IsEmpty: true}, nil
 	}
 	if msg == "" {
-		msg = fmt.Sprintf("HTTP %d", resp2.StatusCode)
+		msg = fmt.Sprintf("HTTP %d", last.StatusCode)
 	}
 	return nil, fmt.Errorf("额度查询失败: %s", msg)
 }
 
 // fetchApiZaiMonitor API Key 通道：quota/limit + subscription/list
-// api.z.ai monitor 端点以 API Key（而非 JWT）鉴权（README §5.1）
+// monitor 端点以 API Key 直传 Authorization（无 Bearer 前缀，对齐官方客户端）
 func (z *ZCodeAPI) fetchApiZaiMonitor(a *Account) (*QuotaOverview, error) {
 	if a.APIKey == "" {
 		return nil, fmt.Errorf("账号缺少 API Key")

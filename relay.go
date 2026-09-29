@@ -558,35 +558,58 @@ func normalizeBody(body map[string]interface{}, z *ZCodeAPI) error {
 	return nil
 }
 
-// fixThinking GLM-5.3 强制思考模式（上游不允许禁用思考）
+// fixThinking GLM-5.3 思考模式归一化为上游现行 wire 格式（对齐 zai-org/ZCode 3.14.x）：
+// 思考开启 → {thinking:{type:"adaptive"}, output_config:{effort:"low"|"high"|"max"}}；
+// 未请求思考 → {thinking:{type:"disabled"}}。上游不再接受 budget_tokens / reasoning_effort。
 func fixThinking(body map[string]interface{}) {
 	model, _ := body["model"].(string)
 	if !strings.Contains(model, "5.3") {
 		return
 	}
-	maxTokens := 4096
-	if mt, ok := body["max_tokens"].(float64); ok {
-		maxTokens = int(mt)
-	}
-	if maxTokens < 1024 {
-		maxTokens = 1024
-	}
-	budget := 8192
-	if budget > maxTokens-1024 {
-		budget = maxTokens - 1024
-	}
-	if budget < 1024 {
-		budget = 1024
+	effort := ""
+	if e, ok := body["reasoning_effort"].(string); ok {
+		effort = normalizeEffort(e)
 	}
 	thinking, _ := body["thinking"].(map[string]interface{})
-	if thinking == nil || thinking["type"] != "enabled" {
-		thinking = map[string]interface{}{"type": "enabled", "budget_tokens": budget}
-	} else if _, ok := thinking["budget_tokens"]; !ok {
-		thinking["budget_tokens"] = budget
+	if thinking != nil {
+		if t, _ := thinking["type"].(string); t == "disabled" {
+			body["thinking"] = map[string]interface{}{"type": "disabled"}
+			delete(body, "reasoning_effort")
+			return
+		}
+		if effort == "" {
+			if b, ok := thinking["budget_tokens"].(float64); ok {
+				effort = effortFromBudget(int(b))
+			}
+		}
 	}
-	body["thinking"] = thinking
-	if _, ok := body["reasoning_effort"]; !ok {
-		body["reasoning_effort"] = "max"
+	if effort == "" {
+		effort = "high"
+	}
+	body["thinking"] = map[string]interface{}{"type": "adaptive"}
+	body["output_config"] = map[string]interface{}{"effort": effort}
+	delete(body, "reasoning_effort")
+}
+
+func normalizeEffort(e string) string {
+	switch e {
+	case "low", "minimal":
+		return "low"
+	case "max":
+		return "max"
+	default: // medium/high 等归并为 high
+		return "high"
+	}
+}
+
+func effortFromBudget(budget int) string {
+	switch {
+	case budget >= 32768:
+		return "max"
+	case budget >= 4096:
+		return "high"
+	default:
+		return "low"
 	}
 }
 
