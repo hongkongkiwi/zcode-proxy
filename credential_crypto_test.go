@@ -36,7 +36,7 @@ func TestEncV1Roundtrip(t *testing.T) {
 // TestEncV1CrossLanguageVector 与 zcode-switch 测试向量互操作
 // 向量来自 refs/zcode-switch/src-tauri/test-vectors/node-enc-v1.json（Node 客户端加密，Rust 解密验证）
 func TestEncV1CrossLanguageVector(t *testing.T) {
-	data, err := os.ReadFile(`refs\zcode-switch\src-tauri\test-vectors\node-enc-v1.json`)
+	data, err := os.ReadFile(`refs/zcode-switch/src-tauri/test-vectors/node-enc-v1.json`)
 	if err != nil {
 		// 向量文件可能不存在于浅克隆，跳过
 		t.Skipf("vector file missing: %v", err)

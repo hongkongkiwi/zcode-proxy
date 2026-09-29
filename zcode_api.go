@@ -3,12 +3,14 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -32,6 +34,8 @@ type ZCodeAPI struct {
 
 	quotaRefreshInflight sync.Map // 账号ID → 刷新中（单飞，防并发请求对 billing 形成风暴）
 
+	asyncRotation atomic.Int64 // 闲时通道轮转起点（并发请求分摊账号）
+
 	tokenRefreshInflight sync.Map // 账号ID → refresh_token 兑换中（单飞）
 }
 
@@ -50,6 +54,10 @@ func NewZCodeAPI(cfg *FileConfig, db *DB, pool *AccountPool, captcha *CaptchaSer
 	}
 	pool.SetQuotaFetcher(func(a *Account) error {
 		err := z.RefreshAccountQuota(a)
+		if errors.Is(err, errRefreshInFlight) {
+			// 并发刷新已被别的副本赢下：本周期跳过，不算失败也不烧重置同步
+			return nil
+		}
 		if n, serr := z.SyncResetHistoryFromUpstream(a); serr != nil {
 			log.Printf("[reset] 上游重置历史同步失败 account=%s: %v", a.Email, serr)
 		} else if n > 0 {
@@ -60,8 +68,16 @@ func NewZCodeAPI(cfg *FileConfig, db *DB, pool *AccountPool, captcha *CaptchaSer
 	return z
 }
 
-// RefreshAccountQuota 拉取额度 → 应用状态迁移 → 落库
+// errRefreshInFlight 已有并发刷新在跑（调用方可视为"数据正在更新"而非失败）
+var errRefreshInFlight = errors.New("quota refresh already in flight")
+
+// RefreshAccountQuota 拉取额度 → 应用状态迁移 → 落库。
+// 进程内单飞：并发触发（relay 成功后节流刷新 + 池子周期刷新）同一账号只拉一次。
 func (z *ZCodeAPI) RefreshAccountQuota(a *Account) error {
+	if _, busy := z.quotaRefreshInflight.LoadOrStore(a.ID, struct{}{}); busy {
+		return errRefreshInFlight
+	}
+	defer z.quotaRefreshInflight.Delete(a.ID)
 	ov, err := z.FetchQuotaRaw(a)
 	if err != nil {
 		return err
@@ -74,8 +90,12 @@ func (z *ZCodeAPI) RefreshAccountQuota(a *Account) error {
 func (z *ZCodeAPI) applyQuotaResult(a *Account, ov *QuotaOverview) {
 	switch {
 	case ov.AuthFailed:
-		// 凭证失效：先尝试 refresh_token 兑换新 JWT，成功则恢复而非判死
-		if z.tryRefreshAccount(a) {
+		// 凭证失效：先尝试 refresh_token 兑换新 JWT，成功（或已有并发刷新
+		// 在跑）则不判死，等下一轮用新凭证确认
+		if ok, inflight := z.tryRefreshAccount(a); ok || inflight {
+			return
+		}
+		if z.credentialsAlreadyRotated(a) {
 			return
 		}
 		z.pool.MarkInvalid(a, "额度接口鉴权失败（401/403），凭证可能已过期")
@@ -90,6 +110,18 @@ func (z *ZCodeAPI) applyQuotaResult(a *Account, ov *QuotaOverview) {
 		if a.tryRecoverActive() {
 			z.db.SetAccountStatus(a.ID, StatusActive, "", 0)
 			log.Printf("[quota] account %s recovered -> active", a.Email)
+		}
+	}
+
+	// F5：免费促销档（Start / 体验 / trial）自动降 priority，priority 策略下
+	// 促销账号先于付费账号被消费。仅首次（UseCount==0 且仍为默认值）生效，
+	// 不覆盖用户在账号编辑里的手动调整。
+	if ov.PlanTier != "" && a.UseCount == 0 && accountPriority(a) == DefaultPriority && isPromoTier(ov.PlanTier) {
+		a.Priority = PromoPriority
+		if err := z.db.UpdateAccountPriority(a.ID, PromoPriority); err != nil {
+			log.Printf("[quota] auto promo priority %s: %v", a.Email, err)
+		} else {
+			log.Printf("[quota] account %s: promo tier %q -> priority %d", a.Email, ov.PlanTier, PromoPriority)
 		}
 	}
 
@@ -112,38 +144,62 @@ func (z *ZCodeAPI) applyQuotaResult(a *Account, ov *QuotaOverview) {
 }
 
 // tryRefreshAccount 用库中 refresh_token 兑换新 JWT（每账号单飞）。
-// 成功时持久化新凭证并把账号恢复 active；任何失败返回 false，
-// 调用方沿用原 401 处理（MarkInvalid），不会更糟。
+// ok=true：兑换成功——新凭证已落库、账号已恢复 active（内存+DB）。
+// inflight=true：另一 goroutine 的刷新已在跑，结果未知——调用方暂不判死。
+// 其余失败返回 (false,false)，调用方沿用原 401 处理（MarkInvalid），不会更糟。
 // 说明：上游刷新请求形状无仓库内样例，按 token 端点的 JSON 信封风格构造；
 // 若形状不符，兑换失败并退回手动重登路径。
-func (z *ZCodeAPI) tryRefreshAccount(a *Account) bool {
+func (z *ZCodeAPI) tryRefreshAccount(a *Account) (ok, inflight bool) {
 	if a.Provider != "zai" || a.RefreshToken == "" {
-		return false
+		return false, false
 	}
 	if _, busy := z.tokenRefreshInflight.LoadOrStore(a.ID, struct{}{}); busy {
-		return false
+		return false, true
 	}
 	defer z.tokenRefreshInflight.Delete(a.ID)
 
 	data, err := z.refreshTokenRequest(a.RefreshToken)
 	if err != nil {
 		log.Printf("[oauth] refresh %s failed: %v", a.Email, err)
-		return false
+		return false, false
 	}
 	jwt := jsonStr(data, "token")
 	if jwt == "" {
 		log.Printf("[oauth] refresh %s: 响应不含新 JWT", a.Email)
-		return false
+		return false, false
 	}
 	zai, _ := data["zai"].(map[string]interface{})
 	newRefresh := firstNonEmpty(jsonStr(zai, "refresh_token"), a.RefreshToken) // 上游可能不轮换
 	newAccess := jsonStr(zai, "access_token")
 	if err := z.db.UpdateAccountTokens(a.ID, newAccess, newRefresh, jwt, "", ""); err != nil {
 		log.Printf("[oauth] refresh %s persist: %v", a.Email, err)
+		return false, false
+	}
+	// 恢复必须同时落内存与 DB：只改内存的话，DB 里的 invalid 状态会让池子在
+	// 整个退避周期内继续跳过这个刚修好的账号
+	a.setRuntime(StatusActive, "", 0)
+	a.setCredentials(newAccess, newRefresh, jwt)
+	if err := z.db.SetAccountStatus(a.ID, StatusActive, "", 0); err != nil {
+		log.Printf("[oauth] refresh %s status persist: %v", a.Email, err)
+	}
+	log.Printf("[oauth] refreshed JWT for %s via refresh_token", a.Email)
+	return true, false
+}
+
+// credentialsAlreadyRotated 本副本的 JWT 落后于库中凭证（刷新成功后才加载的
+// 旧快照赶来报 401）时为 true——不得把刚修好的账号按旧凭证判死
+func (z *ZCodeAPI) credentialsAlreadyRotated(a *Account) bool {
+	if a.ID == 0 || a.ZCodeJWT == "" {
 		return false
 	}
-	a.setRuntime(StatusActive, "", 0)
-	log.Printf("[oauth] refreshed JWT for %s via refresh_token", a.Email)
+	fresh, err := z.db.GetAccount(a.ID)
+	if err != nil || fresh == nil || fresh.ZCodeJWT == "" {
+		return false
+	}
+	if fresh.ZCodeJWT == a.ZCodeJWT {
+		return false
+	}
+	log.Printf("[quota] account %s credentials already rotated in DB; skipping invalid", a.Email)
 	return true
 }
 
@@ -230,4 +286,11 @@ func (z *ZCodeAPI) HandleModels(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{"object": "list", "data": data})
+}
+
+// isPromoTier 判断套餐档位是否属于免费促销层（自动降 priority 用）
+func isPromoTier(tier string) bool {
+	t := strings.ToLower(tier)
+	return strings.Contains(t, "start") || strings.Contains(t, "trial") ||
+		strings.Contains(t, "promo") || strings.Contains(tier, "体验")
 }

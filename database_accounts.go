@@ -43,8 +43,8 @@ func (db *DB) UpsertAccount(a *Account) (int64, error) {
 		INSERT INTO accounts (
 			user_id, email, display_name, provider, auth_type,
 			access_token, refresh_token, zcode_jwt, api_key, user_info,
-			device_mid, creds_raw, status, enabled, account_group, remark
-		) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+			device_mid, creds_raw, status, enabled, account_group, priority, remark
+		) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 		ON CONFLICT(user_id) DO UPDATE SET
 			email         = COALESCE(NULLIF(excluded.email,''), accounts.email),
 			display_name  = COALESCE(NULLIF(excluded.display_name,''), accounts.display_name),
@@ -60,11 +60,12 @@ func (db *DB) UpsertAccount(a *Account) (int64, error) {
 			status        = CASE WHEN accounts.status IN ('disabled') THEN accounts.status ELSE excluded.status END,
 			enabled       = excluded.enabled,
 			account_group = COALESCE(NULLIF(excluded.account_group,''), accounts.account_group),
+			priority      = accounts.priority,
 			remark        = COALESCE(NULLIF(excluded.remark,''), accounts.remark),
 			updated_at    = datetime('now','localtime')`,
 		a.UserID, a.Email, a.DisplayName, a.Provider, a.AuthType,
 		encAccess, encRefresh, encJWT, encAPIKey, encUserInfo,
-		a.DeviceMid, encCredsRaw, a.Status, boolInt(a.Enabled), a.AccountGroup, a.Remark); err != nil {
+		a.DeviceMid, encCredsRaw, a.Status, boolInt(a.Enabled), a.AccountGroup, accountPriority(a), a.Remark); err != nil {
 		return 0, err
 	}
 	// 冲突更新分支不会推进 last_insert_rowid，驱动返回的是连接上一次
@@ -84,9 +85,23 @@ func boolInt(b bool) int {
 	return 0
 }
 
+// DefaultPriority / PromoPriority priority 策略默认值：数值小者优先被选
+const (
+	DefaultPriority = int64(100)
+	PromoPriority   = int64(50)
+)
+
+// accountPriority 归一化：未设置/非法值回落默认
+func accountPriority(a *Account) int64 {
+	if a.Priority > 0 {
+		return a.Priority
+	}
+	return DefaultPriority
+}
+
 const accountCols = `id, user_id, email, display_name, provider, auth_type,
 	access_token, refresh_token, zcode_jwt, api_key, user_info, device_mid, creds_raw,
-	status, enabled, account_group, quota_json, plan_tier, plan_expire,
+	status, enabled, account_group, priority, quota_json, plan_tier, plan_expire,
 	total_units, used_units, remaining, use_count, fail_count,
 	last_used_at, last_checked_at, cooling_until, last_error,
 	last_claim_at, last_claim_plan, last_claim_msg, remark, created_at, updated_at`
@@ -97,7 +112,7 @@ func scanAccount(row interface{ Scan(...interface{}) error }) (*Account, error) 
 	err := row.Scan(
 		&a.ID, &a.UserID, &a.Email, &a.DisplayName, &a.Provider, &a.AuthType,
 		&a.AccessToken, &a.RefreshToken, &a.ZCodeJWT, &a.APIKey, &a.UserInfo, &a.DeviceMid, &a.CredsRaw,
-		&a.Status, &enabled, &a.AccountGroup, &a.QuotaJSON, &a.PlanTier, &a.PlanExpire,
+		&a.Status, &enabled, &a.AccountGroup, &a.Priority, &a.QuotaJSON, &a.PlanTier, &a.PlanExpire,
 		&a.TotalUnits, &a.UsedUnits, &a.Remaining, &a.UseCount, &a.FailCount,
 		&a.LastUsedAt, &a.LastCheckedAt, &a.CoolingUntil, &a.LastError,
 		&a.LastClaimAt, &a.LastClaimPlan, &a.LastClaimMsg, &a.Remark, &a.CreatedAt, &a.UpdatedAt)
@@ -192,6 +207,26 @@ func (a *Account) statusError() (string, string) {
 	return a.Status, a.LastError
 }
 
+// credentialSnapshot 锁保护地读取凭证三元组（供独立 goroutine 如异步 settle 使用，
+// 避免与 setCredentials 并发读写）
+func (a *Account) credentialSnapshot() (jwt, apiKey, deviceMid string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.ZCodeJWT, a.APIKey, a.DeviceMid
+}
+
+// setCredentials 刷新成功后就地更新内存凭证（调用方持有该实例的独占使用权：
+// 每个请求/刷新 goroutine 的 Account 都是 ListAccounts 的独立副本）。
+// 不同步内存的话，同一次刷新流程后续的上游调用（如重置历史同步）仍会
+// 拿旧 JWT 打 401。
+func (a *Account) setCredentials(accessToken, refreshToken, zcodeJWT string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.AccessToken = accessToken
+	a.RefreshToken = refreshToken
+	a.ZCodeJWT = zcodeJWT
+}
+
 // GetAccount 按 ID 查询
 func (db *DB) GetAccount(id int64) (*Account, error) {
 	row := db.conn.QueryRow(`SELECT `+accountCols+` FROM accounts WHERE id = ?`, id)
@@ -256,6 +291,16 @@ func (db *DB) UpdateAccountFields(id int64, group, remark string, enabled bool) 
 }
 
 // UpdateAccountTokens 更新凭证字段（OAuth 刷新 / 手动编辑）；凭证列静态加密
+// UpdateAccountPriority 手动调整 priority 策略权重（0 回落默认 100）
+func (db *DB) UpdateAccountPriority(id int64, priority int64) error {
+	if priority <= 0 {
+		priority = DefaultPriority
+	}
+	_, err := db.conn.Exec(`UPDATE accounts SET priority = ?,
+		updated_at = datetime('now','localtime') WHERE id = ?`, priority, id)
+	return err
+}
+
 func (db *DB) UpdateAccountTokens(id int64, accessToken, refreshToken, zcodeJWT, apiKey, userInfo string) error {
 	encAccess, err := vaultEncrypt(accessToken)
 	if err != nil {

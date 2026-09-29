@@ -10,8 +10,8 @@ package main
 //      在服务端记录授权结果，浏览器不回连 localhost（无需注册 redirect_uri）；
 //   4. GET /api/v1/oauth/cli/poll/{flow_id} 轮询至 status=ready → {token(JWT), user, zai:{access_token}}。
 //
-// 错误语义（对齐 bundle）：4xx（除 408/429）、信封 code!==0、未知 status → 终止；
-// 网络错误 / 5xx / 408 / 429 / 畸形 200 → 视为 pending 继续轮询。
+// 错误语义（对齐 bundle）：4xx（除 408/429）、信封 code!==0、未知 status、
+// 畸形 200 → 终止；网络错误 / 5xx / 408 / 429 → 视为 pending 继续轮询。
 // 总超时 = min(5 分钟, expires_at)。
 
 import (
@@ -85,7 +85,15 @@ func (m *OAuthManager) StartPollLogin(group string) (*OAuthFlow, string, error) 
 	}
 	m.mu.Unlock()
 
-	go m.pollLoop(flow, tokenHex, flowID, expiresAt, time.Duration(pollIntervalSec)*time.Second)
+	// 轮询间隔来自上游响应：夹取防止畸形值导致挂死或热旋
+	interval := time.Duration(pollIntervalSec) * time.Second
+	if interval < time.Second {
+		interval = time.Second
+	}
+	if interval > 15*time.Second {
+		interval = 15 * time.Second
+	}
+	go m.pollLoop(flow, tokenHex, flowID, expiresAt, interval)
 	return flow, finalURL, nil
 }
 

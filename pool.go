@@ -1,10 +1,12 @@
 package main
 
 import (
+	"encoding/json"
 	"log"
 	"math/rand"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -33,6 +35,7 @@ const (
 	StrategyRandom     = "random"
 	StrategyRoundRobin = "round_robin"
 	StrategyBestQuota  = "best_quota"
+	StrategyPriority   = "priority"
 )
 
 // AccountPool 账号池
@@ -46,10 +49,25 @@ type AccountPool struct {
 
 	invalidRetry map[int64]time.Time // invalid 账号上次重试时间（mu 保护，内存退避）
 
+	sticky       map[string]stickyEntry // 会话粘滞：sessionKey -> 账号（mu 保护，TTL 淘汰）
+	stickyPruned time.Time              // 上次粘滞表清理时间
+
 	refreshFn func(a *Account) error // 由 ZCodeAPI 注入的额度刷新函数
 	stopCh    chan struct{}
 	stopOnce  sync.Once
 }
+
+// stickyEntry 会话粘滞表项
+type stickyEntry struct {
+	accountID int64
+	seenAt    int64
+}
+
+const (
+	stickyTTL  = time.Hour
+	stickyMax  = 10000
+	pruneEvery = 10 * time.Minute
+)
 
 // NewAccountPool 创建账号池
 func NewAccountPool(db *DB, cfg *FileConfig, appVersion string) *AccountPool {
@@ -59,6 +77,7 @@ func NewAccountPool(db *DB, cfg *FileConfig, appVersion string) *AccountPool {
 		appVersion:   appVersion,
 		rotation:     make(map[string]int),
 		invalidRetry: make(map[int64]time.Time),
+		sticky:       make(map[string]stickyEntry),
 		stopCh:       make(chan struct{}),
 	}
 }
@@ -171,6 +190,12 @@ func (p *AccountPool) refreshAll() {
 		go func(acc *Account) {
 			defer wg.Done()
 			defer func() { <-sem }()
+			defer func() {
+				// 后台长驻 worker：单账号刷新 panic 不得带走整个进程
+				if r := recover(); r != nil {
+					log.Printf("[pool] refresh quota %s panicked: %v", acc.Email, r)
+				}
+			}()
 			// 每账号随机延迟 0-2s，模拟人工行为
 			time.Sleep(time.Duration(rand.Intn(2000)) * time.Millisecond)
 			if err := fn(acc); err != nil {
@@ -206,12 +231,24 @@ func accountSelectable(a *Account, now int64) bool {
 	return true
 }
 
-// EffectiveStatus 考虑冷却到期的实时状态
+// EffectiveStatus 考虑冷却到期的实时状态（cooling_until<=0 视为已到期，
+// 与 accountSelectable 同一规则，避免"仪表盘显示冷却、转发却照选"的分裂）
 func EffectiveStatus(a *Account) string {
-	if a.Status == StatusCooling && a.CoolingUntil > 0 && time.Now().Unix() >= a.CoolingUntil {
+	if a.Status == StatusCooling && (a.CoolingUntil <= 0 || time.Now().Unix() >= a.CoolingUntil) {
 		return StatusActive
 	}
 	return a.Status
+}
+
+// matchAccountGroup 账号组匹配：account_group 允许逗号分隔多组（ListGroups 同约定），
+// 精确匹配某一组名
+func matchAccountGroup(a *Account, group string) bool {
+	for _, part := range strings.Split(a.AccountGroup, ",") {
+		if strings.TrimSpace(part) == group {
+			return true
+		}
+	}
+	return false
 }
 
 // ---- 账号选择 ----
@@ -229,7 +266,7 @@ func (p *AccountPool) Select(provider, group string, skip map[int64]bool) *Accou
 		if a.Provider != provider {
 			continue
 		}
-		if group != "" && a.AccountGroup != group {
+		if group != "" && !matchAccountGroup(a, group) {
 			continue
 		}
 		if skip[a.ID] {
@@ -249,6 +286,24 @@ func (p *AccountPool) Select(provider, group string, skip map[int64]bool) *Accou
 	}
 
 	strategy, _ := p.db.GetSetting("selection_strategy")
+	if strategy == StrategyPriority {
+		// 级联：只保留最高优先级（数值最小）层，层内 round_robin 公平轮转。
+		// 被状态机淘汰的账号本就不在候选里——promo 层耗尽时自然让位给下一层
+		minPri := int64(1 << 62)
+		for _, a := range pool {
+			pri := accountPriority(a)
+			if pri < minPri {
+				minPri = pri
+			}
+		}
+		var tier []*Account
+		for _, a := range pool {
+			if accountPriority(a) == minPri {
+				tier = append(tier, a)
+			}
+		}
+		pool = tier
+	}
 	switch strategy {
 	case StrategyRandom:
 		return pool[rand.Intn(len(pool))]
@@ -267,6 +322,117 @@ func (p *AccountPool) Select(provider, group string, skip map[int64]bool) *Accou
 		p.rotation[key] = (idx + 1) % len(pool)
 		return a
 	}
+}
+
+// ---- 会话粘滞（F2）----
+// 同一会话尽量固定到同一账号，保住上游 prompt 缓存（缓存命中比 fresh 便宜数倍）。
+// 粘滞账号进入不可选状态时 selectable 校验自动让位，恢复后回到粘滞账号。
+
+func (p *AccountPool) stickyEnabled() bool {
+	v, _ := p.db.GetSetting("sticky_sessions")
+	return v != "0" && v != "false"
+}
+
+// SelectSticky 粘滞优先选择：sessionKey 命中且账号仍可选 → 复用；
+// 否则按策略选择并记录。skip（已尝试失败）的账号不粘滞。
+func (p *AccountPool) SelectSticky(provider, group, sessionKey string, skip map[int64]bool) *Account {
+	if sessionKey != "" && p.stickyEnabled() {
+		now := time.Now().Unix()
+		p.mu.Lock()
+		e, ok := p.sticky[sessionKey]
+		p.mu.Unlock()
+		if ok && now-e.seenAt < int64(stickyTTL.Seconds()) && !skip[e.accountID] {
+			if a := p.selectableByID(e.accountID, provider, group, skip); a != nil {
+				p.rememberSticky(sessionKey, a.ID)
+				return a
+			}
+		}
+	}
+	a := p.Select(provider, group, skip)
+	if a != nil && sessionKey != "" && p.stickyEnabled() {
+		p.rememberSticky(sessionKey, a.ID)
+	}
+	return a
+}
+
+func (p *AccountPool) selectableByID(id int64, provider, group string, skip map[int64]bool) *Account {
+	a, err := p.db.GetAccount(id)
+	if err != nil || a == nil {
+		return nil
+	}
+	if skip[id] || a.Provider != provider || !a.Enabled {
+		return nil
+	}
+	if group != "" && !matchAccountGroup(a, group) {
+		return nil
+	}
+	if !accountSelectable(a, time.Now().Unix()) {
+		return nil
+	}
+	if a.ZCodeJWT == "" && a.APIKey == "" {
+		return nil
+	}
+	return a
+}
+
+func (p *AccountPool) rememberSticky(sessionKey string, accountID int64) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	now := time.Now().Unix()
+	if len(p.sticky) >= stickyMax && time.Since(p.stickyPruned) < pruneEvery {
+		// 表满且刚清理过：覆盖式写入，接受随机挤掉
+		p.sticky[sessionKey] = stickyEntry{accountID: accountID, seenAt: now}
+		return
+	}
+	p.stickyPruned = time.Now()
+	for k, e := range p.sticky {
+		if now-e.seenAt >= int64(stickyTTL.Seconds()) {
+			delete(p.sticky, k)
+		}
+	}
+	if len(p.sticky) >= stickyMax {
+		p.sticky = make(map[string]stickyEntry)
+	}
+	p.sticky[sessionKey] = stickyEntry{accountID: accountID, seenAt: now}
+}
+
+// ---- 耗尽重置提示（F3）----
+
+// ExhaustedResetInfo 返回 provider/group 下耗尽账号的最早重置时间（unix 秒）
+// 与账号名；读各自 quota_json 的 next_reset 字段（monitor 通道提供）。
+func (p *AccountPool) ExhaustedResetInfo(provider, group string) (int64, string) {
+	accounts, err := p.db.ListAccounts("")
+	if err != nil {
+		return 0, ""
+	}
+	var until int64
+	email := ""
+	for _, a := range accounts {
+		if provider != "" && a.Provider != provider {
+			continue
+		}
+		if group != "" && !matchAccountGroup(a, group) {
+			continue
+		}
+		if a.Status != StatusExhausted || a.QuotaJSON == "" {
+			continue
+		}
+		if r := nextResetFromQuota(a.QuotaJSON); r > 0 && (until == 0 || r < until) {
+			until = r
+			email = a.DisplayNameOrEmail()
+		}
+	}
+	return until, email
+}
+
+func nextResetFromQuota(quotaJSON string) int64 {
+	var ov struct {
+		NextReset int64 `json:"next_reset"`
+	}
+	if json.Unmarshal([]byte(quotaJSON), &ov) != nil {
+		return 0
+	}
+	return ov.NextReset
 }
 
 // ---- 状态迁移 ----
@@ -328,7 +494,7 @@ func (p *AccountPool) CoolingInfo(provider, group string) (int64, string) {
 		if provider != "" && a.Provider != provider {
 			continue
 		}
-		if group != "" && a.AccountGroup != group {
+		if group != "" && !matchAccountGroup(a, group) {
 			continue
 		}
 		if a.Status == StatusCooling && a.CoolingUntil > now {

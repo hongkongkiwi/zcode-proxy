@@ -48,7 +48,8 @@ func main() {
 	defer db.Close()
 	log.Printf("[main] database: %s", absDBPath)
 
-	cfg.StartHotReload(30 * time.Second)
+	stopHotReload := cfg.StartHotReload(30 * time.Second)
+	defer stopHotReload()
 
 	// 客户端伪装版本号：config 优先，其次注册表探测，最后内置默认
 	appVersion := cfg.GetAppVersion()
@@ -60,6 +61,7 @@ func main() {
 	// 账号池（状态机 + 选择策略 + 额度刷新循环）
 	pool := NewAccountPool(db, cfg, appVersion)
 	pool.Start()
+	defer pool.Stop()
 
 	// TLS 指纹钩子（utls 预设 / 自定义 JA3）
 	fingerprintHook = func() TLSFingerprint {
@@ -80,6 +82,8 @@ func main() {
 	captcha := NewCaptchaService(cfg, db, appVersion)
 	egress := NewEgressProxy(db)
 	captchaProxyHook = func(a *Account) string { return egress.ProxyURLForAccount(a) }
+	captchaGlobalProxyHook = func() string { return egress.GlobalProxyURL() }
+	routingGlobalProxyHook = func() string { return egress.GlobalProxyURL() }
 	browserProfileHook = func() string {
 		exe, _ := os.Executable()
 		return filepath.Join(filepath.Dir(exe), "data", "browser-profile")

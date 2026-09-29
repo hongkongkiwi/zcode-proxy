@@ -50,7 +50,7 @@ Go 单二进制实现的 **ZCode（Z.AI / GLM Coding Plan）多账号管理 + OA
 
 | 模块 | 说明 |
 |---|---|
-| 多账号管理 | 本地客户端一键导入 / OAuth 登录（免回调 CLI 轮询为主，手动粘贴备用）/ 粘贴 JWT·API Key；分组、启用策略（random / round_robin / best_quota）、状态机 |
+| 多账号管理 | 本地客户端一键导入 / OAuth 登录（免回调 CLI 轮询为主，手动粘贴备用）/ 粘贴 JWT·API Key；分组、启用策略（random / round_robin / best_quota / **priority 级联**）、状态机、**会话粘滞**（保住上游 prompt 缓存）、耗尽窗口重置时间提示 |
 | 2API 网关 | `/v1/messages`（Anthropic 原生）、`/v1/chat/completions`、`/v1/responses`、`/v1/models`、`/v1/messages/count_tokens`；SSE 流式 + 用量/TTFT 记录；上游端点按服务端 `agent/configs` 路由表自动重写（fail-open） |
 | 闲时通道 | `/async/v1/messages`（Anthropic 原生）经上游 **off-peak 免费算力队列**：取票排队、SSE 注释帧保活、`X-Off-Peak-Ticket-ID` 调用、幂等关票、票回收自动重取；设置 `async_enabled` 开启 |
 | 额度监控 | 后台周期刷新；账号页额度条**可点开**查看分套餐槽位与逐模型额度构成；驱动状态机；JWT 通道（Start Plan 计费）报耗尽而账号带 API Key 时自动交叉核对 monitor 通道（individual coding plan 额度），有余量则以 monitor 为准 |
@@ -104,6 +104,13 @@ Go 单二进制实现的 **ZCode（Z.AI / GLM Coding Plan）多账号管理 + OA
 - **激活**：上报 `event/report`（app_launch + app_daily_active，含 device_mid/user_id）触发服务端授予 Start Plan；
 - **配额重置**：`coding-plan/reset/status` 查 five_hour/week 重置机会 → `reset/use {idempotency_key, reset_type}` 消耗机会恢复配额；
 - **调度**：cron 计划（分钟级去重 + per-plan 互斥 + 账号间随机延迟防风控），任务类型 detect/claim/activate/reset，运行记录可查。
+
+### 多账号路由（负载均衡 / 优先级级联 / 会话粘滞）
+
+- **负载均衡**：`round_robin`（默认）在所有可选账号间均匀轮转；`random` 随机；`best_quota` 永远挑剩余额度最大的账号。
+- **优先级级联（priority）**：账号按 priority 数值升序分层层级——**数值小者先用，层内轮转**；某层耗尽/冷却/失效时被状态机自动过滤，请求自然落到下一层，额度恢复后自动回归高层。典型用法：促销/试用账号设 50（导入后首次额度刷新发现 Start/体验 档会**自动降为 50**，仅首次生效不覆盖手动调整），自费账号保持 100。
+- **会话粘滞（sticky_sessions，默认开）**：同一会话（`metadata.user_id`，缺省按 system 块摘要）固定到同一账号，保住上游 prompt 缓存（缓存命中远便宜于 fresh）；粘滞账号进入不可选状态自动让位，恢复后回归。TTL 1 小时。
+- **耗尽重置提示**：monitor 通道的重置时间落库后，全部账号耗尽的 503 会附「额度窗口约 N 分钟后重置」；额度构成弹窗展示双通道（Start Plan 计费 vs coding plan monitor）并排视图。
 
 ### 额度监控与构成弹窗
 
@@ -167,7 +174,7 @@ Go 单二进制实现的 **ZCode（Z.AI / GLM Coding Plan）多账号管理 + OA
    - 路径2 `JWT 直连`（上游放宽时零延迟）；
    - 路径3 `x-api-key` → `api.z.ai/api/anthropic/v1/messages`（无需验证码）。
 5. **上游错误分类**：`401/403→invalid`；`429→请求内退避重试一次(尊重 Retry-After≤5s)，仍失败 cooling 30s`；`402/余额短语→exhausted`；`3012 unusual activity→风控，试其余路径，全败 cooling`；`3xx→cooling(WAF 挑战)`；`2xx 但非 json/sse→cooling`；其余原样回传。挑战页（3xx / 2xx 非 JSON/SSE）返回客户端时统一为 `502`，不伪装 200。
-6. **成功**：`MarkUsed`（cooling/exhausted 复活为 active）+ 节流额度刷新（30s）+ 流式透传/转换 + SSE 嗅探写 `usage_records`（含 TTFT）。
+6. **成功**：`MarkUsed`（记录使用；cooling 到期后自动重新可选，exhausted 仅由额度刷新确认有余量后恢复）+ 节流额度刷新（30s，进程内单飞）+ 流式透传/转换 + SSE 嗅探写 `usage_records`（含 TTFT）。
 7. **全败**：503 `no_available_account`，若因冷却则附「约 N 秒后自动恢复」与最近失败原因链。
 
 ## 3. 并发与锁模型
@@ -263,7 +270,9 @@ Go 单二进制实现的 **ZCode（Z.AI / GLM Coding Plan）多账号管理 + OA
 ## 10. 配置参考
 
 `config/config.json`（首次运行生成）：`listen_addr`、`app_version`(空=注册表探测)、`models[]`、`upstream{zai,zai_fallback,bigmodel}`。
-`settings`（界面/`PUT /api/settings`）：`selection_strategy`、`quota_refresh_interval`(0=关闭)、`upstream_proxy`、`fingerprint`、`custom_ja3`、`captcha_mode`(auto/manual/off)、`gateway_models`、`api_key`、`password_hash`(bcrypt)、`async_enabled`(闲时通道开关)、`async_poll_interval_ms`、`async_keepalive_ms`、`async_max_retries`、`async_max_wait_sec`。
+`settings`（界面/`PUT /api/settings`）：`selection_strategy`、`quota_refresh_interval`(0=关闭)、`upstream_proxy`、`fingerprint`、`custom_ja3`、`captcha_mode`(auto/manual/off)、`gateway_models`、`api_key`、`password_hash`(bcrypt)、`async_enabled`(闲时通道开关)、`async_poll_interval_ms`、`async_keepalive_ms`、`async_max_retries`、`async_max_wait_sec`、`sticky_sessions`(会话粘滞，默认开)。
+
+账号 `priority` 字段：priority 策略下数值小者先用（1-9999，默认 100；导入后首次额度刷新发现促销档自动降为 50）。
 
 ## 11. 管理 API（节选，session 鉴权）
 

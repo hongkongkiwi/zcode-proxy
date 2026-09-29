@@ -69,6 +69,27 @@ type QuotaOverview struct {
 	NotEntitled bool            `json:"not_entitled"` // 无 Coding Plan / 未激活
 	AuthFailed  bool            `json:"auth_failed"`  // 401/403 凭证失效
 	IsEmpty     bool            `json:"is_empty"`
+	NextReset   int64           `json:"next_reset,omitempty"` // 最早重置时间（unix 秒，monitor 通道）
+	Channels    []QuotaChannel  `json:"channels,omitempty"`   // 双通道额度构成（交叉核对时填充）
+}
+
+// QuotaChannel 单通道额度概要（F4：Start Plan 计费 vs coding plan monitor 并排可见）
+type QuotaChannel struct {
+	Source     string  `json:"source"`
+	PlanTier   string  `json:"plan_tier"`
+	Remaining  float64 `json:"remaining"`
+	Exhausted  bool    `json:"exhausted"`
+	AuthFailed bool    `json:"auth_failed"`
+	NextReset  int64   `json:"next_reset,omitempty"`
+}
+
+// channelSummary 从 overview 提取通道概要
+func channelSummary(ov *QuotaOverview) QuotaChannel {
+	c := QuotaChannel{Source: ov.Source, PlanTier: ov.PlanTier, Exhausted: ov.AllExhausted(), NextReset: ov.NextReset}
+	if ov.Remaining != nil {
+		c.Remaining = *ov.Remaining
+	}
+	return c
 }
 
 // quotaResult 内部：HTTP + 业务码 + 原始 JSON
@@ -221,6 +242,8 @@ func (z *ZCodeAPI) FetchQuotaRaw(a *Account) (*QuotaOverview, error) {
 				if ov2, err2 := z.fetchApiZaiMonitor(a); err2 == nil && ov2 != nil &&
 					!ov2.AllExhausted() && !ov2.IsEmpty && !ov2.AuthFailed {
 					log.Printf("[quota] account %s: JWT billing exhausted but monitor channel has quota, using monitor", a.Email)
+					// F4：双通道额度构成并排入库（quota_json.channels）
+					ov2.Channels = append(ov2.Channels, channelSummary(ov), channelSummary(ov2))
 					return ov2, nil
 				}
 			}
@@ -231,19 +254,28 @@ func (z *ZCodeAPI) FetchQuotaRaw(a *Account) (*QuotaOverview, error) {
 			return nil, err
 		}
 		// JWT 通道明确 401/403 且账号带 API Key 时回退 monitor 通道
-		if a.APIKey == "" {
-			return nil, err
+		if a.APIKey != "" {
+			ov2, err2 := z.fetchApiZaiMonitor(a)
+			if err2 != nil && (ov2 == nil || !ov2.AuthFailed) {
+				// 回退通道网络/业务失败：单通道鉴权失败不定性，不改状态
+				return nil, err2
+			}
+			// 回退成功，或双通道均 401/403（AuthFailed → 状态机标记 invalid）
+			return ov2, nil
 		}
-		ov2, err2 := z.fetchApiZaiMonitor(a)
-		if err2 != nil && (ov2 == nil || !ov2.AuthFailed) {
-			// 回退通道网络/业务失败：单通道鉴权失败不定性，不改状态
-			return nil, err2
-		}
-		// 回退成功，或双通道均 401/403（AuthFailed → 状态机标记 invalid）
-		return ov2, nil
+		// 无回退通道：JWT 通道 401/403 即"已应答通道全部失败"，
+		// 必须按约定返回 AuthFailed + nil err，否则后台/手动刷新永远无法
+		// 把过期账号迁移到 invalid（或触发 refresh_token 兑换）
+		return &QuotaOverview{AuthFailed: true}, nil
 	}
 	if a.APIKey != "" {
-		return z.fetchApiZaiMonitor(a)
+		ov, err := z.fetchApiZaiMonitor(a)
+		if ov != nil && ov.AuthFailed {
+			// 唯一通道 401/403：同样定性为 AuthFailed（去 err 化，交状态机）。
+			// monitor 通道的 AuthFailed 一律伴随非 nil err，故这里不看 err。
+			return ov, nil
+		}
+		return ov, err
 	}
 	return nil, fmt.Errorf("账号缺少凭证")
 }
@@ -324,6 +356,22 @@ func (z *ZCodeAPI) fetchApiZaiMonitor(a *Account) (*QuotaOverview, error) {
 	ov := normalizeQuotaLimit(resp.Body, sub)
 	ov.Source = "api.z.ai/monitor"
 	ov.RefreshedAt = time.Now().Unix()
+	// F3：取各限额桶最早的 nextResetTime（毫秒 → unix 秒），供耗尽提示/未来调度
+	if d, ok := resp.Body["data"].(map[string]interface{}); ok {
+		if limits, ok := d["limits"].([]interface{}); ok {
+			for _, it := range limits {
+				lm, ok := it.(map[string]interface{})
+				if !ok {
+					continue
+				}
+				if n, ok := lm["nextResetTime"].(float64); ok && n > 0 {
+					if s := int64(n / 1000); ov.NextReset == 0 || s < ov.NextReset {
+						ov.NextReset = s
+					}
+				}
+			}
+		}
+	}
 	return ov, nil
 }
 

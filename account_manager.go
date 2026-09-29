@@ -282,16 +282,23 @@ func (m *AccountManager) SwitchBackToLocal(accountID int64, killClient bool) err
 	f := resolveLocalClientFiles()
 	secret := DefaultCredentialSecret(f.home)
 
-	// 1. 备份（基于可执行文件目录，避免受工作目录影响）
+	// 1. 备份（基于可执行文件目录，避免受工作目录影响）。
+	// 备份是切回的唯一可逆手段：备份失败必须中止，不得先覆盖线上凭证
 	backupDir := filepath.Join(exeDir(), "data", "backups")
-	os.MkdirAll(backupDir, 0755)
+	if err := os.MkdirAll(backupDir, 0755); err != nil {
+		return fmt.Errorf("创建备份目录失败: %w", err)
+	}
 	stamp := time.Now().Format("20060102-150405")
 	for _, p := range []string{f.credentials, f.config} {
 		if data, err := os.ReadFile(p); err == nil {
 			// 备份含凭证快照，限权 0600（WriteFile 对已存在文件不改权限，补一次 Chmod）
 			bak := filepath.Join(backupDir, filepath.Base(p)+"."+stamp+".bak")
-			os.WriteFile(bak, data, 0600)
-			os.Chmod(bak, 0600)
+			if err := os.WriteFile(bak, data, 0600); err != nil {
+				return fmt.Errorf("备份 %s 失败: %w", filepath.Base(p), err)
+			}
+			if err := os.Chmod(bak, 0600); err != nil {
+				return fmt.Errorf("收紧备份权限失败: %w", err)
+			}
 		}
 	}
 
@@ -309,22 +316,34 @@ func (m *AccountManager) SwitchBackToLocal(accountID int64, killClient bool) err
 	}
 	enc := func(plain string) (string, error) { return EncryptCredential(plain, secret) }
 
-	if v, err := enc(a.ZCodeJWT); err == nil {
-		creds["zcodejwttoken"] = v
+	// 全部加密成功才动笔：部分成功会写出一个"旧登录态 + 新计费键"的混合身份
+	var zcodeEnc, accessEnc, userEnc, providerEnc string
+	var encErr error
+	if zcodeEnc, encErr = enc(a.ZCodeJWT); encErr != nil {
+		return fmt.Errorf("加密 zcodejwttoken 失败: %w", encErr)
 	}
 	if a.AccessToken != "" {
-		if v, err := enc(a.AccessToken); err == nil {
-			creds["oauth:"+provider+":access_token"] = v
+		if accessEnc, encErr = enc(a.AccessToken); encErr != nil {
+			return fmt.Errorf("加密 access_token 失败: %w", encErr)
 		}
 	}
 	if a.UserInfo != "" {
-		if v, err := enc(a.UserInfo); err == nil {
-			creds["oauth:"+provider+":user_info"] = v
+		if userEnc, encErr = enc(a.UserInfo); encErr != nil {
+			return fmt.Errorf("加密 user_info 失败: %w", encErr)
 		}
 	}
-	if v, err := enc(provider); err == nil {
-		creds["oauth:active_provider"] = v
+	if providerEnc, encErr = enc(provider); encErr != nil {
+		return fmt.Errorf("加密 provider 失败: %w", encErr)
 	}
+
+	creds["zcodejwttoken"] = zcodeEnc
+	if accessEnc != "" {
+		creds["oauth:"+provider+":access_token"] = accessEnc
+	}
+	if userEnc != "" {
+		creds["oauth:"+provider+":user_info"] = userEnc
+	}
+	creds["oauth:active_provider"] = providerEnc
 	if err := atomicWriteJSON(f.credentials, creds); err != nil {
 		return fmt.Errorf("写回 credentials.json 失败: %w", err)
 	}

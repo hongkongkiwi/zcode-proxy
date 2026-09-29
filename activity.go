@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"sort"
 	"strings"
@@ -220,14 +221,11 @@ func math_Round(x float64) float64 {
 	return float64(int64(x + 0.5))
 }
 
-// SubmitClaim 提交领取（必须带验证码参数）
+// SubmitClaim 提交领取。captchaParam 为空 = GetVerifyParam 判定免验证
+// （captcha_mode=off 或上游未开启验证码），此时不带头直连——上游若仍要求
+// 验证码会返回 3001/3007，由调用方按既有重解路径处理。
 func (z *ZCodeAPI) SubmitClaim(a *Account, planID, captchaParam, captchaRegion string) *ClaimResult {
 	result := &ClaimResult{PlanID: planID}
-	if strings.TrimSpace(captchaParam) == "" {
-		result.Code = -1
-		result.Message = "缺少人机验证参数（验证码求解失败）"
-		return result
-	}
 	token := z.billingToken(a)
 	if token == "" {
 		result.Code = -1
@@ -248,7 +246,9 @@ func (z *ZCodeAPI) SubmitClaim(a *Account, planID, captchaParam, captchaRegion s
 		req.Header.Set(k, v)
 	}
 	req.Header.Set("Authorization", "Bearer "+token)
-	req.Header.Set("X-Aliyun-Captcha-Verify-Param", strings.TrimSpace(captchaParam))
+	if p := strings.TrimSpace(captchaParam); p != "" {
+		req.Header.Set("X-Aliyun-Captcha-Verify-Param", p)
+	}
 	if r := strings.TrimSpace(captchaRegion); r != "" {
 		req.Header.Set("X-Aliyun-Captcha-Verify-Region", r)
 	}
@@ -428,14 +428,18 @@ func (z *ZCodeAPI) claimForAccountLocked(a *Account) *ClaimResult {
 	if err != nil {
 		record.Success = false
 		record.Message = err.Error()
-		z.db.InsertClaimRecord(record)
+		if err := z.db.InsertClaimRecord(record); err != nil {
+			log.Printf("[activity] insert claim record: %v", err)
+		}
 		return &ClaimResult{Code: -1, Message: err.Error()}
 	}
 	if len(plans) == 0 {
 		// 无活动视为成功空跑（与 detect 语义一致，避免调度统计 0/N 误报 failed）
 		record.Success = true
 		record.Message = "当前无可领取活动"
-		z.db.InsertClaimRecord(record)
+		if err := z.db.InsertClaimRecord(record); err != nil {
+			log.Printf("[activity] insert claim record: %v", err)
+		}
 		return &ClaimResult{OK: true, Code: 0, Message: "当前无可领取活动"}
 	}
 	plan := plans[0] // 已按 priority 降序
@@ -446,7 +450,9 @@ func (z *ZCodeAPI) claimForAccountLocked(a *Account) *ClaimResult {
 	captchaParam, region, err := z.captcha.GetVerifyParam(a)
 	if err != nil {
 		record.Message = fmt.Sprintf("验证码求解失败: %v", err)
-		z.db.InsertClaimRecord(record)
+		if err := z.db.InsertClaimRecord(record); err != nil {
+			log.Printf("[activity] insert claim record: %v", err)
+		}
 		z.db.SetAccountClaimResult(a.ID, plan.Name, record.Message)
 		return &ClaimResult{Code: -1, PlanID: plan.PlanID, PlanName: plan.Name, Message: record.Message}
 	}
@@ -469,7 +475,9 @@ func (z *ZCodeAPI) claimForAccountLocked(a *Account) *ClaimResult {
 	record.Code = result.Code
 	record.Message = result.Message
 	record.NextAt = result.NextAt
-	z.db.InsertClaimRecord(record)
+	if err := z.db.InsertClaimRecord(record); err != nil {
+		log.Printf("[activity] insert claim record: %v", err)
+	}
 	z.db.SetAccountClaimResult(a.ID, result.PlanName, result.Message)
 
 	// 领取成功后异步刷新额度
@@ -488,13 +496,17 @@ func (z *ZCodeAPI) DetectForAccount(a *Account) *ClaimResult {
 	record := &ClaimRecord{AccountID: a.ID, Email: a.Email, TaskType: "detect"}
 	if err != nil {
 		record.Message = err.Error()
-		z.db.InsertClaimRecord(record)
+		if err := z.db.InsertClaimRecord(record); err != nil {
+			log.Printf("[activity] insert claim record: %v", err)
+		}
 		return &ClaimResult{Code: -1, Message: err.Error()}
 	}
 	if len(plans) == 0 {
 		record.Success = true
 		record.Message = "无可领取活动"
-		z.db.InsertClaimRecord(record)
+		if err := z.db.InsertClaimRecord(record); err != nil {
+			log.Printf("[activity] insert claim record: %v", err)
+		}
 		return &ClaimResult{OK: true, Message: "无可领取活动"}
 	}
 	names := make([]string, 0, len(plans))
@@ -505,7 +517,9 @@ func (z *ZCodeAPI) DetectForAccount(a *Account) *ClaimResult {
 	record.PlanID = plans[0].PlanID
 	record.PlanName = strings.Join(names, "、")
 	record.Message = fmt.Sprintf("发现 %d 个活动: %s", len(plans), record.PlanName)
-	z.db.InsertClaimRecord(record)
+	if err := z.db.InsertClaimRecord(record); err != nil {
+		log.Printf("[activity] insert claim record: %v", err)
+	}
 	return &ClaimResult{OK: true, PlanID: plans[0].PlanID, PlanName: record.PlanName, Message: record.Message}
 }
 
@@ -514,7 +528,9 @@ func (z *ZCodeAPI) ActivateForAccount(a *Account) *ClaimResult {
 	record := &ClaimRecord{AccountID: a.ID, Email: a.Email, TaskType: "activate"}
 	if err := z.ReportActivation(a); err != nil {
 		record.Message = err.Error()
-		z.db.InsertClaimRecord(record)
+		if err := z.db.InsertClaimRecord(record); err != nil {
+			log.Printf("[activity] insert claim record: %v", err)
+		}
 		return &ClaimResult{Code: -1, Message: err.Error()}
 	}
 	// 上报后刷新额度确认
@@ -523,10 +539,17 @@ func (z *ZCodeAPI) ActivateForAccount(a *Account) *ClaimResult {
 	if err != nil {
 		record.Success = true
 		record.Message = "激活事件已上报；额度确认失败: " + err.Error()
-		z.db.InsertClaimRecord(record)
+		if err := z.db.InsertClaimRecord(record); err != nil {
+			log.Printf("[activity] insert claim record: %v", err)
+		}
 		return &ClaimResult{OK: true, Message: record.Message}
 	}
 	z.applyQuotaResult(a, ov)
+	if ov.AuthFailed {
+		record.Message = "激活事件已上报，但凭证已失效（账号被标记 invalid，若配有 refresh_token 将自动恢复后可重试）"
+		z.db.InsertClaimRecord(record)
+		return &ClaimResult{OK: false, Message: record.Message}
+	}
 	if ov.PlanTier != "" {
 		record.Success = true
 		record.PlanName = ov.PlanTier
@@ -534,7 +557,9 @@ func (z *ZCodeAPI) ActivateForAccount(a *Account) *ClaimResult {
 	} else {
 		record.Message = "激活事件已上报，但未检测到生效套餐（服务端可能延迟授予）"
 	}
-	z.db.InsertClaimRecord(record)
+	if err := z.db.InsertClaimRecord(record); err != nil {
+		log.Printf("[activity] insert claim record: %v", err)
+	}
 	return &ClaimResult{OK: record.Success, PlanName: ov.PlanTier, Message: record.Message}
 }
 

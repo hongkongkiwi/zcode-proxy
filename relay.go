@@ -3,6 +3,8 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -106,9 +108,10 @@ func (z *ZCodeAPI) relay(w http.ResponseWriter, r *http.Request, rc *relayCtx) {
 	tried := map[int64]bool{}
 	var reasons []string
 	start := time.Now()
+	sessionKey := rc.sessionKey()
 
 	for attempt := 0; attempt < maxAccountAttempts; attempt++ {
-		a := z.pool.Select(rc.provider, rc.group, tried)
+		a := z.pool.SelectSticky(rc.provider, rc.group, sessionKey, tried)
 		if a == nil {
 			break
 		}
@@ -123,10 +126,8 @@ func (z *ZCodeAPI) relay(w http.ResponseWriter, r *http.Request, rc *relayCtx) {
 		}
 	}
 
-	detail := strings.Join(dedup(reasons), "；")
-	if len(detail) > 400 {
-		detail = detail[:400] + "…"
-	}
+	// rune 安全截断：失败原因以中文为主，按字节切会切碎 UTF-8 尾巴
+	detail := truncate(strings.Join(dedup(reasons), "；"), 400)
 	msg := "所有账号均不可用或额度已用完，请在后台检查账号状态"
 	// 达到单次尝试上限时如实说明：仅尝试了部分账号，其余本次未尝试
 	if len(tried) >= maxAccountAttempts {
@@ -140,6 +141,14 @@ func (z *ZCodeAPI) relay(w http.ResponseWriter, r *http.Request, rc *relayCtx) {
 		}
 		msg = fmt.Sprintf("账号冷却中（%s），约 %d 秒后自动恢复重试", firstNonEmpty(reason, "上游限流/风控"), secs)
 	}
+	// F3：耗尽账号的上游重置时间已知时如实告知（monitor 通道 nextResetTime）
+	if until, email := z.pool.ExhaustedResetInfo(rc.provider, rc.group); until > 0 {
+		mins := (until - time.Now().Unix()) / 60
+		if mins < 0 {
+			mins = 0
+		}
+		msg += fmt.Sprintf("；耗尽的额度窗口约 %d 分钟后重置（%s）", mins, firstNonEmpty(email, "promo 账号"))
+	}
 	if detail != "" {
 		msg += "（最近失败原因: " + detail + "）"
 	}
@@ -147,6 +156,24 @@ func (z *ZCodeAPI) relay(w http.ResponseWriter, r *http.Request, rc *relayCtx) {
 	writeJSON(w, http.StatusServiceUnavailable, map[string]interface{}{
 		"error": map[string]string{"message": msg, "type": "no_available_account"},
 	})
+}
+
+// sessionKey 会话粘滞键（F2）：优先 metadata.user_id（Anthropic 客户端语义），
+// 缺省退化为 system 块摘要哈希——同一系统提示词的会话视为同一粘滞域。
+func (rc *relayCtx) sessionKey() string {
+	if md, ok := rc.body["metadata"].(map[string]interface{}); ok {
+		if uid := jsonStr(md, "user_id"); uid != "" {
+			return "u:" + uid
+		}
+	}
+	if sys, has := rc.body["system"]; has {
+		raw, err := json.Marshal(sys)
+		if err == nil && len(raw) > 0 {
+			sum := sha256.Sum256(raw)
+			return "s:" + hex.EncodeToString(sum[:])[:24]
+		}
+	}
+	return ""
 }
 
 // tryAccount 单账号降级链：JWT+验证码 → JWT 直连 → API Key 回退。
@@ -290,8 +317,12 @@ func (z *ZCodeAPI) forwardOnce(w http.ResponseWriter, r *http.Request, a *Accoun
 
 			switch {
 			case resp.StatusCode == 401 || resp.StatusCode == 403:
-				// 先尝试 refresh_token 兑换；成功则账号已恢复，交回池子换号续用
-				if z.tryRefreshAccount(a) {
+				// 先尝试 refresh_token 兑换；成功或已有并发刷新在跑则不判死，
+				// 交回池子换号续用（下一轮用新凭证）
+				if ok, inflight := z.tryRefreshAccount(a); ok || inflight {
+					return outcomeNextAccount
+				}
+				if z.credentialsAlreadyRotated(a) {
 					return outcomeNextAccount
 				}
 				z.pool.MarkInvalid(a, fmt.Sprintf("鉴权失败 HTTP %d", resp.StatusCode))
@@ -320,7 +351,8 @@ func (z *ZCodeAPI) forwardOnce(w http.ResponseWriter, r *http.Request, a *Accoun
 				return outcomeRiskBlocked
 			case isExhaustedError(resp.StatusCode, text):
 				z.pool.MarkExhausted(a, "额度已用完")
-				go z.RefreshAccountQuota(a)
+				// 走节流+单飞版本：并发请求同时撞上同一耗尽账号时只拉一次 billing
+				go z.RefreshAccountQuotaThrottled(a)
 				return outcomeNextAccount
 			}
 
@@ -350,6 +382,14 @@ func (z *ZCodeAPI) forwardOnce(w http.ResponseWriter, r *http.Request, a *Accoun
 		if !isStream {
 			body, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<20))
 			resp.Body.Close()
+			// 2xx + JSON 但不是 message（上游内联错误信封，SSE 路径已证实存在）：
+			// 不得洗成"成功空响应"，按上游错误处理
+			if isErrorEnvelope(body) {
+				z.pool.MarkFailed(a, "上游 2xx 内联错误信封")
+				z.recordUsage(a, r, payload, http.StatusBadGateway, start, 0, nil, rc.clientStream)
+				writeUpstreamErrorForProto(w, resp, string(body), rc.proto)
+				return outcomeUpstreamError
+			}
 			usage := parseAnthropicUsageJSON(body)
 			z.recordUsage(a, r, payload, resp.StatusCode, start, 0, usage, rc.clientStream)
 			writeProtocolResponse(w, rc.proto, resp.StatusCode, contentType, body, usage, rc.clientModel)
@@ -360,6 +400,38 @@ func (z *ZCodeAPI) forwardOnce(w http.ResponseWriter, r *http.Request, a *Accoun
 		return outcomeWritten
 	}
 	return outcomeCaptchaRejected // 验证码重试次数用尽
+}
+
+// isErrorEnvelope 识别 2xx JSON body 里的内联错误信封：
+// {"type":"error",...}（Anthropic 风格）或 {"error":...} / {"code":!=0,...}（网关/上游信封）。
+// 字段用 RawMessage 接收：某字段类型不符（如 "error":"rate limited" 字符串形态）
+// 不得让整封信逃过检测——守卫的目的就是对不可信上游形状 fail closed。
+func isErrorEnvelope(body []byte) bool {
+	var v struct {
+		Type  string          `json:"type"`
+		Error json.RawMessage `json:"error"`
+		Code  json.RawMessage `json:"code"`
+	}
+	if err := json.Unmarshal(body, &v); err != nil {
+		// 整体不是 JSON 对象：按非信封处理（HTML 等由 Content-Type 守卫负责）
+		return false
+	}
+	if v.Type == "error" {
+		return true
+	}
+	if len(v.Error) > 0 && string(v.Error) != "null" {
+		return true
+	}
+	if len(v.Code) > 0 && string(v.Code) != "null" {
+		var n float64
+		if json.Unmarshal(v.Code, &n) != nil {
+			return true // 非数值 code（字符串形态）按错误信封处理
+		}
+		if n != 0 {
+			return true
+		}
+	}
+	return false
 }
 
 // buildUpstreamRequest 组装上游 URL 与请求头（agent.py build_request + zcode-switch 身份头合并）
@@ -751,7 +823,8 @@ func writeUpstreamErrorForProto(w http.ResponseWriter, resp *http.Response, text
 	})
 }
 
-// RefreshAccountQuotaThrottled 成功请求后的即时额度刷新（30s 节流 + 进程内单飞）
+// RefreshAccountQuotaThrottled 成功请求后的即时额度刷新（30s 节流；
+// 进程内单飞由 RefreshAccountQuota 统一把守，所有入口共享）
 func (z *ZCodeAPI) RefreshAccountQuotaThrottled(a *Account) {
 	if a.Provider != "zai" || a.ZCodeJWT == "" {
 		return
@@ -760,17 +833,12 @@ func (z *ZCodeAPI) RefreshAccountQuotaThrottled(a *Account) {
 		return
 	}
 	// lastCheckedAt 来自 ListAccounts 的库内快照，N 个并发请求可能同时选中同一
-	// 账号副本并通过节流检查；LoadOrStore 把它们收敛为一次 billing 拉取
-	if _, busy := z.quotaRefreshInflight.LoadOrStore(a.ID, struct{}{}); busy {
-		return
-	}
-	defer z.quotaRefreshInflight.Delete(a.ID)
-	if err := z.RefreshAccountQuota(a); err != nil {
+	// 账号副本并通过节流检查；RefreshAccountQuota 的单飞把它们收敛为一次拉取
+	if err := z.RefreshAccountQuota(a); err != nil && !errors.Is(err, errRefreshInFlight) {
 		log.Printf("[quota] throttled refresh %s: %v", a.Email, err)
 	}
 }
 
-// recordUsage 落 usage_records
 // recordUsage 落 usage_records；clientStream 为客户端真实请求模式（非上游内部流式标志）
 func (z *ZCodeAPI) recordUsage(a *Account, r *http.Request, payload []byte, statusCode int, start time.Time, ttftMs int, usage *StreamUsage, clientStream bool) {
 	var body map[string]interface{}

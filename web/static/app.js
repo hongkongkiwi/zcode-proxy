@@ -106,6 +106,8 @@ function showApp(username) {
 }
 
 async function doLogin() {
+  const loginBtn = document.querySelector('#loginPage .btn-primary');
+  if (loginBtn && loginBtn.disabled) return; // 在途请求防重（Enter 连击）
   const username = document.getElementById('loginUser').value.trim() || 'admin';
   const password = document.getElementById('loginPass').value;
   const errEl = document.getElementById('loginError');
@@ -116,6 +118,7 @@ async function doLogin() {
   try {
     const data = await api('/api/login', { method: 'POST', body: { username, password } });
     showApp(data.username);
+    if (data.is_default_password) warnDefaultPassword();
   } catch (e) {
     const msg = e.message || t('登录失败');
     errEl.textContent = msg;
@@ -135,9 +138,17 @@ async function checkAuth() {
   try {
     const d = await api('/api/auth/check');
     showApp(d.username || 'admin');
+    if (d.is_default_password) warnDefaultPassword();
   } catch (e) {
     showLogin();
   }
+}
+
+// warnDefaultPassword 初始随机口令未修改时的醒目提醒（后端 is_default_password=1）
+function warnDefaultPassword() {
+  if (warnDefaultPassword._shown) return;
+  warnDefaultPassword._shown = true;
+  setTimeout(() => toast(t('当前使用初始管理口令，请尽快在「设置 → 账号安全」中修改'), 'error'), 800);
 }
 
 document.getElementById('loginPass').addEventListener('keydown', e => { if (e.key === 'Enter') doLogin(); });
@@ -155,7 +166,7 @@ function switchSection(name) {
   if (name === 'accounts') { loadGroups(); loadAccounts(); }
   if (name === 'activity') { loadPlans(); loadClaimRecords(); loadPlanRuns(); }
   if (name === 'usage') { loadUsageStats(); loadUsageRecords(); }
-  if (name === 'llmtest') { loadLlmKey(); }
+  if (name === 'llmtest') { loadLlmKey(); initLlmPlaceholders(); }
   if (name === 'settings') loadSettings();
 }
 
@@ -281,6 +292,15 @@ function showQuotaModal(id) {
         <div class="kv-item"><div class="k">${t('数据源')}</div><div class="v">${esc(q.source || '-')}</div></div>
         <div class="kv-item"><div class="k">${t('刷新时间')}</div><div class="v">${fmtT(q.refreshed_at)}</div></div>
       </div>
+      ${(q.channels && q.channels.length) ? `<div style="margin-bottom:14px">
+        <div style="font-weight:700;font-size:13px;margin-bottom:6px">${t('双通道额度构成')}</div>
+        ${q.channels.map(c => `
+          <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;border:1px solid var(--c-border);border-radius:8px;padding:8px 12px;margin-bottom:6px;font-size:12.5px">
+            <div><b>${esc(c.source)}</b> <span class="badge badge-secondary">${esc(c.plan_tier || '-')}</span>
+              ${c.exhausted ? `<span class="badge badge-danger">${t('已耗尽')}</span>` : `<span class="badge badge-success">${t('有余量')}</span>`}</div>
+            <div>${t('剩余 %s', fmtNum(c.remaining))}${c.next_reset ? ` · ${tf('重置 %s', fmtT(c.next_reset))}` : ''}</div>
+          </div>`).join('')}
+      </div>` : ''}
       ${slots.map(s => `
         <div style="border:1px solid var(--c-border);border-radius:10px;padding:12px 14px;margin-bottom:12px">
           <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:6px;margin-bottom:8px">
@@ -334,7 +354,7 @@ function renderAccounts() {
         <td style="min-width:190px;cursor:pointer" title="${t('点击查看套餐与额度构成')}" onclick="showQuotaModal(${a.id})">${quotaCell(a)}</td>
         <td><span class="mono" title="${esc(a.device_mid)}">${a.device_mid ? esc(a.device_mid.slice(0, 8)) + '…' : '-'}</span></td>
         <td>${a.use_count} / ${a.fail_count}<div style="font-size:10.5px;color:var(--c-text-lighter)">${fmtAgo(a.last_used_at)}</div></td>
-        <td style="max-width:170px">${a.last_claim_at ? `<div style="font-size:11px">${esc(a.last_claim_plan || '')}</div><div style="font-size:10.5px;color:var(--c-text-lighter)">${esc(a.last_claim_msg || '').slice(0, 40)}</div>` : '<span style="color:var(--c-text-lighter)">-</span>'}</td>
+        <td style="max-width:170px">${a.last_claim_at ? `<div style="font-size:11px">${esc(a.last_claim_plan || '')}</div><div style="font-size:10.5px;color:var(--c-text-lighter)">${esc((a.last_claim_msg || '').slice(0, 40))}</div>` : '<span style="color:var(--c-text-lighter)">-</span>'}</td>
         <td class="actions-cell">
           <button class="btn btn-sm btn-secondary" onclick="refreshQuota(${a.id})">${t('刷新')}</button>
           <button class="btn btn-sm btn-primary" onclick="claimNow(${a.id})">${t('领活动')}</button>
@@ -372,7 +392,8 @@ async function refreshQuota(id) {
 async function refreshAllQuota() {
   toast(t('正在刷新所有账号额度…'), 'info');
   try {
-    const list = accountsCache.length ? accountsCache : (await api('/api/accounts')).accounts || [];
+    // 始终取全量列表：accountsCache 可能带着分组筛选，只刷当前组却提示"全部"会误导
+    const list = (await api('/api/accounts')).accounts || [];
     for (const a of list) {
       try { await api(`/api/accounts/${a.id}/refresh`, { method: 'POST' }); } catch (e) { /* 单个失败继续 */ }
     }
@@ -412,7 +433,8 @@ async function detectNow(id) {
 async function detectAllAccounts() {
   let list;
   try {
-    list = accountsCache.length ? accountsCache : (await api('/api/accounts')).accounts || [];
+    // 全量列表：不受当前分组筛选影响（与"检测全部"语义一致）
+    list = (await api('/api/accounts')).accounts || [];
   } catch (e) { toast(tf('检测失败: %s', e.message), 'error'); return; }
   toast(tf('正在检测 %s 个账号的活动…', list.length), 'info');
   let found = 0;
@@ -444,8 +466,8 @@ async function resetQuota(id) {
       <div class="kv-grid" style="margin-bottom:14px">
         <div class="kv-item"><div class="k">${t('5 小时窗口重置')}</div><div class="v">${tf('%s 次可用', five)}</div></div>
         <div class="kv-item"><div class="k">${t('周重置')}</div><div class="v">${tf('%s 次可用', week)}</div></div>
-        <div class="kv-item"><div class="k">${t('最近 5h 重置')}</div><div class="v">${s.latest_five_hour_reset_history ? fmtEpoch(s.latest_five_hour_reset_history.used_at) : t('无')}</div></div>
-        <div class="kv-item"><div class="k">${t('最近周重置')}</div><div class="v">${s.latest_week_reset_history ? fmtEpoch(s.latest_week_reset_history.used_at) : t('无')}</div></div>
+        <div class="kv-item"><div class="k">${t('最近 5h 重置')}</div><div class="v">${s.latest_five_hour_reset_history ? fmtEpoch(s.latest_five_hour_reset_history.used_at / 1000) : t('无')}</div></div>
+        <div class="kv-item"><div class="k">${t('最近周重置')}</div><div class="v">${s.latest_week_reset_history ? fmtEpoch(s.latest_week_reset_history.used_at / 1000) : t('无')}</div></div>
       </div>
       <div class="hint">${t('消耗一次机会立即恢复对应窗口配额（优先 five_hour）。')}</div>
       <div class="actions"><button class="btn btn-secondary" onclick="closeModal()">${t('取消')}</button>
@@ -482,6 +504,7 @@ function editAccount(id) {
   openModal(`<h3>${t('编辑账号')}</h3>
     <div class="form-group"><label>${t('分组')}</label><select id="editGroup">${groupOptions(a.group)}</select></div>
     <div class="form-group"><label>${t('备注')}</label><input type="text" id="editRemark" value="${esc(a.remark)}"></div>
+    <div class="form-group"><label>${t('Priority（priority 策略：数值小者先用，促销层默认 50）')}</label><input type="number" id="editPriority" class="form-input" min="1" max="9999" value="${a.priority || 100}"></div>
     <div class="form-group"><label><input type="checkbox" id="editEnabled" ${a.enabled ? 'checked' : ''} style="width:auto;margin-right:6px">${t('启用（参与轮询）')}</label></div>
     <div class="actions"><button class="btn btn-secondary" onclick="closeModal()">${t('取消')}</button>
     <button class="btn btn-primary" onclick="submitEditAccount(${id})">${t('保存')}</button></div>`);
@@ -497,6 +520,7 @@ async function submitEditAccount(id) {
     await api(`/api/accounts/${id}`, { method: 'PUT', body: {
       group, remark: document.getElementById('editRemark').value,
       enabled: document.getElementById('editEnabled').checked,
+      priority: parseInt(document.getElementById('editPriority').value, 10) || 100,
     }});
     closeModal(); toast(t('已保存')); loadGroups(); loadAccounts();
   } catch (e) { toast(e.message, 'error'); }
@@ -581,6 +605,7 @@ async function submitPaste() {
 // ---- OAuth 登录 ----
 
 let oauthPollTimer = null;
+let oauthRedirectTimer = null;
 
 function showOAuthModal() {
   openModal(`<h3>${t('OAuth 登录新账号')}</h3>
@@ -605,16 +630,17 @@ async function startOAuth() {
     const r = await api('/api/accounts/oauth/start', { method: 'POST', body: { manual, group } });
     window._oauthState = r.state;
     if (!manual) {
-      window.open(r.authorize_url, '_blank');
+      window.open(r.authorize_url, '_blank', 'noopener'); // noopener 下返回值恒为 null，不据此判断是否被拦截
       document.getElementById('oauthStep2').innerHTML =
-        `<div class="hint" style="margin-top:10px">${t('已在新标签页打开 Z.AI 授权页，登录并授权后自动跳回本网关完成入库。')}</div>
-         <div class="hint" style="margin-top:6px;color:var(--c-warning-dark)">${t('若授权后浏览器没有自动跳回（或 Z.AI 页面报错），请复制授权后地址栏的完整 URL，切换到「手动粘贴」模式提交。')}</div>
+        `<div class="hint" style="margin-top:10px">${t('已在新标签页打开 Z.AI 授权页，登录并授权后自动跳回本网关完成入库。')} <a href="${esc(r.authorize_url)}" target="_blank" rel="noopener">${t('打开授权页')}</a></div>
+         <div class="hint" style="margin-top:6px;color:var(--c-warning-dark)">${t('若授权后无法自动跳回（当前上游常报 Redirect URI 未注册），请点「取消」，把模式切换为「手动粘贴」后重新发起登录并提交新授权页跳转的完整 URL——旧授权码不可复用。')}</div>
          <div id="oauthStatus" style="margin-top:8px;font-size:13px"></div>`;
+      btn.disabled = false; // 允许改手动模式后重新发起（旧 code 因 redirect_uri 不同无法复用）
       pollOAuth();
     } else {
-      window.open(r.authorize_url, '_blank');
+      window.open(r.authorize_url, '_blank', 'noopener');
       document.getElementById('oauthStep2').innerHTML =
-        `<div class="hint" style="margin-top:10px">${t('已在新标签页打开 Z.AI 授权页。步骤：① 登录并同意授权 → ② 浏览器会跳到 <b>zcode.z.ai/login?code=…</b> → ③ 复制该地址栏<b>完整 URL</b>粘贴到下面 → ④ 提交兑换。')}</div>
+        `<div class="hint" style="margin-top:10px">${t('已在新标签页打开 Z.AI 授权页。步骤：① 登录并同意授权 → ② 浏览器会跳到 <b>zcode.z.ai/login?code=…</b> → ③ 复制该地址栏<b>完整 URL</b>粘贴到下面 → ④ 提交兑换。')} <a href="${esc(r.authorize_url)}" target="_blank" rel="noopener">${t('打开授权页')}</a></div>
          <div class="form-group" style="margin-top:10px"><label>${t('粘贴回跳 URL（或仅 code）')}</label>
          <textarea id="oauthManualInput" class="form-textarea" style="min-height:70px" placeholder="https://zcode.z.ai/login?code=...&state=..."></textarea></div>
          <button class="btn btn-success" onclick="submitOAuthManual()">${t('提交兑换')}</button>
@@ -646,11 +672,12 @@ function pollOAuth() {
     if (!window._oauthState) return;
     try {
       const f = await api('/api/accounts/oauth/status?state=' + encodeURIComponent(window._oauthState));
+      if (!window._oauthState) return; // await 期间用户已取消：不得再拉起跳转定时器
       const el = document.getElementById('oauthStatus');
       if (f.status === 'ready') {
         clearInterval(oauthPollTimer);
         toast(tf('登录成功: %s', f.email || ''));
-        setTimeout(() => { closeModal(); switchSection('accounts'); }, 800);
+        oauthRedirectTimer = setTimeout(() => { closeModal(); switchSection('accounts'); }, 800);
       } else if (f.status === 'failed') {
         clearInterval(oauthPollTimer);
         if (el) el.innerHTML = `<span style="color:var(--c-danger)">${esc(f.message)}</span>`;
@@ -664,6 +691,7 @@ function pollOAuth() {
 
 function cancelOAuth() {
   clearInterval(oauthPollTimer);
+  clearTimeout(oauthRedirectTimer);
   window._oauthState = null;
   closeModal();
 }
@@ -694,7 +722,7 @@ function renderPlans() {
     <tbody>${plansCache.map(p => `
       <tr>
         <td style="font-weight:700">${esc(p.plan_name)}</td>
-        <td><span class="badge badge-info">${taskLabel(p.task_type)}</span></td>
+        <td><span class="badge badge-info">${esc(taskLabel(p.task_type))}</span></td>
         <td class="mono">${esc(p.cron_expr)}</td>
         <td>${p.target_type === 'single_account' ? tf('账号#%s', p.account_id) : p.target_type === 'group' ? tf('分组: %s', esc(p.account_group)) : t('全部账号')}</td>
         <td>${p.delay_seconds}s</td>
@@ -712,14 +740,24 @@ function renderPlans() {
 
 async function showPlanModal(id) {
   const p = plansCache.find(x => x.id === id) || {};
-  // 账号缓存为空（如启动后直接进入活动页）时先拉取：
-  // 否则 single_account 计划保存时 planAccount 只有占位项，account_id 会被静默归零
-  if (!accountsCache.length) {
+  // 账号缓存为空（如启动后直接进入活动页）、或缓存带着分组筛选而当前计划的
+  // 目标账号不在其中时，拉取全量列表：否则 single_account 计划编辑时看不到
+  // 真实目标，保存也会被拒
+  let listLoadFailed = false;
+  const targetMissing = id && p.target_type === 'single_account' &&
+    !(accountsCache || []).some(a => a.id === p.account_id);
+  if (!(accountsCache || []).length || targetMissing) {
     try { accountsCache = (await api('/api/accounts')).accounts || []; }
-    catch (e) { toast(tf('账号列表加载失败: %s', e.message), 'error'); }
+    catch (e) { listLoadFailed = true; toast(tf('账号列表加载失败: %s', e.message), 'error'); }
   }
-  const accountOpts = (accountsCache.length ? accountsCache : []).map(a =>
+  let accountOpts = (accountsCache.length ? accountsCache : []).map(a =>
     `<option value="${a.id}" ${p.account_id === a.id ? 'selected' : ''}>${esc(a.email || a.display_name || ('#' + a.id))}</option>`).join('');
+  // 目标账号不在列表：列表加载失败或账号已被删除——如实区分，避免误导排查
+  if (id && p.target_type === 'single_account' && p.account_id &&
+      !accountsCache.some(a => a.id === p.account_id)) {
+    const label = listLoadFailed ? t('当前目标，列表加载失败') : t('当前目标（账号已删除）');
+    accountOpts += `<option value="${p.account_id}" selected>#${p.account_id}（${esc(label)}）</option>`;
+  }
   openModal(`<h3>${id ? t('编辑计划') : t('新建计划')}</h3>
     <div class="form-group"><label>${t('计划名称')}</label><input type="text" id="planName" value="${esc(p.plan_name || '')}" placeholder="${t('例如：每日领取活动')}"></div>
     <div class="form-group"><label>${t('任务类型')}</label>
@@ -805,7 +843,7 @@ async function pollRunning() {
     if (!running.length) { bar.innerHTML = ''; return; }
     bar.innerHTML = running.map(s => `
       <div class="running-bar">
-        <span class="rb-title">${tf('▶ %s（%s）', esc(s.plan_name), taskLabel(s.task_type))}</span>
+        <span class="rb-title">${tf('▶ %s（%s）', esc(s.plan_name), esc(taskLabel(s.task_type)))}</span>
         <div class="progress-track" style="flex:1;min-width:120px"><div class="progress-fill" style="width:${s.total ? s.done / s.total * 100 : 0}%"></div></div>
         <span class="rb-meta">${s.done}/${s.total} · ✅${s.success} ❌${s.fail}${s.current_account ? ' · ' + esc(s.current_account) : ''}</span>
       </div>`).join('');
@@ -823,7 +861,7 @@ async function loadClaimRecords() {
       <tbody>${recs.map(r => `<tr>
         <td style="font-size:12px">${esc(r.created_at)}</td>
         <td>${esc(r.email || ('#' + r.account_id))}</td>
-        <td><span class="badge badge-info">${taskLabel(r.task_type)}</span></td>
+        <td><span class="badge badge-info">${esc(taskLabel(r.task_type))}</span></td>
         <td>${esc(r.plan_name || r.plan_id || '-')}</td>
         <td>${r.success ? `<span class="badge badge-success">${t('成功')}</span>` : `<span class="badge badge-danger">${t('失败')}</span>`}${r.code ? ` <span class="mono" style="font-size:11px">code=${r.code}</span>` : ''}</td>
         <td style="max-width:280px" title="${esc(r.message)}">${esc(r.message || '')}</td>
@@ -842,7 +880,7 @@ async function loadPlanRuns() {
       <tbody>${recs.map(r => `<tr>
         <td style="font-size:12px">${esc(r.run_at)}</td>
         <td>${esc(r.plan_name)}</td>
-        <td><span class="badge badge-info">${taskLabel(r.task_type)}</span></td>
+        <td><span class="badge badge-info">${esc(taskLabel(r.task_type))}</span></td>
         <td>${r.status === 'success' ? `<span class="badge badge-success">${t('成功')}</span>` : `<span class="badge badge-danger">${t('失败')}</span>`}</td>
         <td>${r.success_count} / ${r.fail_count}</td>
         <td>${(r.duration_ms / 1000).toFixed(1)}s</td>
@@ -897,6 +935,7 @@ async function loadSettings() {
     document.getElementById('setGlobalProxy').value = s.upstream_proxy || '';
     document.getElementById('setCaptchaMode').value = s.captcha_mode || 'auto';
     document.getElementById('setGatewayModels').value = s.gateway_models || '';
+    document.getElementById('setSticky').checked = !(s.sticky_sessions === '0' || s.sticky_sessions === 'false');
     window._fpCurrent = s.fingerprint || 'chrome';
     window._ja3Current = s.custom_ja3 || '';
     loadGatewayKey();
@@ -948,6 +987,7 @@ async function saveStrategySettings() {
     await api('/api/settings', { method: 'PUT', body: {
       selection_strategy: document.getElementById('setStrategy').value,
       quota_refresh_interval: document.getElementById('setQuotaInterval').value,
+      sticky_sessions: document.getElementById('setSticky').checked ? '1' : '0',
     }});
     toast(t('策略已保存'));
   } catch (e) { toast(e.message, 'error'); }
@@ -1418,6 +1458,7 @@ async function runLlmTest() {
   contentEl.textContent = text
     ? text
     : (think ? t('【模型仅输出思考过程（max_tokens 不足或未产出正文）】') + '\n' + think : t('（空响应）'));
+  contentEl.dataset.placeholderLang = ''; // 真实输出：不再是占位文案
   llmHistory.unshift({ t: new Date().toLocaleTimeString(), proto, model, status, latency, ttft, ok });
   document.getElementById('llmHistory').innerHTML = llmHistory.slice(0, 10).map(h =>
     `<div>${esc(h.t)} · ${esc(h.proto)} · ${esc(h.model)} · <span style="color:${h.ok ? 'var(--c-success-dark)' : 'var(--c-danger)'}">${h.status}</span> · ${h.latency}ms${h.ttft ? ' / ttft ' + h.ttft + 'ms' : ''}</div>`).join('');
@@ -1426,18 +1467,32 @@ async function runLlmTest() {
 
 function clearLlmHistory() {
   llmHistory = [];
-  document.getElementById('llmHistory').innerHTML = t('（无）');
+  const h = document.getElementById('llmHistory');
+  h.innerHTML = t('（无）');
+  h.dataset.placeholderLang = CURRENT_LANG;
   document.getElementById('llmResult').innerHTML = '';
-  document.getElementById('llmContent').textContent = t('（尚未运行）');
+  const c = document.getElementById('llmContent');
+  c.textContent = t('（尚未运行）');
+  c.dataset.placeholderLang = CURRENT_LANG;
 }
 
 // llmContent/llmHistory 不带 data-i18n（语言切换会覆盖真实测试输出），
-// 占位文案在启动时按当前语言写入
+// 占位文案按当前语言写入；语言切换后占位跟随更新（真实输出不受影响）
 function initLlmPlaceholders() {
-  const c = document.getElementById('llmContent');
+  const apply = (el, text) => {
+    if (!el) return;
+    if (el.dataset.placeholderLang === undefined) return; // 尚未初始化过占位
+    if (el.dataset.placeholderLang === '') return;        // 已是真实输出，不覆盖
+    if (el.dataset.placeholderLang === CURRENT_LANG) return; // 占位已是当前语言
+    el.textContent = text;
+    el.dataset.placeholderLang = CURRENT_LANG;
+  };
+  apply(document.getElementById('llmContent'), t('（尚未运行）'));
   const h = document.getElementById('llmHistory');
-  if (c && !c.textContent.trim()) c.textContent = t('（尚未运行）');
-  if (h && !h.textContent.trim()) h.innerHTML = t('（无）');
+  if (h && !llmHistory.length && h.dataset.placeholderLang !== undefined) {
+    h.innerHTML = t('（无）');
+    h.dataset.placeholderLang = CURRENT_LANG;
+  }
 }
 
 // setLlmPrompt 快捷提示词填入

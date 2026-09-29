@@ -138,6 +138,10 @@ func (am *AuthManager) verifyPassword(pwd string) bool {
 			// 登录本身仍以 legacy 比对结果为准
 			if hash, err := hashPassword(pwd); err == nil {
 				am.db.SetPasswordHash(hash)
+				// 仍是缺省口令（admin/admin 老库）：标记之，UI 会提示修改
+				if pwd == "admin" {
+					am.db.SetDefaultPasswordFlag(true)
+				}
 				log.Printf("[auth] password hash migrated to bcrypt")
 			} else {
 				log.Printf("[auth] bcrypt migration skipped: %v", err)
@@ -188,7 +192,13 @@ func (am *AuthManager) recordLoginFail(key string) {
 	}
 	f.count++
 	if f.count >= loginMaxFails {
-		backoff := loginLockBase << (uint(f.count/loginMaxFails) - 1)
+		// 指数退避的位移必须封顶：60s<<28 会溢出 int64 变成负数，
+		// 反而让锁定彻底失效（141 次失败后无限免费重试）
+		k := f.count/loginMaxFails - 1
+		if k > 8 {
+			k = 8
+		}
+		backoff := loginLockBase << uint(k)
 		if backoff > loginLockMax {
 			backoff = loginLockMax
 		}
@@ -214,8 +224,14 @@ func (am *AuthManager) adminUser() string {
 
 func (am *AuthManager) isDefaultPassword() bool {
 	if am.db != nil {
-		isDefault, _ := am.db.IsDefaultPassword()
-		return isDefault
+		if isDefault, _ := am.db.IsDefaultPassword(); isDefault {
+			return true
+		}
+		// 从未写过标记的老库：仍是无盐 admin 缺省哈希时继续提示
+		if stored, _ := am.db.GetPasswordHash(); stored != "" && !strings.HasPrefix(stored, "$2") {
+			return legacyHash("admin") == stored
+		}
+		return false
 	}
 	return am.fallbackPwd == "admin"
 }
@@ -453,13 +469,26 @@ func (am *AuthManager) HandleChangePassword(w http.ResponseWriter, r *http.Reque
 		writeAPIError(w, http.StatusBadRequest, fmt.Sprintf("new_password must be at most %d bytes", maxPasswordBytes))
 		return
 	}
-	am.mu.Lock()
-	defer am.mu.Unlock()
-
+	// 改密接口会拿旧口令做校验且成功即接管账号：与导出同样的 stolen-session
+	// 威胁模型，必须有指数退避限速，否则可无节流爆破 old_password
+	rateKey := clientIP(r) + "|password-change"
+	if wait := am.checkLoginRate(rateKey); wait > 0 {
+		writeAPIError(w, http.StatusTooManyRequests,
+			fmt.Sprintf("尝试过于频繁，请 %d 秒后再试", int(wait.Seconds())+1))
+		return
+	}
+	// 旧口令验证（bcrypt 耗时）放在会话锁外，与 Login 同一设计——
+	// 否则改密风暴会以 ~100ms/次的速度冻结整个 /api 面
 	if !am.verifyPassword(body.OldPassword) {
+		am.recordLoginFail(rateKey)
 		writeAPIError(w, http.StatusUnauthorized, "old password incorrect")
 		return
 	}
+	am.clearLoginFail(rateKey)
+
+	am.mu.Lock()
+	defer am.mu.Unlock()
+
 	if am.db != nil {
 		hash, err := hashPassword(body.NewPassword)
 		if err != nil {

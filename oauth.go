@@ -150,16 +150,18 @@ func (m *OAuthManager) HandleCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if errParam != "" {
+		// 原子守卫：状态检查与翻转在同一临界区内，error 回调不得翻转
+		// 已成功（ready）或兑换中（exchanging）的流程
 		m.mu.Lock()
-		st := flow.Status
-		m.mu.Unlock()
-		if st == "ready" || st == "exchanging" {
-			// 重放/伪造的 error 回调不得翻转已成功或兑换中的流程
+		if flow.Status == "ready" || flow.Status == "exchanging" {
+			m.mu.Unlock()
 			fmt.Fprint(w, `<html><body style="font-family:sans-serif;text-align:center;padding-top:80px">
 				<h2>ℹ️ 登录流程已在进行中或已完成</h2><p>请回到管理界面查看登录状态。</p></body></html>`)
 			return
 		}
-		m.finishFlow(flow, "", fmt.Sprintf("授权被拒绝: %s", firstNonEmpty(errDesc, errParam)))
+		flow.Status = "failed"
+		flow.Message = fmt.Sprintf("授权被拒绝: %s", firstNonEmpty(errDesc, errParam))
+		m.mu.Unlock()
 		fmt.Fprint(w, `<html><body style="font-family:sans-serif;text-align:center;padding-top:80px">
 			<h2>❌ 授权被拒绝</h2><p>`+escapeHTML(firstNonEmpty(errDesc, errParam))+`</p></body></html>`)
 		return
@@ -266,6 +268,10 @@ func (m *OAuthManager) setFlowStatus(f *OAuthFlow, status, msg string) {
 func (m *OAuthManager) finishFlow(f *OAuthFlow, email, errMsg string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	// 已成功的流程不得被并发失败翻转（如 pollLoop 超时与兑换完成赛跑）
+	if f.Status == "ready" {
+		return
+	}
 	if errMsg != "" {
 		f.Status = "failed"
 		f.Message = errMsg

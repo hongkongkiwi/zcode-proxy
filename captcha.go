@@ -325,8 +325,9 @@ func (s *CaptchaService) fetchConfig(a *Account) (*CaptchaConfig, error) {
 	s.mu.Unlock()
 
 	urlStr := fmt.Sprintf("%s?version=%s&os=%s", ClientConfigsURL, s.appVersion, NodePlatform())
-	// 配置接口无需认证，直接裸请求（zcode.z.ai → 指纹客户端）
-	client := ClientForURL("", urlStr, 20*time.Second)
+	// 配置接口无需认证，但必须走全局出口代理（与上游其余调用同一网络路径），
+	// 否则配置直连失败会让所有求解在起点就报废
+	client := ClientForURL(captchaGlobalProxyHook(), urlStr, 20*time.Second)
 	req, _ := http.NewRequest("GET", urlStr, nil)
 	id := NewClientIdentity(s.appVersion, "")
 	for k, v := range ZaiClientHeaders(id) {
@@ -449,7 +450,17 @@ func (s *CaptchaService) solveWithBrowser(cc *CaptchaConfig, headless bool, a *A
 		}
 		controlURL = res.url
 	case <-time.After(captchaLaunchTimeout):
-		l.Kill() // 卡死的 Launch：回收残留进程
+		// 卡死的 Launch：即时杀一次，并留观察者在迟到的 Launch 完成后补杀——
+		// 否则残留 Chrome 会一直占着该组的 user-data-dir 单例锁。
+		// 观察者无界等待是刻意的：泊住一个 goroutine 远比泄漏一个
+		// 占着 profile 锁的 Chrome 进程便宜（Launch 永不返回时泄漏的
+		// 只有 launch goroutine 本身）
+		l.Kill()
+		go func() {
+			if res := <-lch; res.err == nil {
+				l.Kill()
+			}
+		}()
 		return "", fmt.Errorf("启动浏览器超时（%v）", captchaLaunchTimeout)
 	}
 	// Launch 成功后立即登记兜底回收：Connect/后续任何失败都杀进程
@@ -538,6 +549,9 @@ func (s *CaptchaService) solveWithBrowser(cc *CaptchaConfig, headless bool, a *A
 
 // captchaProxyHook 由 main 注入：返回账号组出口代理 URL
 var captchaProxyHook = func(a *Account) string { return "" }
+
+// captchaGlobalProxyHook 由 main 注入：返回全局出口代理 URL（config 接口用）
+var captchaGlobalProxyHook = func() string { return "" }
 
 // browserProfileHook 由 main 注入：返回持久化浏览器配置目录
 var browserProfileHook = func() string { return "" }

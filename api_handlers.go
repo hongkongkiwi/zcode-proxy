@@ -2,9 +2,11 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -173,7 +175,7 @@ func accountPublicView(a *Account) map[string]interface{} {
 		"has_access_token": a.AccessToken != "", "has_creds_snapshot": a.CredsRaw != "",
 		"device_mid": a.DeviceMid,
 		"status":     EffectiveStatus(a), "raw_status": a.Status, "enabled": a.Enabled,
-		"group": a.AccountGroup, "remark": a.Remark,
+		"group": a.AccountGroup, "remark": a.Remark, "priority": accountPriority(a),
 		"plan_tier": a.PlanTier, "plan_expire": a.PlanExpire,
 		"total_units": a.TotalUnits, "used_units": a.UsedUnits, "remaining": a.Remaining,
 		"quota":           quota,
@@ -390,10 +392,25 @@ func (s *APIServer) handleAccountRefresh(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	if err := s.zapi.RefreshAccountQuota(a); err != nil {
+		if errors.Is(err, errRefreshInFlight) {
+			// 已有并发刷新在跑：不算失败，返回当前快照即可（账号可能已被并发删除）
+			a2, err2 := s.db.GetAccount(id)
+			if err2 != nil {
+				writeAPIError(w, http.StatusNotFound, err2.Error())
+				return
+			}
+			writeJSON(w, http.StatusOK, map[string]interface{}{"success": true, "account": accountPublicView(a2), "message": "刷新已在进行中"})
+			return
+		}
 		writeAPIError(w, http.StatusBadGateway, err.Error())
 		return
 	}
-	a2, _ := s.db.GetAccount(id)
+	a2, err := s.db.GetAccount(id)
+	if err != nil {
+		// 刷新期间账号被删：如实 404，不得拿 nil 账号渲染
+		writeAPIError(w, http.StatusNotFound, err.Error())
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{"success": true, "account": accountPublicView(a2)})
 }
 
@@ -509,9 +526,10 @@ func (s *APIServer) handleUpdateAccount(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	var body struct {
-		Group   *string `json:"group"`
-		Remark  *string `json:"remark"`
-		Enabled *bool   `json:"enabled"`
+		Group    *string `json:"group"`
+		Remark   *string `json:"remark"`
+		Enabled  *bool   `json:"enabled"`
+		Priority *int64  `json:"priority"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeAPIError(w, http.StatusBadRequest, "invalid request body")
@@ -535,6 +553,16 @@ func (s *APIServer) handleUpdateAccount(w http.ResponseWriter, r *http.Request) 
 	if err := s.db.UpdateAccountFields(id, group, remark, enabled); err != nil {
 		writeAPIError(w, http.StatusInternalServerError, err.Error())
 		return
+	}
+	if body.Priority != nil {
+		if *body.Priority < 0 || *body.Priority > 9999 {
+			writeAPIError(w, http.StatusBadRequest, "priority 取值范围 1-9999")
+			return
+		}
+		if err := s.db.UpdateAccountPriority(id, *body.Priority); err != nil {
+			writeAPIError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
 	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{"success": true})
 }
@@ -648,8 +676,34 @@ func (s *APIServer) handleSavePlan(w http.ResponseWriter, r *http.Request) {
 	if p.TaskType == "" {
 		p.TaskType = "claim"
 	}
+	switch p.TaskType {
+	case "claim", "detect", "activate", "reset":
+	default:
+		writeAPIError(w, http.StatusBadRequest, "无效任务类型: "+p.TaskType)
+		return
+	}
 	if p.TargetType == "" {
 		p.TargetType = "all_accounts"
+	}
+	switch p.TargetType {
+	case "all_accounts", "single_account", "group":
+	default:
+		// 未知 target_type 会被调度器当 all_accounts 处理——写错一个字母
+		// 就从"单账号"静默变成"全账号"，必须保存时就拒绝
+		writeAPIError(w, http.StatusBadRequest, "无效目标类型: "+p.TargetType)
+		return
+	}
+	if p.TargetType == "single_account" && p.AccountID <= 0 {
+		writeAPIError(w, http.StatusBadRequest, "single_account 目标必须提供有效 account_id")
+		return
+	}
+	// POST 路径不含 {id}：客户端误带 body id 会把"新建"静默变成"覆盖他者"
+	if r.Method == http.MethodPost {
+		p.ID = 0
+	} else if _, err := s.db.GetClaimPlan(p.ID); err != nil {
+		// PUT：目标不存在时如实 404，而不是 0 行更新的假成功
+		writeAPIError(w, http.StatusNotFound, "计划不存在: "+strconv.FormatInt(p.ID, 10))
+		return
 	}
 	id, err := s.db.SaveClaimPlan(&p)
 	if err != nil {
@@ -711,7 +765,13 @@ func (s *APIServer) handlePlanRuns(w http.ResponseWriter, r *http.Request) {
 
 func (s *APIServer) handleClaimRecords(w http.ResponseWriter, r *http.Request) {
 	limit := queryInt(r, "limit", 100)
-	accountID := int64(queryInt(r, "account_id", 0))
+	// account_id=0 语义是"不过滤"，不能走 queryInt（会把 0 夹成 1）
+	accountID := int64(0)
+	if v := r.URL.Query().Get("account_id"); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
+			accountID = n
+		}
+	}
 	records, err := s.db.ListClaimRecords(limit, accountID)
 	if err != nil {
 		writeAPIError(w, http.StatusInternalServerError, err.Error())
@@ -746,7 +806,7 @@ func (s *APIServer) handleStats(w http.ResponseWriter, r *http.Request) {
 var settingsWhitelist = map[string]bool{
 	"selection_strategy": true, "quota_refresh_interval": true,
 	"upstream_proxy": true, "fingerprint": true, "custom_ja3": true,
-	"captcha_mode": true, "gateway_models": true,
+	"captcha_mode": true, "gateway_models": true, "sticky_sessions": true,
 	// 闲时免费通道（off-peak ticket queue）
 	"async_enabled": true, "async_poll_interval_ms": true,
 	"async_keepalive_ms": true, "async_max_retries": true, "async_max_wait_sec": true,
@@ -786,7 +846,7 @@ func (s *APIServer) handlePutSettings(w http.ResponseWriter, r *http.Request) {
 		}
 		if k == "selection_strategy" {
 			switch v {
-			case StrategyRandom, StrategyRoundRobin, StrategyBestQuota:
+			case StrategyRandom, StrategyRoundRobin, StrategyBestQuota, StrategyPriority:
 			default:
 				writeAPIError(w, http.StatusBadRequest, "无效策略: "+v)
 				return
@@ -808,6 +868,26 @@ func (s *APIServer) handlePutSettings(w http.ResponseWriter, r *http.Request) {
 				writeAPIError(w, http.StatusBadRequest, "无效 JA3: "+err.Error())
 				return
 			}
+		}
+		if k == "upstream_proxy" && strings.TrimSpace(v) != "" {
+			// 无校验的代理值会静默退化成直连（隐私失败）或全量连接失败
+			trimmed := strings.TrimSpace(v)
+			u, err := url.Parse(trimmed)
+			if err != nil || u.Host == "" {
+				writeAPIError(w, http.StatusBadRequest, "无效上游代理地址（示例: http://host:port 或 socks5://user:pass@host:port）")
+				return
+			}
+			switch u.Scheme {
+			case "http", "https", "socks5", "socks5h":
+			default:
+				writeAPIError(w, http.StatusBadRequest, "不支持的代理协议: "+u.Scheme+"（支持 http/https/socks5/socks5h）")
+				return
+			}
+			if (u.Scheme == "socks5" || u.Scheme == "socks5h") && u.Port() == "" {
+				writeAPIError(w, http.StatusBadRequest, "socks5 代理必须带端口（如 socks5://host:1080）")
+				return
+			}
+			v = trimmed // 校验通过后存 trimmed 值，保证"所存即可解析"
 		}
 		pending = append(pending, settingKV{k, v})
 	}
@@ -865,9 +945,32 @@ func (s *APIServer) handleSaveProxy(w http.ResponseWriter, r *http.Request) {
 		}
 		n.ID = id
 	}
-	if n.Host == "" || n.Port <= 0 {
-		writeAPIError(w, http.StatusBadRequest, "host/port 必填")
+	if n.Host == "" || n.Port <= 0 || n.Port > 65535 {
+		writeAPIError(w, http.StatusBadRequest, "host 必填，port 须在 1-65535")
 		return
+	}
+	switch n.Type {
+	case "socks5", "http", "https":
+	default:
+		writeAPIError(w, http.StatusBadRequest, "无效代理类型: "+n.Type+"（支持 socks5/http/https）")
+		return
+	}
+	if r.Method == http.MethodPost {
+		n.ID = 0 // POST 不接受 body id：防止"新建"静默覆盖既有节点
+	} else {
+		exists := false
+		if nodes, err := s.db.ListProxyNodes(); err == nil {
+			for _, o := range nodes {
+				if o.ID == n.ID {
+					exists = true
+					break
+				}
+			}
+		}
+		if !exists {
+			writeAPIError(w, http.StatusNotFound, "代理节点不存在")
+			return
+		}
 	}
 	// 编辑时密码留空 = 保持原密码
 	if n.ID > 0 && n.Password == "" {

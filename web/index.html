@@ -22,10 +22,10 @@
 </div>
 <div class="form-group">
 <label data-i18n="密码">密码</label>
-<input type="password" id="loginPass" placeholder="admin" autocomplete="current-password">
+<input type="password" id="loginPass" placeholder="••••••••" autocomplete="current-password">
 </div>
 <button class="btn btn-primary" onclick="doLogin()" data-i18n="登录">登录</button>
-<div class="hint" data-i18n="默认账户: admin / admin">默认账户: admin / admin</div>
+<div class="hint" data-i18n="默认账户 admin，初始密码见服务端首次启动日志（或设置 ZCODE_WEB_PASS）">默认账户 admin，初始密码见服务端首次启动日志（或设置 ZCODE_WEB_PASS）</div>
 <div style="margin-top:14px;display:flex;justify-content:center"><select class="lang-select" onchange="setLangChoice(this.value)" title="Language / 语言">
 <option value="auto" data-i18n="跟随系统">跟随系统</option>
 <option value="zh">简体中文</option>
@@ -246,7 +246,12 @@
 <option value="round_robin" data-i18n="轮询（round_robin）">轮询（round_robin）</option>
 <option value="random" data-i18n="随机（random）">随机（random）</option>
 <option value="best_quota" data-i18n="剩余额度优先（best_quota）">剩余额度优先（best_quota）</option>
+<option value="priority" data-i18n="优先级级联（priority：数值小者先用，耗尽自动落到下一层）">优先级级联（priority：数值小者先用，耗尽自动落到下一层）</option>
 </select>
+</div>
+<div class="form-group" style="margin-bottom:16px">
+<label class="form-label" data-i18n="会话粘滞">会话粘滞</label>
+<div><label style="display:inline-flex;align-items:center;gap:6px;font-size:13px"><input type="checkbox" id="setSticky" style="width:auto" checked data-i18n="同一会话固定同一账号（保住上游 prompt 缓存，更省额度）">同一会话固定同一账号（保住上游 prompt 缓存，更省额度）</label></div>
 </div>
 <div class="form-group" style="margin-bottom:16px">
 <label class="form-label" data-i18n="额度自动刷新间隔（秒，0=关闭）">额度自动刷新间隔（秒，0=关闭）</label>

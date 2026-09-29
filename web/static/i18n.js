@@ -94,6 +94,7 @@ const I18N_EN = {
   '地址': 'Address',
   '测试失败: %s': 'Test failed: %s',
   '请选择目标账号': 'Please select a target account',
+  '打开授权页': 'Open authorization page',
   '账号列表加载失败: %s': 'Failed to load account list: %s',
   '当前环境不支持自动复制，请手动复制': 'Automatic copy is not supported here; please copy manually',
   '复制失败，请手动复制': 'Copy failed; please copy manually',
@@ -146,7 +147,11 @@ const I18N_EN = {
   '用户名': 'Username',
   '密码': 'Password',
   '登录': 'Sign in',
-  '默认账户: admin / admin': 'Default account: admin / admin',
+  '默认账户 admin，初始密码见服务端首次启动日志（或设置 ZCODE_WEB_PASS）': 'Default user admin; the initial password is printed once in the server log on first start (or set ZCODE_WEB_PASS).',
+  '当前使用初始管理口令，请尽快在「设置 → 账号安全」中修改': 'The initial admin password is still in use; please change it soon under Settings → Account Security.',
+  '当前目标，列表加载失败': 'current target (list failed to load)',
+  '当前目标（账号已删除）': 'current target (account deleted)',
+  '若授权后无法自动跳回（当前上游常报 Redirect URI 未注册），请点「取消」，把模式切换为「手动粘贴」后重新发起登录并提交新授权页跳转的完整 URL——旧授权码不可复用。': 'If the redirect back fails (the upstream often reports "Redirect URI not registered"), click Cancel, switch the mode to "Manual paste", start a new login, and submit the full URL of the NEW authorization redirect — old authorization codes cannot be reused.',
 
   // 语言选择器
   '跟随系统': 'System default',

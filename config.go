@@ -123,15 +123,24 @@ func (c *FileConfig) writeDefaultLocked(path string) {
 }
 
 // StartHotReload 定时热加载
-func (c *FileConfig) StartHotReload(interval time.Duration) {
+// StartHotReload 返回停止函数：停机时调用，否则 ticker 与 goroutine 随进程存活
+func (c *FileConfig) StartHotReload(interval time.Duration) (stop func()) {
 	ticker := time.NewTicker(interval)
+	done := make(chan struct{})
 	go func() {
-		for range ticker.C {
-			if err := c.reload(); err != nil {
-				log.Printf("[config] hot reload failed: %v", err)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-ticker.C:
+				if err := c.reload(); err != nil {
+					log.Printf("[config] hot reload failed: %v", err)
+				}
 			}
 		}
 	}()
+	return func() { close(done) }
 }
 
 // GetListenAddr 线程安全读取

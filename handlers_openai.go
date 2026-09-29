@@ -266,6 +266,9 @@ func openaiToAnthropic(body map[string]interface{}) (map[string]interface{}, err
 		}
 	}
 
+	// Anthropic 要求 user/assistant 严格交替：OpenAI 并行工具调用会产生
+	// 连续多条 user(tool_result)/assistant(tool_use) 消息，合并之
+	messages = mergeSameRoleMessages(messages)
 	out := map[string]interface{}{"model": model, "messages": toIfaceSlice(messages)}
 	if len(systemParts) > 0 {
 		out["system"] = strings.Join(systemParts, "\n\n")
@@ -354,6 +357,36 @@ func openaiToAnthropic(body map[string]interface{}) (map[string]interface{}, err
 		}
 	}
 	return out, nil
+}
+
+// mergeSameRoleMessages 合并相邻同角色消息（内容块拼接），保证 user/assistant 交替
+func mergeSameRoleMessages(msgs []map[string]interface{}) []map[string]interface{} {
+	var out []map[string]interface{}
+	for _, m := range msgs {
+		if n := len(out); n > 0 && out[n-1]["role"] == m["role"] {
+			prevBlocks := asBlockList(out[n-1]["content"])
+			curBlocks := asBlockList(m["content"])
+			if prevBlocks != nil && curBlocks != nil {
+				out[n-1]["content"] = append(prevBlocks, curBlocks...)
+				continue
+			}
+		}
+		out = append(out, m)
+	}
+	return out
+}
+
+// asBlockList 内容统一为块数组；无法归一化（nil 以外的非块形态）返回 nil 表示不合并
+func asBlockList(v interface{}) []map[string]interface{} {
+	switch c := v.(type) {
+	case []map[string]interface{}:
+		return c
+	case string:
+		return []map[string]interface{}{{"type": "text", "text": c}}
+	case nil:
+		return []map[string]interface{}{}
+	}
+	return nil
 }
 
 // ---- 请求体转换：OpenAI Responses → Anthropic Messages ----

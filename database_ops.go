@@ -74,27 +74,31 @@ func (db *DB) DeleteClaimPlan(id int64) error {
 	return err
 }
 
-func (db *DB) UpdateClaimPlanRun(id int64, status, msg string) error {
+// UpdateClaimPlanRunAt 写计划运行状态，显式记录触发时间：
+// 执行完成时间 ≠ 触发分钟，按完成时间写会让每分钟计划在分钟边界处漏跑
+func (db *DB) UpdateClaimPlanRunAt(id int64, status, msg, runAt string) error {
 	_, err := db.conn.Exec(`
-		UPDATE claim_plans SET last_run_at=datetime('now','localtime'),
-		last_run_status=?, last_run_msg=? WHERE id=?`, status, msg, id)
+		UPDATE claim_plans SET last_run_at=?,
+		last_run_status=?, last_run_msg=? WHERE id=?`, runAt, status, msg, id)
 	return err
 }
 
 // ---- 活动领取记录 ----
 
-// HasResetRecordNear 是否已存在该账号 ±15 分钟内的成功重置记录
-// （用于上游 used_at 去重：官方客户端等外部执行的重置不必重复入库）
+// HasResetRecordNear 是否已存在该账号 ±15 分钟内、同一重置类型（kind）的成功记录
+// （用于上游 used_at 去重：官方客户端等外部执行的重置不必重复入库。
+// 必须按 kind 区分：five_hour 与 week 背靠背消耗时互不构成重复）
 // 注意：created_at 存的是 localtime 墙钟字符串，strftime('%s') 会按 UTC 解析，
 // 需减去本地时区偏移才是真实 epoch。
-func (db *DB) HasResetRecordNear(accountID int64, usedAtSec int64) (bool, error) {
+func (db *DB) HasResetRecordNear(accountID int64, usedAtSec int64, kind string) (bool, error) {
 	_, offset := time.Now().Zone()
 	var n int
 	err := db.conn.QueryRow(
 		`SELECT COUNT(1) FROM claim_records
 		 WHERE account_id=? AND task_type='reset' AND success=1
+		   AND plan_name LIKE ?
 		   AND ABS(strftime('%s',created_at)-?-?)<900`,
-		accountID, offset, usedAtSec).Scan(&n)
+		accountID, "%("+kind+")%", offset, usedAtSec).Scan(&n)
 	return n > 0, err
 }
 

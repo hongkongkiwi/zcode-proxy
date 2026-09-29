@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"golang.org/x/net/proxy"
 	"net"
 	"net/http"
 	"net/url"
@@ -99,6 +100,14 @@ func detectTimezone() string {
 	if b, err := os.ReadFile("/etc/timezone"); err == nil {
 		if tz := strings.TrimSpace(string(b)); tz != "" {
 			return tz
+		}
+	}
+	// macOS 无 /etc/timezone：/etc/localtime 是指向 zoneinfo 的符号链接
+	if tgt, err := os.Readlink("/etc/localtime"); err == nil {
+		if i := strings.LastIndex(tgt, "/zoneinfo/"); i >= 0 {
+			if tz := tgt[i+len("/zoneinfo/"):]; tz != "" {
+				return tz
+			}
 		}
 	}
 	return "UTC"
@@ -420,6 +429,11 @@ func dialRaw(ctx context.Context, dialer *net.Dialer, proxyURL, network, addr st
 		if err != nil {
 			return nil, err
 		}
+		// 必须走 ContextDialer：旧 Dial 内部用 context.Background()，
+		// 代理握手不响应时会永久泄漏 goroutine 和连接（ctx 取消救不了它）
+		if cd, ok := sd.(proxy.ContextDialer); ok {
+			return cd.DialContext(ctx, network, addr)
+		}
 		return sd.Dial(network, addr)
 	default: // http/https 代理：CONNECT 隧道
 		conn, err := dialer.DialContext(ctx, "tcp", u.Host)
@@ -436,6 +450,23 @@ func dialRaw(ctx context.Context, dialer *net.Dialer, proxyURL, network, addr st
 
 // httpConnectTunnel 向 HTTP 代理发送 CONNECT 并等待 200
 func httpConnectTunnel(ctx context.Context, conn net.Conn, addr string, proxyURL *url.URL) error {
+	// CONNECT 握手（写请求 + 读响应）必须有界：代理接受 TCP 后不回包时，
+	// ReadResponse 会永久阻塞且 ctx 取消救不了它——用看门狗关连接
+	if dl, ok := ctx.Deadline(); ok {
+		conn.SetDeadline(dl)
+	} else {
+		conn.SetDeadline(time.Now().Add(30 * time.Second))
+	}
+	watchdog := make(chan struct{})
+	defer conn.SetDeadline(time.Time{})
+	go func() {
+		select {
+		case <-ctx.Done():
+			conn.Close()
+		case <-watchdog:
+		}
+	}()
+	defer close(watchdog)
 	req := &http.Request{
 		Method: http.MethodConnect,
 		URL:    &url.URL{Opaque: addr},

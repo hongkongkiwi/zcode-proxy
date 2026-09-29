@@ -53,7 +53,6 @@ type EndpointRouter struct {
 	retryWait time.Time
 
 	refreshMu   sync.Mutex
-	refreshing  bool
 	testTimeout time.Duration // 测试注入：覆盖 3s 默认超时
 }
 
@@ -124,35 +123,33 @@ func (r *EndpointRouter) ensureFresh() {
 	if fresh || cooling {
 		return
 	}
+	// refreshMu 串行化刷新：排队 waiter 会阻塞至在途刷新结束（单飞语义），
+	// 拿到锁后复查新鲜度——前一个 waiter 可能已完成刷新
 	r.refreshMu.Lock()
-	if r.refreshing {
-		r.refreshMu.Unlock()
+	defer r.refreshMu.Unlock()
+	r.mu.Lock()
+	fresh = r.snapshot != nil && time.Now().Before(r.snapshot.expiresAt)
+	cooling = time.Now().Before(r.retryWait)
+	r.mu.Unlock()
+	if fresh || cooling {
 		return
 	}
-	r.refreshing = true
-	r.refreshMu.Unlock()
-	defer func() {
-		r.refreshMu.Lock()
-		r.refreshing = false
-		r.refreshMu.Unlock()
-	}()
 	r.refresh()
 }
 
 // Refresh 同步刷新（测试/后台任务用）
 func (r *EndpointRouter) Refresh() { r.refresh() }
 
+// routingGlobalProxyHook 由 main 注入：配置拉取与其余上游调用走同一网络路径
+// （代理部署下直连会永久 markFailure，端点映射退回 legacy 路径）
+var routingGlobalProxyHook = func() string { return "" }
+
 func (r *EndpointRouter) refresh() {
 	timeout := r.testTimeout
 	if timeout <= 0 {
 		timeout = routingTimeout
 	}
-	client := &http.Client{
-		Timeout: timeout,
-		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			return http.ErrUseLastResponse
-		},
-	}
+	client := ClientForURL(routingGlobalProxyHook(), r.origin+routingConfigPath, timeout)
 	req, err := http.NewRequest("GET", r.origin+routingConfigPath, nil)
 	if err != nil {
 		r.markFailure()

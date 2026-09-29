@@ -324,7 +324,7 @@ func streamProtocolResponse(w http.ResponseWriter, rc *relayCtx, resp *http.Resp
 	flusher, _ := w.(http.Flusher)
 
 	switch {
-	case proto == protocolAnthropic:
+	case proto == protocolAnthropic && clientStream:
 		// 原生透传 + 嗅探
 		w.Header().Set("Content-Type", firstNonEmpty(resp.Header.Get("Content-Type"), "text/event-stream"))
 		w.Header().Set("Cache-Control", "no-cache")
@@ -365,6 +365,11 @@ func streamProtocolResponse(w http.ResponseWriter, rc *relayCtx, resp *http.Resp
 		}
 		parser.flush(func(ev sseEvent) { applyEventToUsage(ev, &usage, &activeTool, &texts, &thinks) })
 		finalizeToolCalls(&usage)
+		if readErr != nil && readErr != io.EOF {
+			// 中途断流/解析溢出：客户端流会被截断，补一个协议正确的 error 帧，
+			// 让 SDK 能区分"干净结束"与"上游中断"
+			writeSSEErrorEvent(w, fmt.Sprintf("upstream stream interrupted: %v", readErr))
+		}
 		// 透传路径错误事件已原样转发给客户端；此处仅修正用量记录语义并告警
 		recStatus := resp.StatusCode
 		if usage.StreamError != "" {
@@ -390,11 +395,28 @@ func streamProtocolResponse(w http.ResponseWriter, rc *relayCtx, resp *http.Resp
 
 	default:
 		// 客户端要非流式，但上游是流式：聚合后写单个 JSON
+		if proto == protocolAnthropic {
+			// Anthropic 客户端：聚合回完整 message（与闲时通道同一聚合器）
+			aggregated, aggUsage, aerr := aggregateAnthropicStream(resp.Body)
+			if aerr != nil {
+				z.recordUsage(a, r, payload, 502, start, 0, aggUsage, false)
+				writeJSON(w, http.StatusBadGateway, map[string]interface{}{
+					"error": map[string]string{"message": "上游响应聚合失败: " + truncate(aerr.Error(), 200), "type": "upstream_error"},
+				})
+				return
+			}
+			z.recordUsage(a, r, payload, resp.StatusCode, start, 0, aggUsage, false)
+			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set("Cache-Control", "no-store")
+			w.WriteHeader(resp.StatusCode)
+			w.Write(aggregated)
+			return
+		}
+		all, readErr := io.ReadAll(io.LimitReader(resp.Body, 64<<20))
 		var usage StreamUsage
 		var activeTool map[string]interface{}
 		var texts, thinks []string
 		parser := &sseParser{}
-		all, readErr := io.ReadAll(io.LimitReader(resp.Body, 64<<20))
 		if ferr := parser.feed(all, func(ev sseEvent) { applyEventToUsage(ev, &usage, &activeTool, &texts, &thinks) }); ferr != nil {
 			readErr = ferr
 		}
@@ -849,13 +871,15 @@ func (z *ZCodeAPI) streamResponses(w http.ResponseWriter, flusher http.Flusher, 
 			switch delta["type"] {
 			case "thinking_delta":
 				if t, ok := delta["thinking"].(string); ok && t != "" {
-					thinks = append(thinks, t)
 					if blk.kind == "" {
 						blk.kind = "thinking"
 					}
 					if blk.kind != "thinking" {
+						// 非思考块上的 thinking_delta（上游协议违例）：不入 thinks，
+						// 否则 completed 会合成事件序列里从未出现过的 reasoning 项
 						return
 					}
+					thinks = append(thinks, t)
 					// 思考作为 reasoning 输出项流式发出：客户端事件序列可重放出
 					// 与 response.completed.output 一致的状态
 					if blk.itemID == "" {

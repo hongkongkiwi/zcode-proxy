@@ -59,6 +59,13 @@ func (m *AccountManager) ExportBundle(password string, ids []int64) (string, err
 	if password == "" {
 		return "", fmt.Errorf("请设置导出密码")
 	}
+	// 库中存在解不开的密文时拒绝导出：解密失败会静默变空串（omitempty 直接
+	// 丢字段），导出的包看似成功实则缺凭证——恰是用户拿去迁移的最坏时刻。
+	if _, broken, err := m.db.scanVaultCiphertext(currentVaultSeed()); err != nil {
+		return "", fmt.Errorf("凭证完整性检查失败: %w", err)
+	} else if broken > 0 {
+		return "", fmt.Errorf("库中有 %d 条凭证无法用当前钥匙解密（ZCODE_PROXY_VAULT_SECRET 或 vault.key 不匹配）。该检查覆盖全库（含未勾选账号），以避免导出包静默缺凭证；请先恢复钥匙再导出", broken)
+	}
 	all, err := m.db.ListAccounts("")
 	if err != nil {
 		return "", err
@@ -137,10 +144,15 @@ func (m *AccountManager) ImportBundle(password, bundle string) (int, error) {
 		}
 	}
 	var payload struct {
+		Version  int             `json:"version"`
 		Accounts []bundleAccount `json:"accounts"`
 	}
 	if err := json.Unmarshal(plain, &payload); err != nil {
 		return 0, fmt.Errorf("包内容解析失败")
+	}
+	// 明确拒绝未知版本：未来字段结构变化时不得静默错解
+	if payload.Version > 1 {
+		return 0, fmt.Errorf("不支持的账号包版本 %d（当前最高支持 v1，请升级本网关）", payload.Version)
 	}
 	count := 0
 	for _, it := range payload.Accounts {
