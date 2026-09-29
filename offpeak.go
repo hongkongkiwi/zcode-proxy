@@ -378,14 +378,7 @@ func (z *ZCodeAPI) runOffPeak(w http.ResponseWriter, r *http.Request, opts offPe
 			}
 		}
 	}
-	if err != nil {
-		log.Printf("[async] list accounts: %v", err)
-		writeJSON(w, http.StatusInternalServerError, map[string]interface{}{
-			"error": map[string]string{"message": "账号查询失败", "type": "no_available_account"},
-		})
-		return
-	}
-	tried := map[int64]bool{}
+		tried := map[int64]bool{}
 	attempts := 0
 	var reasons []string
 	streamHeaders := false // SSE 响应头只写一次：换号续流时不重复 WriteHeader
@@ -908,6 +901,7 @@ type anthropicAgg struct {
 	stopReason  string
 	streamError string // 上游内联错误帧（独立于 stop_reason，不被后续 delta 掩盖）
 	in, out     int
+	cacheRead, cacheCreation int
 	toolJSON    map[int]*strings.Builder
 }
 
@@ -924,6 +918,12 @@ func aggregateAnthropicStream(r io.Reader) ([]byte, *StreamUsage, error) {
 					if n := toInt(u["input_tokens"]); n > agg.in {
 						agg.in = n
 					}
+					if n := toInt(u["cache_read_input_tokens"]); n > agg.cacheRead {
+						agg.cacheRead = n
+					}
+					if n := toInt(u["cache_creation_input_tokens"]); n > agg.cacheCreation {
+						agg.cacheCreation = n
+					}
 				}
 			}
 		case "content_block_start":
@@ -938,6 +938,10 @@ func aggregateAnthropicStream(r io.Reader) ([]byte, *StreamUsage, error) {
 				nb["text"] = ""
 			case "thinking":
 				nb["thinking"] = ""
+				// R6：start 自带的签名必须保留，聚合后的 message 才能在下一轮重放
+				if sig, ok := blk["signature"].(string); ok && sig != "" {
+					nb["signature"] = sig
+				}
 			case "tool_use":
 				nb["id"] = blk["id"]
 				nb["name"] = blk["name"]
@@ -962,6 +966,12 @@ func aggregateAnthropicStream(r io.Reader) ([]byte, *StreamUsage, error) {
 				return
 			}
 			switch delta["type"] {
+			case "signature_delta":
+				// R6：签名增量同样聚合（上游可能不走 start 携带）
+				if s, ok := delta["signature"].(string); ok && s != "" {
+					prev, _ := agg.blocks[idx]["signature"].(string)
+					agg.blocks[idx]["signature"] = prev + s
+				}
 			case "text_delta":
 				if s, ok := delta["text"].(string); ok {
 					if prev, ok2 := agg.blocks[idx]["text"].(string); ok2 {
@@ -998,6 +1008,16 @@ func aggregateAnthropicStream(r io.Reader) ([]byte, *StreamUsage, error) {
 				if v, ok := u["input_tokens"]; ok {
 					if n := toInt(v); n > agg.in {
 						agg.in = n
+					}
+				}
+				if v, ok := u["cache_read_input_tokens"]; ok {
+					if n := toInt(v); n > agg.cacheRead {
+						agg.cacheRead = n
+					}
+				}
+				if v, ok := u["cache_creation_input_tokens"]; ok {
+					if n := toInt(v); n > agg.cacheCreation {
+						agg.cacheCreation = n
 					}
 				}
 			}
@@ -1052,13 +1072,17 @@ func aggregateAnthropicStream(r io.Reader) ([]byte, *StreamUsage, error) {
 		"content":       content,
 		"stop_reason":   sr,
 		"stop_sequence": nil,
-		"usage":         map[string]interface{}{"input_tokens": agg.in, "output_tokens": agg.out},
+		"usage": map[string]interface{}{
+			"input_tokens": agg.in, "output_tokens": agg.out,
+			"cache_read_input_tokens": agg.cacheRead, "cache_creation_input_tokens": agg.cacheCreation,
+		},
 	}
 	raw, err := json.Marshal(out)
 	if err != nil {
 		return nil, partialUsage(agg), err
 	}
-	return raw, &StreamUsage{InputTokens: agg.in, OutputTokens: agg.out}, nil
+	return raw, &StreamUsage{InputTokens: agg.in, OutputTokens: agg.out,
+		CacheReadTokens: agg.cacheRead, CacheCreationTokens: agg.cacheCreation}, nil
 }
 
 // partialUsage 聚合失败时返回已提取的部分用量（可为 nil），供失败路径落库
@@ -1066,7 +1090,8 @@ func partialUsage(agg *anthropicAgg) *StreamUsage {
 	if agg.in == 0 && agg.out == 0 {
 		return nil
 	}
-	return &StreamUsage{InputTokens: agg.in, OutputTokens: agg.out}
+	return &StreamUsage{InputTokens: agg.in, OutputTokens: agg.out,
+		CacheReadTokens: agg.cacheRead, CacheCreationTokens: agg.cacheCreation}
 }
 
 // ---- SSE 透传期间的 usage 嗅探 ----

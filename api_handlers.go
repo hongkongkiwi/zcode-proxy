@@ -84,6 +84,12 @@ func (s *APIServer) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/usage-records", s.handleUsageRecords)
 	mux.HandleFunc("GET /api/stats", s.handleStats)
 
+	// 下游网关 Key（R1）
+	mux.HandleFunc("GET /api/keys", s.handleListKeys)
+	mux.HandleFunc("POST /api/keys", s.handleCreateKey)
+	mux.HandleFunc("PUT /api/keys/{id}", s.handleUpdateKey)
+	mux.HandleFunc("DELETE /api/keys/{id}", s.handleDeleteKey)
+
 	// 设置
 	mux.HandleFunc("GET /api/settings", s.handleGetSettings)
 	mux.HandleFunc("PUT /api/settings", s.handlePutSettings)
@@ -807,6 +813,8 @@ var settingsWhitelist = map[string]bool{
 	"selection_strategy": true, "quota_refresh_interval": true,
 	"upstream_proxy": true, "fingerprint": true, "custom_ja3": true,
 	"captcha_mode": true, "gateway_models": true, "sticky_sessions": true,
+	"prompt_cache_breakpoint": true,
+	"max_concurrent_per_account": true,
 	// 闲时免费通道（off-peak ticket queue）
 	"async_enabled": true, "async_poll_interval_ms": true,
 	"async_keepalive_ms": true, "async_max_retries": true, "async_max_wait_sec": true,

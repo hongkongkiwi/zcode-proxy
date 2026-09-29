@@ -32,6 +32,13 @@ type FileConfig struct {
 	mu        sync.RWMutex
 }
 
+// ConfigDir 配置目录（-doctor 报告用）
+func (c *FileConfig) ConfigDir() string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.configDir
+}
+
 // DefaultUpstream 与 zcode2api settings.py 一致的默认端点
 var DefaultUpstream = UpstreamURLs{
 	Zai:         "https://zcode.z.ai/api/v1/zcode-plan/anthropic/v1/messages",

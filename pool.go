@@ -52,6 +52,10 @@ type AccountPool struct {
 	sticky       map[string]stickyEntry // 会话粘滞：sessionKey -> 账号（mu 保护，TTL 淘汰）
 	stickyPruned time.Time              // 上次粘滞表清理时间
 
+	slots map[int64]*accountSlots // 每账号并发闸门（mu 保护；1302 并发限流的根治手段）
+
+	riskStrikes map[int64][]time.Time // 24h 滑动窗口内的风控拦截次数（mu 保护，R4 阶梯冷却）
+
 	refreshFn func(a *Account) error // 由 ZCodeAPI 注入的额度刷新函数
 	stopCh    chan struct{}
 	stopOnce  sync.Once
@@ -67,6 +71,9 @@ const (
 	stickyTTL  = time.Hour
 	stickyMax  = 10000
 	pruneEvery = 10 * time.Minute
+
+	slotDefaultCap = 3
+	slotMaxCap     = 32
 )
 
 // NewAccountPool 创建账号池
@@ -78,6 +85,8 @@ func NewAccountPool(db *DB, cfg *FileConfig, appVersion string) *AccountPool {
 		rotation:     make(map[string]int),
 		invalidRetry: make(map[int64]time.Time),
 		sticky:       make(map[string]stickyEntry),
+		slots:        make(map[int64]*accountSlots),
+		riskStrikes:  make(map[int64][]time.Time),
 		stopCh:       make(chan struct{}),
 	}
 }
@@ -396,6 +405,98 @@ func (p *AccountPool) rememberSticky(sessionKey string, accountID int64) {
 	p.sticky[sessionKey] = stickyEntry{accountID: accountID, seenAt: now}
 }
 
+// ---- 每账号并发闸门（1302 并发限流的根治）----
+
+// accountSlots 每账号并发闸门：与其打满并发再吃上游 429/1302，不如在网关侧排队
+type accountSlots struct {
+	cap int
+	ch  chan struct{}
+}
+
+// accountSlotCap 读取并发上限设置（1-32，默认 3）
+func (p *AccountPool) accountSlotCap() int {
+	v, _ := p.db.GetSetting("max_concurrent_per_account")
+	n, err := strconv.Atoi(v)
+	if err != nil || n < 1 {
+		return slotDefaultCap
+	}
+	if n > slotMaxCap {
+		return slotMaxCap
+	}
+	return n
+}
+
+// AcquireAccountSlot 占用一个在途名额（阻塞至 timeout）；false = 排队超时。
+// 上限设置变更时重建闸门（旧名额 token 作废由 Release 的幂等保护兜底）。
+func (p *AccountPool) AcquireAccountSlot(a *Account, timeout time.Duration) bool {
+	capNow := p.accountSlotCap()
+	p.mu.Lock()
+	as := p.slots[a.ID]
+	if as == nil || as.cap != capNow {
+		as = &accountSlots{cap: capNow, ch: make(chan struct{}, capNow)}
+		p.slots[a.ID] = as
+	}
+	ch := as.ch
+	p.mu.Unlock()
+
+	if timeout <= 0 {
+		select {
+		case ch <- struct{}{}:
+			return true
+		default:
+			return false
+		}
+	}
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case ch <- struct{}{}:
+		return true
+	case <-timer.C:
+		return false
+	}
+}
+
+// ReleaseAccountSlot 释放在途名额（幂等：多余释放忽略）
+func (p *AccountPool) ReleaseAccountSlot(a *Account) {
+	p.mu.Lock()
+	as := p.slots[a.ID]
+	p.mu.Unlock()
+	if as == nil {
+		return
+	}
+	select {
+	case <-as.ch:
+	default:
+	}
+}
+
+// nextRateLimitCooldown 限流冷却升级：同一账号连续吃 429/1302 时 30s → 120s → 300s
+// （依据 LastError 里已写入的历史冷却时长判断，零 schema 改动）
+func nextRateLimitCooldown(a *Account) int {
+	switch {
+	case strings.Contains(a.LastError, "冷却 120s"), strings.Contains(a.LastError, "冷却 300s"):
+		return 300
+	case strings.Contains(a.LastError, "限流"), strings.Contains(a.LastError, "Rate limit"):
+		return 120
+	default:
+		return 30
+	}
+}
+
+// isRateLimitBody 识别限流：HTTP 429，或业务码 1302/1303（并发超限）
+func isRateLimitBody(status int, text string) bool {
+	if status == 429 {
+		return true
+	}
+	if strings.Contains(text, `"code":1302`) || strings.Contains(text, `"code": 1302`) ||
+		strings.Contains(text, `"code":1303`) || strings.Contains(text, `"code": 1303`) {
+		return true
+	}
+	low := strings.ToLower(text)
+	return (strings.Contains(text, "1302") || strings.Contains(text, "1303")) && strings.Contains(low, "rate limit")
+}
+
 // ---- 耗尽重置提示（F3）----
 
 // ExhaustedResetInfo 返回 provider/group 下耗尽账号的最早重置时间（unix 秒）
@@ -453,6 +554,49 @@ func (p *AccountPool) MarkCooling(a *Account, reason string, seconds int) {
 	a.setRuntime(StatusCooling, reason, until)
 	p.db.SetAccountStatus(a.ID, StatusCooling, reason, until)
 	log.Printf("[pool] account %s -> cooling %ds: %s", a.Email, seconds, reason)
+}
+
+// riskLadder 风控阶梯时长：24h 窗口内第 N 次拦截 → 冷却时长
+// （1 次 120s 与原行为一致；重复被拦说明指纹/出口已可疑，指数升级）
+var riskLadder = []time.Duration{120 * time.Second, 30 * time.Minute, 24 * time.Hour}
+
+const riskStrikeWindow = 24 * time.Hour
+
+// MarkRiskCooling 风控拦截（3012/unusual activity）阶梯冷却（R4）：
+// 24h 滑动窗口计次，1 次→120s、2 次→30min、3 次及以上→24h。
+// 账号仍走 cooling 状态自动恢复——升级的是时长而非状态，避免把
+// 瞬时风控误伤成需要人工介入的 invalid。
+func (p *AccountPool) MarkRiskCooling(a *Account, reason string) {
+	now := time.Now()
+	p.mu.Lock()
+	cutoff := now.Add(-riskStrikeWindow)
+	live := p.riskStrikes[a.ID][:0]
+	for _, ts := range p.riskStrikes[a.ID] {
+		if ts.After(cutoff) {
+			live = append(live, ts)
+		}
+	}
+	p.riskStrikes[a.ID] = append(live, now)
+	strikes := len(p.riskStrikes[a.ID])
+	p.mu.Unlock()
+
+	idx := strikes - 1
+	if idx >= len(riskLadder) {
+		idx = len(riskLadder) - 1
+	}
+	seconds := int(riskLadder[idx] / time.Second)
+	until := now.Unix() + int64(seconds)
+	a.setRuntime(StatusCooling, reason, until)
+	p.db.SetAccountStatus(a.ID, StatusCooling, reason, until)
+	log.Printf("[pool] account %s -> risk-cooling %s (strike %d in 24h): %s",
+		a.Email, riskLadder[idx], strikes, reason)
+}
+
+// riskStrikeCount 24h 窗口内风控拦截次数（测试与诊断用）
+func (p *AccountPool) riskStrikeCount(id int64) int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return len(p.riskStrikes[id])
 }
 
 // MarkInvalid 凭证失效

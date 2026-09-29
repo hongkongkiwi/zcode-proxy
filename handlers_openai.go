@@ -71,6 +71,12 @@ func (z *ZCodeAPI) HandleResponses(w http.ResponseWriter, r *http.Request) {
 		errResp.Write(w)
 		return
 	}
+	// 网关无状态：拒绝依赖服务端会话的 previous_response_id（须整段回传 input）
+	if prid, _ := body["previous_response_id"].(string); prid != "" {
+		writeAPIError(w, http.StatusBadRequest,
+			"this gateway is stateless: previous_response_id is not supported; send the full conversation input each time")
+		return
+	}
 	if s, ok := body["stream"]; ok {
 		if _, isBool := s.(bool); !isBool {
 			writeAPIError(w, http.StatusBadRequest, "stream must be a boolean")
@@ -185,7 +191,11 @@ func openaiToAnthropic(body map[string]interface{}) (map[string]interface{}, err
 		var blocks []map[string]interface{}
 		switch c := content.(type) {
 		case string:
-			blocks = append(blocks, map[string]interface{}{"type": "text", "text": c})
+			// 空串 text 块会被 Anthropic schema 拒绝（"at least 1 character"）；
+			// 工具调用回合常带 content:""，必须跳过而不是转发整单 400
+			if c != "" {
+				blocks = append(blocks, map[string]interface{}{"type": "text", "text": c})
+			}
 		case []interface{}:
 			for _, part := range c {
 				pm, ok := part.(map[string]interface{})
@@ -246,6 +256,10 @@ func openaiToAnthropic(body map[string]interface{}) (map[string]interface{}, err
 				default:
 					toolInput = map[string]interface{}{}
 				}
+				if toolInput == nil {
+					// 字面量 "null"：Unmarshal 成功但得到 nil，input 必须是对象
+					toolInput = map[string]interface{}{}
+				}
 				id, _ := cm["id"].(string)
 				if id == "" {
 					id = "call_" + randomHex(8)
@@ -254,6 +268,9 @@ func openaiToAnthropic(body map[string]interface{}) (map[string]interface{}, err
 					"type": "tool_use", "id": id, "name": name, "input": toolInput,
 				})
 			}
+			// R6：OpenAI 客户端重放助手回合时丢失签名思考块，
+			// 按其可见输出（文本 + 工具调用）查缓存静默回填；未命中不变
+			blocks = replayThinkingBlocks(blocks)
 		}
 		if len(blocks) > 0 {
 			item := map[string]interface{}{"role": role, "content": blocks}
@@ -350,10 +367,20 @@ func openaiToAnthropic(body map[string]interface{}) (map[string]interface{}, err
 			out["tool_choice"] = map[string]interface{}{"type": "any"}
 		}
 	case map[string]interface{}:
+		// Chat 形态 {"type":"function","function":{"name":...}} 与
+		// Responses 扁平形态 {"type":"function","name":...} 都要识别，
+		// 否则指定函数调用的 tool_choice 被静默丢弃
+		name := ""
 		if fn, ok := tc["function"].(map[string]interface{}); ok {
-			if name, _ := fn["name"].(string); name != "" {
-				out["tool_choice"] = map[string]interface{}{"type": "tool", "name": name}
+			name, _ = fn["name"].(string)
+		}
+		if name == "" {
+			if tcType, _ := tc["type"].(string); tcType == "function" {
+				name, _ = tc["name"].(string)
 			}
+		}
+		if name != "" {
+			out["tool_choice"] = map[string]interface{}{"type": "tool", "name": name}
 		}
 	}
 	return out, nil

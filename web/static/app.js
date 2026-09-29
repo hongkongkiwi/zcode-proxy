@@ -936,6 +936,7 @@ async function loadSettings() {
     document.getElementById('setCaptchaMode').value = s.captcha_mode || 'auto';
     document.getElementById('setGatewayModels').value = s.gateway_models || '';
     document.getElementById('setSticky').checked = !(s.sticky_sessions === '0' || s.sticky_sessions === 'false');
+    document.getElementById('setMaxConcurrent').value = s.max_concurrent_per_account || '3';
     window._fpCurrent = s.fingerprint || 'chrome';
     window._ja3Current = s.custom_ja3 || '';
     loadGatewayKey();
@@ -988,6 +989,7 @@ async function saveStrategySettings() {
       selection_strategy: document.getElementById('setStrategy').value,
       quota_refresh_interval: document.getElementById('setQuotaInterval').value,
       sticky_sessions: document.getElementById('setSticky').checked ? '1' : '0',
+      max_concurrent_per_account: document.getElementById('setMaxConcurrent').value || '3',
     }});
     toast(t('策略已保存'));
   } catch (e) { toast(e.message, 'error'); }
@@ -1481,9 +1483,9 @@ function clearLlmHistory() {
 function initLlmPlaceholders() {
   const apply = (el, text) => {
     if (!el) return;
-    if (el.dataset.placeholderLang === undefined) return; // 尚未初始化过占位
-    if (el.dataset.placeholderLang === '') return;        // 已是真实输出，不覆盖
+    if (el.dataset.placeholderLang === '') return;         // 已是真实输出，不覆盖
     if (el.dataset.placeholderLang === CURRENT_LANG) return; // 占位已是当前语言
+    // undefined = 首次加载的空白元素：写入当前语言的占位
     el.textContent = text;
     el.dataset.placeholderLang = CURRENT_LANG;
   };

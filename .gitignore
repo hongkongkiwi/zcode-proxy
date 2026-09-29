@@ -31,3 +31,6 @@ run.sh
 zcode-proxy
 connect-zcode.sh
 .agents/
+
+# review worktree (isolated session)
+.worktrees/

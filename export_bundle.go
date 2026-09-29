@@ -8,6 +8,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"log"
 	"strings"
 
 	"golang.org/x/crypto/pbkdf2"
@@ -168,9 +169,12 @@ func (m *AccountManager) ImportBundle(password, bundle string) (int, error) {
 			AccountGroup: it.AccountGroup, Remark: it.Remark,
 			Status: StatusActive, Enabled: true,
 		}
-		if _, err := m.db.UpsertAccount(a); err == nil {
-			count++
+		if _, err := m.db.UpsertAccount(a); err != nil {
+			// 静默跳过会让导入方以为全部成功（如 vault 拒写的脏字段）
+			log.Printf("[bundle] import %s skipped: %v", it.UserID, err)
+			continue
 		}
+		count++
 	}
 	return count, nil
 }

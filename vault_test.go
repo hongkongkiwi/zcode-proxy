@@ -342,3 +342,92 @@ func TestVaultSettingsSecretsEncryptedAtRest(t *testing.T) {
 		t.Fatalf("password hash roundtrip = %q, %v", got, err)
 	}
 }
+
+// TestVaultKeyfileWithStuckRowConverges 回归（P0）：keyfile 可解行与"两种钥匙都
+// 解不开"的卡死行混存时，必须采用 keyfile 并在重启后保持收敛——
+// 历史缺陷：误判为"真钥匙不匹配"而进入派生降级态，永久卡死且拒绝写入。
+func TestVaultKeyfileWithStuckRowConverges(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "vault-test.db")
+	t.Cleanup(resetVaultSeed)
+	resetVaultSeed()
+
+	db, err := NewDB(path)
+	if err != nil {
+		t.Fatalf("NewDB: %v", err)
+	}
+	if _, err := db.UpsertAccount(&Account{
+		UserID: "u-k-era", Email: "k@test", Provider: "zai", AuthType: "jwt",
+		ZCodeJWT: "jwt-under-keyfile", Status: StatusActive, Enabled: true,
+	}); err != nil {
+		t.Fatalf("upsert A: %v", err)
+	}
+	keyFile := filepath.Join(dir, "vault.key")
+	keySeed, ok := loadVaultKeyFile(keyFile)
+	if !ok {
+		t.Fatalf("keyfile missing")
+	}
+	db.Close()
+
+	// 注入卡死行：用第三把随机钥匙加密（模拟 env 期写入后 env 丢失/损坏）
+	stuckSeed, err := randomVaultSeed()
+	if err != nil {
+		t.Fatalf("stuck seed: %v", err)
+	}
+	stuckEnc, err := EncryptCredential("jwt-stuck-env-era", stuckSeed)
+	if err != nil {
+		t.Fatalf("encrypt stuck: %v", err)
+	}
+	db2, err := NewDB(path)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	if _, err := db2.conn.Exec(`INSERT INTO accounts (user_id, email, provider, auth_type, zcode_jwt, status, enabled)
+		VALUES ('u-stuck', 'stuck@test', 'zai', 'jwt', ?, 'active', 1)`,
+		vaultPrefix+strings.TrimPrefix(stuckEnc, encPrefix)); err != nil {
+		t.Fatalf("raw insert stuck row: %v", err)
+	}
+	db2.Close()
+
+	// 恢复 keyfile → 重开：必须采用 keyfile（卡死行如实告警），不得进入降级态
+	if err := os.WriteFile(keyFile, []byte(keySeed+"\n"), 0600); err != nil {
+		t.Fatalf("restore keyfile: %v", err)
+	}
+	resetVaultSeed()
+	db3, err := NewDB(path)
+	if err != nil {
+		t.Fatalf("reopen with keyfile: %v", err)
+	}
+	assertState := func(tag string) {
+		t.Helper()
+		if vaultSeedIsDerived() {
+			t.Fatalf("%s: still in derived degraded state — adoption wedge reproduced", tag)
+		}
+		accounts, err := db3.ListAccounts("")
+		if err != nil {
+			t.Fatalf("%s: list: %v", tag, err)
+		}
+		got := map[string]string{}
+		for _, a := range accounts {
+			got[a.UserID] = a.ZCodeJWT
+		}
+		if got["u-k-era"] != "jwt-under-keyfile" {
+			t.Fatalf("%s: keyfile-era row not decryptable: %q", tag, got["u-k-era"])
+		}
+		if got["u-stuck"] != "" {
+			t.Fatalf("%s: stuck row should be unreadable (its key is gone), got %q", tag, got["u-stuck"])
+		}
+	}
+	assertState("first adoption")
+
+	// 第二次重启：收敛性——同样的分支必须再次采用 keyfile，而不是振荡回降级态
+	db3.Close()
+	resetVaultSeed()
+	db4, err := NewDB(path)
+	if err != nil {
+		t.Fatalf("second restart: %v", err)
+	}
+	defer func() { db4.Close(); resetVaultSeed() }()
+	db3 = db4
+	assertState("second restart")
+}

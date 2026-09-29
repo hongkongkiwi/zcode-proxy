@@ -99,18 +99,22 @@ type ClaimRecord struct {
 
 // UsageRecord API 使用记录
 type UsageRecord struct {
-	ID               int64  `json:"id"`
-	CreatedAt        string `json:"created_at"`
-	AccountID        int64  `json:"account_id"`
-	Email            string `json:"email"`
-	Model            string `json:"model"`
-	PromptTokens     int    `json:"prompt_tokens"`
-	CompletionTokens int    `json:"completion_tokens"`
-	TotalTokens      int    `json:"total_tokens"`
-	Stream           bool   `json:"stream"`
-	StatusCode       int    `json:"status_code"`
-	DurationMs       int    `json:"duration_ms"`
-	TtftMs           int    `json:"ttft_ms"`
+	ID                 int64  `json:"id"`
+	CreatedAt          string `json:"created_at"`
+	AccountID          int64  `json:"account_id"`
+	Email              string `json:"email"`
+	Model              string `json:"model"`
+	PromptTokens       int    `json:"prompt_tokens"`
+	CompletionTokens   int    `json:"completion_tokens"`
+	TotalTokens        int    `json:"total_tokens"`
+	CacheReadTokens    int    `json:"cache_read_tokens"`
+	CacheCreationTokens int   `json:"cache_creation_tokens"`
+	Stream             bool   `json:"stream"`
+	StatusCode         int    `json:"status_code"`
+	DurationMs         int    `json:"duration_ms"`
+	TtftMs             int    `json:"ttft_ms"`
+	GatewayKeyID       int64  `json:"gateway_key_id"`
+	KeyName            string `json:"key_name"`
 }
 
 // ProxyNode 出口代理节点（组绑定）
@@ -187,6 +191,17 @@ func NewDB(dbPath string) (*DB, error) {
 	// priority 列增量迁移（旧库无此列；已存在时报错忽略）
 	if _, err := db.conn.Exec(`ALTER TABLE accounts ADD COLUMN priority INTEGER NOT NULL DEFAULT 100`); err == nil {
 		log.Printf("[db] added accounts.priority column (default 100)")
+	}
+	// usage_records 增量迁移：缓存 token 计量（R3）+ 命名网关 Key 归因（R1）
+	for _, col := range []string{
+		`ALTER TABLE usage_records ADD COLUMN cache_read_tokens INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE usage_records ADD COLUMN cache_creation_tokens INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE usage_records ADD COLUMN gateway_key_id INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE usage_records ADD COLUMN key_name TEXT NOT NULL DEFAULT ''`,
+	} {
+		if _, err := db.conn.Exec(col); err == nil {
+			log.Printf("[db] %s", col)
+		}
 	}
 	// 存量明文凭证列静态加密迁移（幂等；失败不阻断启动，下轮再试）
 	if err := db.MigrateVault(); err != nil {
@@ -340,6 +355,21 @@ func (db *DB) initSchema() error {
 	);
 	CREATE INDEX IF NOT EXISTS idx_plan_run_records_run_at ON plan_run_records(run_at);
 	CREATE INDEX IF NOT EXISTS idx_plan_run_records_plan   ON plan_run_records(plan_id);
+
+	CREATE TABLE IF NOT EXISTS gateway_keys (
+		id          INTEGER PRIMARY KEY AUTOINCREMENT,
+		name        TEXT DEFAULT '',
+		key_hash    TEXT NOT NULL UNIQUE,
+		key_prefix  TEXT DEFAULT '',
+		enabled     INTEGER DEFAULT 1,
+		rpm_limit   INTEGER DEFAULT 0,
+		quota_total INTEGER DEFAULT 0,
+		quota_used  INTEGER DEFAULT 0,
+		models      TEXT DEFAULT '',
+		last_used_at INTEGER DEFAULT 0,
+		created_at  TEXT DEFAULT (datetime('now','localtime')),
+		updated_at  TEXT DEFAULT (datetime('now','localtime'))
+	);
 	`
 	if _, err := db.conn.Exec(schema); err != nil {
 		return fmt.Errorf("init schema: %w", err)

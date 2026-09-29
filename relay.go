@@ -104,6 +104,13 @@ func (z *ZCodeAPI) HandleMessages(w http.ResponseWriter, r *http.Request) {
 
 // relay 选账号并按降级链转发
 func (z *ZCodeAPI) relay(w http.ResponseWriter, r *http.Request, rc *relayCtx) {
+	// 命名网关 Key（R1）：模型白名单 / token 配额在进入账号池前拦截
+	if gk := gatewayKeyFromCtx(r.Context()); gk != nil {
+		if errResp := checkGatewayKeyRequest(gk, relayModelName(rc)); errResp != nil {
+			errResp.Write(w)
+			return
+		}
+	}
 	payload, _ := json.Marshal(rc.body)
 	tried := map[int64]bool{}
 	var reasons []string
@@ -156,6 +163,21 @@ func (z *ZCodeAPI) relay(w http.ResponseWriter, r *http.Request, rc *relayCtx) {
 	writeJSON(w, http.StatusServiceUnavailable, map[string]interface{}{
 		"error": map[string]string{"message": msg, "type": "no_available_account"},
 	})
+}
+
+// relayModelName 白名单校验用的规范模型名：去 provider 前缀 + 小写（与 gateway_keys 白名单同规范）
+func relayModelName(rc *relayCtx) string {
+	model := rc.clientModel
+	if m, ok := rc.body["model"].(string); ok && m != "" {
+		model = m // normalizeBody 已归一化，优先取
+	}
+	if i := strings.Index(model, "/"); i >= 0 {
+		model = model[i+1:]
+	}
+	if official, ok := modelNameMap[strings.ToLower(strings.TrimSpace(model))]; ok {
+		return strings.ToLower(official)
+	}
+	return strings.ToLower(strings.TrimSpace(model))
 }
 
 // sessionKey 会话粘滞键（F2）：优先 metadata.user_id（Anthropic 客户端语义），
@@ -249,9 +271,9 @@ func (z *ZCodeAPI) tryAccount(w http.ResponseWriter, r *http.Request, a *Account
 		note("无 API Key 可回退")
 	}
 
-	// 所有路径失败：若是风控拦截则冷却账号
+	// 所有路径失败：若是风控拦截则按阶梯冷却（R4：120s → 30min → 24h）
 	if riskBlocked {
-		z.pool.MarkCooling(a, "上游风控拦截（unusual activity），全通道失败", 120)
+		z.pool.MarkRiskCooling(a, "上游风控拦截（unusual activity），全通道失败")
 	}
 	log.Printf("[relay] account %s all paths failed", a.Email)
 	return outcomeNextAccount
@@ -261,6 +283,14 @@ func (z *ZCodeAPI) tryAccount(w http.ResponseWriter, r *http.Request, a *Account
 func (z *ZCodeAPI) forwardOnce(w http.ResponseWriter, r *http.Request, a *Account,
 	payload []byte, verifyParam, region string, useFallback bool, retries int,
 	rc *relayCtx, start time.Time, pathLabel string) relayOutcome {
+
+	// 每账号并发闸门：排队而非打满并发（上游 1302 并发超限的根治手段）。
+	// 排队 45s 仍无名额 → 让位下一账号（10s 短冷却，很快回来）。
+	if !z.pool.AcquireAccountSlot(a, 45*time.Second) {
+		z.pool.MarkCooling(a, "并发已满（在途请求达到上限），短暂冷却", 10)
+		return outcomeNextAccount
+	}
+	defer z.pool.ReleaseAccountSlot(a)
 
 	// 内部对 OpenAI/Responses 协议一律流式请求上游，便于聚合与转换
 	upstreamStream := rc.clientStream || rc.proto != protocolAnthropic
@@ -327,8 +357,9 @@ func (z *ZCodeAPI) forwardOnce(w http.ResponseWriter, r *http.Request, a *Accoun
 				}
 				z.pool.MarkInvalid(a, fmt.Sprintf("鉴权失败 HTTP %d", resp.StatusCode))
 				return outcomeNextAccount
-			case resp.StatusCode == 429:
-				// 限流多为模型级 RPM 峰值：请求内退避重试一次（尊重 Retry-After），仍失败再短冷却
+			case resp.StatusCode == 429 || isRateLimitBody(resp.StatusCode, text):
+				// 限流（HTTP 429 或业务码 1302/1303 并发超限）：请求内退避重试一次
+				//（尊重 Retry-After），仍失败则按历史冷却时长升级 30s → 120s → 300s
 				retryAfter := 2
 				if ra := resp.Header.Get("Retry-After"); ra != "" {
 					if n, err := strconv.Atoi(ra); err == nil && n > 0 && n <= 5 {
@@ -336,13 +367,14 @@ func (z *ZCodeAPI) forwardOnce(w http.ResponseWriter, r *http.Request, a *Accoun
 					}
 				}
 				if attempt+1 < retries {
-					log.Printf("[relay] account %s model %s rate-limited 429, retrying in %ds", a.DisplayNameOrEmail(), rcModel(payload), retryAfter)
+					log.Printf("[relay] account %s model %s rate-limited (HTTP %d), retrying in %ds", a.DisplayNameOrEmail(), rcModel(payload), resp.StatusCode, retryAfter)
 					resp.Body.Close()
 					time.Sleep(time.Duration(retryAfter) * time.Second)
 					continue
 				}
 				resp.Body.Close() // 最后一次重试也必须关 body，否则泄漏连接
-				z.pool.MarkCooling(a, fmt.Sprintf("上游限流 429（model=%s）", rcModel(payload)), 30)
+				cool := nextRateLimitCooldown(a)
+				z.pool.MarkCooling(a, fmt.Sprintf("上游限流（HTTP %d，model=%s），冷却 %ds", resp.StatusCode, rcModel(payload), cool), cool)
 				return outcomeNextAccount
 			case isRiskBlocked(text):
 				// 3012 unusual activity：免费通道风控拦截。不立即冷却整个账号，
@@ -610,6 +642,7 @@ func normalizeBody(body map[string]interface{}, z *ZCodeAPI) error {
 		body["max_tokens"] = float64(4096)
 	}
 	fixThinking(body)
+	applyPromptCacheBreakpoint(body, z)
 
 	// string content → [{type:text,text:...}]
 	if msgs, ok := body["messages"].([]interface{}); ok {
@@ -633,6 +666,36 @@ func normalizeBody(body map[string]interface{}, z *ZCodeAPI) error {
 		body["messages"] = msgs
 	}
 	return nil
+}
+
+// applyPromptCacheBreakpoint 系统提示词缓存断点（可选，设置 prompt_cache_breakpoint=1 开启）：
+// 给 system 的最后一个块标记 cache_control: ephemeral，命中后上游缓存计费按命中价。
+// 默认关闭：上游对 cache_control 的接受度未在所有通道实测，出问题时一键可关。
+func applyPromptCacheBreakpoint(body map[string]interface{}, z *ZCodeAPI) {
+	if v, _ := z.db.GetSetting("prompt_cache_breakpoint"); v != "1" {
+		return
+	}
+	sys, ok := body["system"]
+	if !ok || sys == nil {
+		return
+	}
+	breakpoint := map[string]interface{}{"type": "ephemeral"}
+	switch s := sys.(type) {
+	case string:
+		if s == "" {
+			return
+		}
+		body["system"] = []interface{}{map[string]interface{}{
+			"type": "text", "text": s, "cache_control": breakpoint,
+		}}
+	case []interface{}:
+		if len(s) == 0 {
+			return
+		}
+		if last, ok := s[len(s)-1].(map[string]interface{}); ok {
+			last["cache_control"] = breakpoint
+		}
+	}
 }
 
 // fixThinking GLM-5.3 思考模式归一化为上游现行 wire 格式（对齐 zai-org/ZCode 3.14.x）：
@@ -857,8 +920,18 @@ func (z *ZCodeAPI) recordUsage(a *Account, r *http.Request, payload []byte, stat
 		rec.PromptTokens = usage.InputTokens
 		rec.CompletionTokens = usage.OutputTokens
 		rec.TotalTokens = usage.InputTokens + usage.OutputTokens
+		rec.CacheReadTokens = usage.CacheReadTokens
+		rec.CacheCreationTokens = usage.CacheCreationTokens
+	}
+	// 命名网关 Key 归因（R1）：记录到 usage 并回写 Key 配额消耗
+	if gk := gatewayKeyFromCtx(r.Context()); gk != nil {
+		rec.GatewayKeyID = gk.ID
+		rec.KeyName = gk.Name
 	}
 	if err := z.db.InsertUsageRecord(rec); err != nil {
 		log.Printf("[usage] insert: %v", err)
+	}
+	if rec.GatewayKeyID > 0 {
+		z.db.BumpGatewayKeyUsage(rec.GatewayKeyID, rec.TotalTokens)
 	}
 }

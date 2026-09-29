@@ -22,6 +22,7 @@ var webFS embed.FS
 func main() {
 	configDir := flag.String("config", "config", "config directory path")
 	dbPath := flag.String("db", "data/zcode.db", "SQLite database path")
+	doctor := flag.Bool("doctor", false, "run offline health checks and exit")
 	flag.Parse()
 
 	absDir, err := filepath.Abs(*configDir)
@@ -48,6 +49,11 @@ func main() {
 	defer db.Close()
 	log.Printf("[main] database: %s", absDBPath)
 
+	// -doctor：离线体检（配置/库完整性/vault/账号/代理/Key），不启动任何服务
+	if *doctor {
+		runDoctorAndExit(cfg, db)
+	}
+
 	stopHotReload := cfg.StartHotReload(30 * time.Second)
 	defer stopHotReload()
 
@@ -62,6 +68,11 @@ func main() {
 	pool := NewAccountPool(db, cfg, appVersion)
 	pool.Start()
 	defer pool.Stop()
+
+	// R5：无 device_mid 的账号（OAuth/粘贴导入）补齐独立设备指纹
+	if n := EnsurePoolDeviceIdentities(db); n > 0 {
+		log.Printf("[main] backfilled device identity for %d account(s)", n)
+	}
 
 	// TLS 指纹钩子（utls 预设 / 自定义 JA3）
 	fingerprintHook = func() TLSFingerprint {

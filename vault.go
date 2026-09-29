@@ -347,8 +347,10 @@ func (db *DB) consolidateMixedVaultRows(keySeed, legacySeed string) (int, int, e
 			var id int64
 			var val string
 			if err := rows.Scan(&id, &val); err != nil {
-				rows.Close()
-				return moved, stuck, err
+				// NULL/异型值（外部损坏、部分恢复的库）按 stuck 语义跳过并保留
+				// 原样——中止整个事务会把一把已证明可解部分数据的钥匙挡在门外
+				stuck++
+				continue
 			}
 			if !strings.HasPrefix(val, vaultPrefix) {
 				continue

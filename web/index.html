@@ -257,6 +257,10 @@
 <label class="form-label" data-i18n="额度自动刷新间隔（秒，0=关闭）">额度自动刷新间隔（秒，0=关闭）</label>
 <input type="number" id="setQuotaInterval" class="form-input" min="0" max="86400">
 </div>
+<div class="form-group" style="margin-bottom:16px">
+<label class="form-label" data-i18n="每账号并发上限（1-32，默认 3；排队而非打满并发触发 1302 限流）">每账号并发上限（1-32，默认 3；排队而非打满并发触发 1302 限流）</label>
+<input type="number" id="setMaxConcurrent" class="form-input" min="1" max="32">
+</div>
 <button class="btn btn-primary" onclick="saveStrategySettings()" data-i18n="保存策略">保存策略</button>
 </div>
 </div>

@@ -42,6 +42,8 @@ type AuthManager struct {
 
 	failMu   sync.Mutex
 	failures map[string]*loginFail // 登录失败限速：key = ip|user
+
+	gwRPM gwRPMTracker // 命名网关 Key 的 RPM 滑动窗口（R1）
 }
 
 type loginFail struct {
@@ -359,7 +361,9 @@ func (am *AuthManager) Middleware(next http.Handler) http.Handler {
 			return
 		}
 
-		// /v1/* 与 /async/*（闲时通道）使用 API Key 认证（Authorization: Bearer 或 x-api-key）
+		// /v1/* 与 /async/*（闲时通道）使用 API Key 认证（Authorization: Bearer 或 x-api-key）。
+		// 命中命名网关 Key（R1）时做启停/RPM 检查并注入 context，转发层再做
+		// 模型白名单/配额拦截；根 Key（旧 api_key）不受限。
 		if strings.HasPrefix(path, "/v1/") || strings.HasPrefix(path, "/async/") {
 			var apiKey string
 			if xKey := r.Header.Get("x-api-key"); xKey != "" {
@@ -376,11 +380,18 @@ func (am *AuthManager) Middleware(next http.Handler) http.Handler {
 				})
 				return
 			}
-			if !am.ValidateAPIKey(apiKey) {
-				writeJSON(w, http.StatusUnauthorized, map[string]interface{}{
-					"error": map[string]string{"message": "invalid API key", "type": "authentication_error"},
+			gk, errResp := am.resolveGatewayKey(apiKey)
+			if errResp != nil {
+				if errResp.status == http.StatusTooManyRequests {
+					w.Header().Set("Retry-After", "10")
+				}
+				writeJSON(w, errResp.status, map[string]interface{}{
+					"error": map[string]string{"message": errResp.msg, "type": "authentication_error"},
 				})
 				return
+			}
+			if gk != nil {
+				r = r.WithContext(contextWithGatewayKey(r.Context(), gk))
 			}
 			next.ServeHTTP(w, r)
 			return

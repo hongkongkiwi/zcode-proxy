@@ -3,6 +3,7 @@ package main
 import (
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func newPoolTestPool(t *testing.T) (*AccountPool, *DB) {
@@ -122,5 +123,76 @@ func TestChannelSummary(t *testing.T) {
 	c := channelSummary(ov)
 	if c.Source != "api.z.ai/monitor" || c.PlanTier != "Max" || c.Remaining != 123.45 || c.NextReset != 1790708414 || c.Exhausted {
 		t.Fatalf("bad channel summary: %+v", c)
+	}
+}
+
+// 并发闸门：上限排队、释放恢复、1302 限流体识别、冷却升级
+func TestAccountSlotGate(t *testing.T) {
+	p, db := newPoolTestPool(t)
+	a := mkPoolAccount("slot", DefaultPriority, StatusActive)
+	id, err := db.UpsertAccount(a)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a.ID = id
+	db.SetSetting("max_concurrent_per_account", "2")
+
+	if !p.AcquireAccountSlot(a, 50*time.Millisecond) {
+		t.Fatal("first acquire should succeed")
+	}
+	if !p.AcquireAccountSlot(a, 50*time.Millisecond) {
+		t.Fatal("second acquire should succeed")
+	}
+	if p.AcquireAccountSlot(a, 50*time.Millisecond) {
+		t.Fatal("third acquire over cap should time out")
+	}
+	p.ReleaseAccountSlot(a)
+	if !p.AcquireAccountSlot(a, 50*time.Millisecond) {
+		t.Fatal("acquire after release should succeed")
+	}
+	p.ReleaseAccountSlot(a)
+	p.ReleaseAccountSlot(a) // 幂等：多余释放不 panic 不负计数
+	if !p.AcquireAccountSlot(a, 50*time.Millisecond) {
+		t.Fatal("idempotent double-release should not corrupt the gate")
+	}
+	p.ReleaseAccountSlot(a)
+}
+
+func TestIsRateLimitBody(t *testing.T) {
+	cases := []struct {
+		status int
+		body   string
+		want   bool
+	}{
+		{429, `anything`, true},
+		{400, `{"code":1302,"msg":"Rate limit reached for requests"}`, true},
+		{400, `{"code": 1303}`, true},
+		{200, `[1302][Rate limit reached for requests][20260930…]`, true},
+		{400, `{"code":3012,"msg":"unusual activity"}`, false},
+		{400, `{"code":1003,"msg":"already claimed"}`, false},
+	}
+	for _, c := range cases {
+		if got := isRateLimitBody(c.status, c.body); got != c.want {
+			t.Fatalf("isRateLimitBody(%d, %q) = %v, want %v", c.status, c.body, got, c.want)
+		}
+	}
+}
+
+func TestNextRateLimitCooldownEscalates(t *testing.T) {
+	a := mkPoolAccount("esc", DefaultPriority, StatusActive)
+	if got := nextRateLimitCooldown(a); got != 30 {
+		t.Fatalf("first offense should be 30s, got %d", got)
+	}
+	a.LastError = "上游限流（HTTP 429，model=x），冷却 30s"
+	if got := nextRateLimitCooldown(a); got != 120 {
+		t.Fatalf("second offense should be 120s, got %d", got)
+	}
+	a.LastError = "上游限流（HTTP 429，model=x），冷却 120s"
+	if got := nextRateLimitCooldown(a); got != 300 {
+		t.Fatalf("third offense should be 300s, got %d", got)
+	}
+	a.LastError = "上游限流（HTTP 429，model=x），冷却 300s"
+	if got := nextRateLimitCooldown(a); got != 300 {
+		t.Fatalf("should cap at 300s, got %d", got)
 	}
 }

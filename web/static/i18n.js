@@ -325,7 +325,6 @@ const I18N_EN = {
   '开始登录': 'Start login',
   '发起登录失败: %s': 'Failed to start login: %s',
   '已在新标签页打开 Z.AI 授权页，登录并授权后自动跳回本网关完成入库。': 'Opened the Z.AI authorization page in a new tab — after login and approval it redirects back to this gateway and the account is imported.',
-  '若授权后浏览器没有自动跳回（或 Z.AI 页面报错），请复制授权后地址栏的完整 URL，切换到「手动粘贴」模式提交。': 'If the browser does not redirect back automatically (or the Z.AI page errors), copy the full post-authorization URL from the address bar and submit it in "Manual paste" mode.',
   '已在新标签页打开 Z.AI 授权页。步骤：① 登录并同意授权 → ② 浏览器会跳到 <b>zcode.z.ai/login?code=…</b> → ③ 复制该地址栏<b>完整 URL</b>粘贴到下面 → ④ 提交兑换。': 'Opened the Z.AI authorization page in a new tab. Steps: ① log in and approve → ② the browser lands on <b>zcode.z.ai/login?code=…</b> → ③ copy the <b>full URL</b> from the address bar and paste it below → ④ submit to redeem.',
   '粘贴回跳 URL（或仅 code）': 'Paste the redirect URL (or just the code)',
   '提交兑换': 'Redeem',

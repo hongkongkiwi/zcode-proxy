@@ -19,11 +19,39 @@ import (
 
 // StreamUsage 流式嗅探到的用量
 type StreamUsage struct {
-	InputTokens  int
-	OutputTokens int
-	StopReason   string
-	ToolCalls    []map[string]interface{}
-	StreamError  string // 上游 SSE error 事件（overloaded_error 等）
+	InputTokens         int
+	OutputTokens        int
+	CacheReadTokens     int // 上游缓存命中 token（cache_read_input_tokens）
+	CacheCreationTokens int // 上游缓存写入 token（cache_creation_input_tokens）
+	StopReason          string
+	ToolCalls           []map[string]interface{}
+	StreamError         string // 上游 SSE error 事件（overloaded_error 等）
+	ThinkingBlocks      []thinkingBlock // R6：本响应收集到的已签名思考块（重放缓存）
+	sigByBlock map[int]string           // content_block index → signature（逐块捕获态）
+	thinkBufs  map[int]*strings.Builder // content_block index → thinking 文本缓冲
+}
+
+// initThinkState 惰性初始化思考块逐块捕获状态
+func (u *StreamUsage) initThinkState() {
+	if u.sigByBlock == nil {
+		u.sigByBlock = map[int]string{}
+	}
+	if u.thinkBufs == nil {
+		u.thinkBufs = map[int]*strings.Builder{}
+	}
+}
+
+// finishThinkBlock 思考块结束：签名非空时收进 ThinkingBlocks，清理逐块状态
+func (u *StreamUsage) finishThinkBlock(idx int) {
+	if u.sigByBlock == nil && u.thinkBufs == nil {
+		return
+	}
+	sig := u.sigByBlock[idx]
+	if buf := u.thinkBufs[idx]; buf != nil && sig != "" {
+		u.ThinkingBlocks = append(u.ThinkingBlocks, thinkingBlock{Text: buf.String(), Signature: sig})
+	}
+	delete(u.sigByBlock, idx)
+	delete(u.thinkBufs, idx)
 }
 
 // sseEvent 一个完整的 SSE 事件
@@ -123,15 +151,19 @@ func isDataErrorFrame(data map[string]interface{}) bool {
 func parseAnthropicUsageJSON(body []byte) *StreamUsage {
 	var v struct {
 		Usage struct {
-			InputTokens  int `json:"input_tokens"`
-			OutputTokens int `json:"output_tokens"`
+			InputTokens         int `json:"input_tokens"`
+			OutputTokens        int `json:"output_tokens"`
+			CacheReadTokens     int `json:"cache_read_input_tokens"`
+			CacheCreationTokens int `json:"cache_creation_input_tokens"`
 		} `json:"usage"`
 		StopReason string `json:"stop_reason"`
 	}
 	if json.Unmarshal(body, &v) != nil {
 		return nil
 	}
-	return &StreamUsage{InputTokens: v.Usage.InputTokens, OutputTokens: v.Usage.OutputTokens, StopReason: v.StopReason}
+	return &StreamUsage{InputTokens: v.Usage.InputTokens, OutputTokens: v.Usage.OutputTokens,
+		CacheReadTokens: v.Usage.CacheReadTokens, CacheCreationTokens: v.Usage.CacheCreationTokens,
+		StopReason: v.StopReason}
 }
 
 // applyEventToUsage 从单个事件累积 usage / stop_reason / tool_calls
@@ -146,6 +178,13 @@ func applyEventToUsage(ev sseEvent, usage *StreamUsage, activeTool *map[string]i
 				if n := toInt(u["output_tokens"]); n > usage.OutputTokens {
 					usage.OutputTokens = n
 				}
+				// 缓存 token 计量（R3）：与 input_tokens 同取 max 语义
+				if n := toInt(u["cache_read_input_tokens"]); n > usage.CacheReadTokens {
+					usage.CacheReadTokens = n
+				}
+				if n := toInt(u["cache_creation_input_tokens"]); n > usage.CacheCreationTokens {
+					usage.CacheCreationTokens = n
+				}
 			}
 		}
 	case "message_delta":
@@ -159,6 +198,16 @@ func applyEventToUsage(ev sseEvent, usage *StreamUsage, activeTool *map[string]i
 					usage.InputTokens = n
 				}
 			}
+			if v, ok := u["cache_read_input_tokens"]; ok {
+				if n := toInt(v); n > usage.CacheReadTokens {
+					usage.CacheReadTokens = n
+				}
+			}
+			if v, ok := u["cache_creation_input_tokens"]; ok {
+				if n := toInt(v); n > usage.CacheCreationTokens {
+					usage.CacheCreationTokens = n
+				}
+			}
 		}
 		if d, ok := ev.Data["delta"].(map[string]interface{}); ok {
 			if sr, ok := d["stop_reason"].(string); ok && sr != "" {
@@ -167,6 +216,15 @@ func applyEventToUsage(ev sseEvent, usage *StreamUsage, activeTool *map[string]i
 		}
 	case "content_block_start":
 		if block, ok := ev.Data["content_block"].(map[string]interface{}); ok {
+			if block["type"] == "thinking" {
+				// R6：记录思考块签名并开文本缓冲（签名也可能在 start 自带）
+				usage.initThinkState()
+				idx := toInt(ev.Data["index"])
+				if sig, ok := block["signature"].(string); ok && sig != "" {
+					usage.sigByBlock[idx] = sig
+				}
+				usage.thinkBufs[idx] = &strings.Builder{}
+			}
 			if block["type"] == "tool_use" {
 				tool := map[string]interface{}{
 					"id":    block["id"],
@@ -192,9 +250,19 @@ func applyEventToUsage(ev sseEvent, usage *StreamUsage, activeTool *map[string]i
 			if t, ok := delta["text"].(string); ok {
 				*textParts = append(*textParts, t)
 			}
+		case "signature_delta":
+			// R6：签名增量追加到对应思考块
+			if s, ok := delta["signature"].(string); ok && s != "" {
+				usage.initThinkState()
+				usage.sigByBlock[toInt(ev.Data["index"])] += s
+			}
 		case "thinking_delta":
 			if t, ok := delta["thinking"].(string); ok {
 				*thinkParts = append(*thinkParts, t)
+				// R6：同步进逐块缓冲，供签名重放缓存取完整块文本
+				if buf, ok := usage.thinkBufs[toInt(ev.Data["index"])]; ok {
+					buf.WriteString(t)
+				}
 			}
 		case "input_json_delta":
 			if *activeTool != nil {
@@ -204,6 +272,7 @@ func applyEventToUsage(ev sseEvent, usage *StreamUsage, activeTool *map[string]i
 			}
 		}
 	case "content_block_stop":
+		usage.finishThinkBlock(toInt(ev.Data["index"]))
 		*activeTool = nil
 	case "error":
 		// 上游流内错误事件（overloaded_error / 风控中途拦截等），不得被吞掉
@@ -264,12 +333,13 @@ func writeProtocolResponse(w http.ResponseWriter, proto protocol, status int, co
 	// OpenAI / Responses：从 Anthropic JSON 提取文本/思考/工具调用
 	var resp struct {
 		Content []struct {
-			Type     string          `json:"type"`
-			Text     string          `json:"text"`
-			Thinking string          `json:"thinking"`
-			ID       string          `json:"id"`
-			Name     string          `json:"name"`
-			Input    json.RawMessage `json:"input"`
+			Type      string          `json:"type"`
+			Text      string          `json:"text"`
+			Thinking  string          `json:"thinking"`
+			Signature string          `json:"signature"`
+			ID        string          `json:"id"`
+			Name      string          `json:"name"`
+			Input     json.RawMessage `json:"input"`
 		} `json:"content"`
 		StopReason string `json:"stop_reason"`
 		Usage      struct {
@@ -280,12 +350,17 @@ func writeProtocolResponse(w http.ResponseWriter, proto protocol, status int, co
 	json.Unmarshal(body, &resp)
 	var text, thinking string
 	var toolCalls []map[string]interface{}
+	var thinkBlocks []thinkingBlock
 	for _, c := range resp.Content {
 		switch c.Type {
 		case "text":
 			text += c.Text
 		case "thinking":
 			thinking += c.Thinking
+			// R6：非流式路径同样收集签名思考块供重放缓存
+			if c.Signature != "" {
+				thinkBlocks = append(thinkBlocks, thinkingBlock{Text: c.Thinking, Signature: c.Signature})
+			}
 		case "tool_use":
 			var input map[string]interface{}
 			json.Unmarshal(c.Input, &input)
@@ -303,6 +378,8 @@ func writeProtocolResponse(w http.ResponseWriter, proto protocol, status int, co
 	if usage != nil && u.InputTokens == 0 {
 		u = usage
 	}
+	u.ThinkingBlocks = append(u.ThinkingBlocks, thinkBlocks...)
+	cacheThinkingForOutput(text, u)
 	if proto == protocolOpenAI {
 		writeJSON(w, status, openaiResponse(clientModel, text, thinking, u))
 	} else {
@@ -365,6 +442,7 @@ func streamProtocolResponse(w http.ResponseWriter, rc *relayCtx, resp *http.Resp
 		}
 		parser.flush(func(ev sseEvent) { applyEventToUsage(ev, &usage, &activeTool, &texts, &thinks) })
 		finalizeToolCalls(&usage)
+		cacheThinkingForOutput(strings.Join(texts, ""), &usage)
 		if readErr != nil && readErr != io.EOF {
 			// 中途断流/解析溢出：客户端流会被截断，补一个协议正确的 error 帧，
 			// 让 SDK 能区分"干净结束"与"上游中断"
@@ -422,6 +500,7 @@ func streamProtocolResponse(w http.ResponseWriter, rc *relayCtx, resp *http.Resp
 		}
 		parser.flush(func(ev sseEvent) { applyEventToUsage(ev, &usage, &activeTool, &texts, &thinks) })
 		finalizeToolCalls(&usage)
+		cacheThinkingForOutput(strings.Join(texts, ""), &usage)
 		// 上游流内错误或中途断流：不得伪装成成功空响应
 		if usage.StreamError != "" || (readErr != nil && readErr != io.EOF) {
 			msg := usage.StreamError
@@ -583,6 +662,7 @@ func (z *ZCodeAPI) streamOpenAI(w http.ResponseWriter, flusher http.Flusher, res
 	}
 	parser.flush(handle)
 	finalizeToolCalls(&usage)
+	cacheThinkingForOutput(strings.Join(texts, ""), &usage)
 
 	// 上游流内错误或中途断流：发 OpenAI 错误 chunk 而非伪装成功
 	if usage.StreamError != "" || (readErr != nil && readErr != io.EOF) {
@@ -835,8 +915,12 @@ func (z *ZCodeAPI) streamResponses(w http.ResponseWriter, flusher http.Flusher, 
 			kind, _ := block["type"].(string)
 			if kind == "tool_use" {
 				for i := range blocks {
-					if blocks[i].kind == "text" {
+					// 未正常关闭的 text/thinking 块先收尾，保证事件序列
+					// 的 output_index 单调（上游违例交错的兜底）
+					if blocks[i].kind == "text" && blocks[i].itemID != "" {
 						closeMessageEvents(i)
+					} else if blocks[i].kind == "thinking" && blocks[i].itemID != "" {
+						closeReasoningEvents(i)
 					}
 				}
 				blocks[idx] = &blockState{kind: "tool"}
@@ -990,6 +1074,7 @@ func (z *ZCodeAPI) streamResponses(w http.ResponseWriter, flusher http.Flusher, 
 		flusher.Flush()
 	}
 	finalizeToolCalls(&usage)
+	cacheThinkingForOutput(fullText, &usage)
 	z.recordUsage(a, r, payload, resp.StatusCode, start, ttft, &usage, true)
 }
 
