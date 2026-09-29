@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"math"
 	"net/http"
 	"sort"
@@ -213,6 +214,16 @@ func (z *ZCodeAPI) FetchQuotaRaw(a *Account) (*QuotaOverview, error) {
 	if a.ZCodeJWT != "" {
 		ov, err := z.fetchZaiBilling(a)
 		if err == nil {
+			// JWT 通道（Start Plan 计费）报耗尽而账号带 API Key 时交叉核对
+			// monitor 通道（individual coding plan 额度在彼处）：monitor 有余量
+			// 则以 monitor 为准，避免把可用的 coding plan 账号误标 exhausted
+			if ov != nil && ov.AllExhausted() && a.APIKey != "" {
+				if ov2, err2 := z.fetchApiZaiMonitor(a); err2 == nil && ov2 != nil &&
+					!ov2.AllExhausted() && !ov2.IsEmpty && !ov2.AuthFailed {
+					log.Printf("[quota] account %s: JWT billing exhausted but monitor channel has quota, using monitor", a.Email)
+					return ov2, nil
+				}
+			}
 			return ov, nil
 		}
 		// 纯网络失败（超时/连接拒绝，无 HTTP 响应）：不回退、不改状态

@@ -53,7 +53,7 @@ Go 单二进制实现的 **ZCode（Z.AI / GLM Coding Plan）多账号管理 + OA
 | 多账号管理 | 本地客户端一键导入 / OAuth 登录（免回调 CLI 轮询为主，手动粘贴备用）/ 粘贴 JWT·API Key；分组、启用策略（random / round_robin / best_quota）、状态机 |
 | 2API 网关 | `/v1/messages`（Anthropic 原生）、`/v1/chat/completions`、`/v1/responses`、`/v1/models`、`/v1/messages/count_tokens`；SSE 流式 + 用量/TTFT 记录；上游端点按服务端 `agent/configs` 路由表自动重写（fail-open） |
 | 闲时通道 | `/async/v1/messages`（Anthropic 原生）经上游 **off-peak 免费算力队列**：取票排队、SSE 注释帧保活、`X-Off-Peak-Ticket-ID` 调用、幂等关票、票回收自动重取；设置 `async_enabled` 开启 |
-| 额度监控 | 后台周期刷新；账号页额度条**可点开**查看分套餐槽位与逐模型额度构成；驱动状态机 |
+| 额度监控 | 后台周期刷新；账号页额度条**可点开**查看分套餐槽位与逐模型额度构成；驱动状态机；JWT 通道（Start Plan 计费）报耗尽而账号带 API Key 时自动交叉核对 monitor 通道（individual coding plan 额度），有余量则以 monitor 为准 |
 | 活动体系 | 检测（billing/preview）、领取（billing/claim + 阿里云无痕验证码）、激活（event/report）、**Coding Plan 配额重置**（reset/status·use·opportunity·history/read）；cron 调度 + 账号间防风控延迟 |
 | 人机验证 | go-rod 驱动**本机真实 Chrome/Edge** 无头求解；失败自动升级有头手动；参数按出口代理分组缓存 |
 | 指纹伪装 | utls 20+ 预置 ClientHello + 自定义 JA3；按主机选择传输策略 |
