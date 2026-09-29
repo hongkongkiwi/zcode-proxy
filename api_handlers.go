@@ -2,8 +2,6 @@ package main
 
 import (
 	"encoding/json"
-	"fmt"
-	"log"
 	"net/http"
 	"strconv"
 	"strings"
@@ -233,14 +231,21 @@ func (s *APIServer) handleImportPaste(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]interface{}{"success": true, "account": accountPublicView(a)})
 }
 
-// handleExportBundle 导出加密账号包
+// handleExportBundle 导出加密账号包（步进重认证：需再次提供当前管理口令）
 func (s *APIServer) handleExportBundle(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		Password string  `json:"password"`
-		IDs      []int64 `json:"ids"`
+		Password      string  `json:"password"`
+		AdminPassword string  `json:"admin_password"`
+		IDs           []int64 `json:"ids"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeAPIError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if !s.auth.verifyPassword(body.AdminPassword) {
+		// 与登录共用限速器： stolen session 无法无节流爆破管理员口令
+		s.auth.recordLoginFail(clientIP(r))
+		writeAPIError(w, http.StatusUnauthorized, "管理员密码验证失败，请输入当前管理员密码")
 		return
 	}
 	bundle, err := s.acctMgr.ExportBundle(body.Password, body.IDs)
@@ -929,6 +934,3 @@ func queryInt(r *http.Request, key string, def int) int {
 	}
 	return n
 }
-
-var _ = log.Printf
-var _ = fmt.Sprintf

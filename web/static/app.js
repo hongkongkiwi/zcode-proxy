@@ -1180,15 +1180,18 @@ function showExportBundleModal() {
   openModal(`<h3>导出加密账号包</h3>
     <p style="font-size:13px;color:var(--c-text-light);margin-bottom:12px">导出全部账号的凭证（JWT / API Key / 设备指纹 / 本地快照），PBKDF2+AES-256-GCM 加密，可跨机器导入。</p>
     <div class="form-group"><label>加密密码</label><input type="password" id="expPass" placeholder="导入时需要相同密码"></div>
+    <div class="form-group"><label>管理员密码（确认身份）</label><input type="password" id="expAdminPass" autocomplete="current-password"></div>
     <div class="actions"><button class="btn btn-secondary" onclick="closeModal()">取消</button>
     <button class="btn btn-primary" onclick="doExportBundle()">生成账号包</button></div>`);
 }
 
 async function doExportBundle() {
   const pass = document.getElementById('expPass').value;
+  const adminPass = document.getElementById('expAdminPass').value;
   if (!pass) return toast('请设置密码', 'error');
+  if (!adminPass) return toast('请输入管理员密码', 'error');
   try {
-    const r = await api('/api/accounts/export', { method: 'POST', body: { password: pass } });
+    const r = await api('/api/accounts/export', { method: 'POST', body: { password: pass, admin_password: adminPass } });
     openModal(`<h3>账号包已生成</h3>
       <div class="form-group"><textarea id="bundleText" style="min-height:160px">${esc(r.bundle)}</textarea></div>
       <div class="actions"><button class="btn btn-secondary" onclick="closeModal()">关闭</button>

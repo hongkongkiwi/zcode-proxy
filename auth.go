@@ -55,14 +55,45 @@ const (
 	loginLockMax  = 30 * time.Minute
 )
 
-// NewAuthManager 创建认证管理器（默认 admin/admin，可用环境变量覆盖）
+// pwdAlphabet 无歧义随机口令字母表（去除 0O1lI 等易混淆字符）
+const pwdAlphabet = "abcdefghijkmnpqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+
+// generateRandomPassword 生成 n 位 crypto/rand 随机口令
+func generateRandomPassword(n int) (string, error) {
+	b := make([]byte, n)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	out := make([]byte, n)
+	for i, v := range b {
+		out[i] = pwdAlphabet[int(v)%len(pwdAlphabet)]
+	}
+	return string(out), nil
+}
+
+// NewAuthManager 创建认证管理器：优先 ZCODE_WEB_PASS；全新数据库（无口令哈希）
+// 生成随机管理口令，bcrypt 落库并打印一次。不再存在硬编码默认口令。
 func NewAuthManager(db *DB, password string) *AuthManager {
-	if password == "" {
-		password = "admin"
+	fallbackPwd := password
+	if fallbackPwd == "" && db != nil {
+		if stored, _ := db.GetPasswordHash(); stored == "" {
+			// 全新数据库：随机生成初始管理口令（is_default_password=1，UI 会提示修改）
+			if pw, err := generateRandomPassword(20); err == nil {
+				fallbackPwd = pw
+				if err := db.SetPasswordHash(hashPassword(pw)); err != nil {
+					log.Printf("[auth] persist initial admin password hash failed: %v", err)
+				} else {
+					db.SetDefaultPasswordFlag(true)
+				}
+				log.Printf("[auth] initial admin password: %s (change it in the web UI)", pw)
+			} else {
+				log.Printf("[auth] generate admin password failed: %v", err)
+			}
+		}
 	}
 	return &AuthManager{
 		sessions:    make(map[string]*sessionEntry),
-		fallbackPwd: password,
+		fallbackPwd: fallbackPwd,
 		db:          db,
 		failures:    make(map[string]*loginFail),
 	}
@@ -100,7 +131,11 @@ func (am *AuthManager) verifyPassword(pwd string) bool {
 		}
 		return false
 	}
-	return pwd == am.fallbackPwd
+	// 兜底：环境变量口令（常数时间比较，长度不等直接拒绝）
+	if am.fallbackPwd == "" || len(pwd) != len(am.fallbackPwd) {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(pwd), []byte(am.fallbackPwd)) == 1
 }
 
 // checkLoginRate 登录限速：锁定中返回剩余时长
@@ -226,10 +261,8 @@ func (am *AuthManager) IsValid(token string) bool {
 }
 
 // clientIP 提取客户端 IP（用于登录限速键）
+// 服务仅绑定本机，X-Forwarded-For 可被任意伪造，一律以连接对端为准
 func clientIP(r *http.Request) string {
-	if xf := r.Header.Get("X-Forwarded-For"); xf != "" {
-		return strings.TrimSpace(strings.Split(xf, ",")[0])
-	}
 	host := r.RemoteAddr
 	if h, _, err := net.SplitHostPort(host); err == nil {
 		return h

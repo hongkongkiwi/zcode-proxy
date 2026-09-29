@@ -288,7 +288,10 @@ func (m *AccountManager) SwitchBackToLocal(accountID int64, killClient bool) err
 	stamp := time.Now().Format("20060102-150405")
 	for _, p := range []string{f.credentials, f.config} {
 		if data, err := os.ReadFile(p); err == nil {
-			os.WriteFile(filepath.Join(backupDir, filepath.Base(p)+"."+stamp+".bak"), data, 0644)
+			// 备份含凭证快照，限权 0600（WriteFile 对已存在文件不改权限，补一次 Chmod）
+			bak := filepath.Join(backupDir, filepath.Base(p)+"."+stamp+".bak")
+			os.WriteFile(bak, data, 0600)
+			os.Chmod(bak, 0600)
 		}
 	}
 
@@ -362,6 +365,8 @@ func (m *AccountManager) SwitchBackToLocal(accountID int64, killClient bool) err
 	if err := atomicWriteJSON(f.config, cfg); err != nil {
 		return fmt.Errorf("写回 config.json 失败: %w", err)
 	}
+	// config.json 现含账号 JWT / API Key，限权 0600
+	os.Chmod(f.config, 0600)
 
 	// 4. 清缓存强制重新探测
 	os.Remove(f.cache)
@@ -375,17 +380,24 @@ func (m *AccountManager) SwitchBackToLocal(accountID int64, killClient bool) err
 	return nil
 }
 
-// atomicWriteJSON 临时文件 + rename 原子写
+// atomicWriteJSON 临时文件 + rename 原子写（目标含账号凭证，权限收紧为 0600）
 func atomicWriteJSON(path string, v interface{}) error {
 	data, err := json.MarshalIndent(v, "", "  ")
 	if err != nil {
 		return err
 	}
 	tmp := path + ".tmp-zproxy"
-	if err := os.WriteFile(tmp, data, 0644); err != nil {
+	if err := os.WriteFile(tmp, data, 0600); err != nil {
 		return err
 	}
-	return os.Rename(tmp, path)
+	if err := os.Chmod(tmp, 0600); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		return err
+	}
+	return os.Chmod(path, 0600)
 }
 
 // killZCodeProcess 结束本机 ZCode 客户端进程（平台实现见 proc_windows.go / proc_other.go）
