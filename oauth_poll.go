@@ -53,6 +53,10 @@ func (m *OAuthManager) StartPollLogin(group string) (*OAuthFlow, string, error) 
 	if flowID == "" || authorizeURL == "" {
 		return nil, "", fmt.Errorf("cli/init 响应缺少 flow_id/authorize_url")
 	}
+	if au, err := url.Parse(authorizeURL); err != nil || au.Scheme != "https" || au.Host == "" {
+		// 对齐官方 cli-oauth.ts：authorize_url 必须 https，防被引导到 http:/javascript:
+		return nil, "", fmt.Errorf("authorize_url 非法（必须为 https 绝对地址）")
+	}
 	if pollIntervalSec < 1 {
 		pollIntervalSec = 2
 	}
@@ -94,7 +98,6 @@ func applyDesktopInterstitial(authorizeURL, provider, appVersion string) (string
 	interstitial := "https://zcode.z.ai/app/oauth/login?redirect=" + url.QueryEscape("zcode://oauth/callback") +
 		"&app_version=" + url.QueryEscape(appVersion)
 	if provider == "bigmodel" {
-		u.Query().Set("redirect", interstitial)
 		q := u.Query()
 		q.Set("redirect", interstitial)
 		u.RawQuery = q.Encode()
@@ -115,7 +118,8 @@ func (m *OAuthManager) cliInit(pollToken string) (map[string]interface{}, error)
 	}
 	req.Header.Set("Authorization", "Bearer "+pollToken)
 	req.Header.Set("Content-Type", "application/json")
-	client := NewUpstreamHTTPClient(m.zapi.egress.GlobalProxyURL(), 15*time.Second)
+	// cli/* 与消息通道同属 zcode.z.ai（ESA WAF），统一走指纹客户端
+	client := ClientForURL(m.zapi.egress.GlobalProxyURL(), cliLoginInitURL, 15*time.Second)
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err
@@ -131,7 +135,8 @@ func (m *OAuthManager) pollLoop(flow *OAuthFlow, pollToken, flowID string, expir
 			deadline = e
 		}
 	}
-	client := NewUpstreamHTTPClient(m.zapi.egress.GlobalProxyURL(), 15*time.Second)
+	// cli/poll 与 cli/init 同属 zcode.z.ai（ESA WAF），统一走指纹客户端
+	client := ClientForURL(m.zapi.egress.GlobalProxyURL(), cliLoginPollBase, 15*time.Second)
 
 	for {
 		if time.Now().After(deadline) {
@@ -158,7 +163,8 @@ func (m *OAuthManager) pollLoop(flow *OAuthFlow, pollToken, flowID string, expir
 }
 
 // pollOnce 单轮轮询。返回 (ready, data, fatalErr)；
-// 网络错误/5xx/408/429/畸形 200 视为 pending（fatal=nil, ready=false）。
+// 仅网络错误/5xx/408/429 视为 pending（对齐官方 auth-login-polling.ts：
+// 非 408/429/5xx 一律终止——畸形 200、缺 data、未知 status、3xx 均为 fatal）。
 func (m *OAuthManager) pollOnce(client *http.Client, pollToken, flowID string) (bool, map[string]interface{}, error) {
 	req, err := http.NewRequest("GET", cliLoginPollBase+"/"+flowID, nil)
 	if err != nil {
@@ -174,13 +180,17 @@ func (m *OAuthManager) pollOnce(client *http.Client, pollToken, flowID string) (
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 		return false, nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, truncate(string(body), 200))
 	}
+	if resp.StatusCode >= 300 && resp.StatusCode < 400 {
+		// 客户端不跟随重定向：3xx 多为 WAF 挑战页，按终止处理而非空转满轮询窗口
+		return false, nil, fmt.Errorf("HTTP %d（重定向/WAF 挑战）", resp.StatusCode)
+	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return false, nil, nil // 5xx 等 → pending
 	}
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	var v map[string]interface{}
 	if json.Unmarshal(body, &v) != nil {
-		return false, nil, nil // 畸形 200 → pending
+		return false, nil, fmt.Errorf("响应非 JSON（HTTP %d）", resp.StatusCode)
 	}
 	if codeVal, has := v["code"]; has {
 		n := jsonInt(v, "code")
@@ -191,15 +201,17 @@ func (m *OAuthManager) pollOnce(client *http.Client, pollToken, flowID string) (
 	}
 	data, _ := v["data"].(map[string]interface{})
 	if data == nil {
-		return false, nil, nil
+		return false, nil, fmt.Errorf("轮询响应缺少 data")
 	}
 	switch jsonStr(data, "status") {
 	case "ready":
 		return true, data, nil
+	case "pending":
+		return false, nil, nil
 	case "failed":
 		return false, nil, fmt.Errorf("服务端报告授权失败")
-	default: // pending / 其它未知状态按 pending 处理
-		return false, nil, nil
+	default: // 未知状态按终止处理（对齐官方）
+		return false, nil, fmt.Errorf("未知授权状态: %q", jsonStr(data, "status"))
 	}
 }
 

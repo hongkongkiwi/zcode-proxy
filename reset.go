@@ -361,7 +361,10 @@ func (z *ZCodeAPI) SyncResetHistoryFromUpstream(a *Account) (int, error) {
 			continue
 		}
 		dup, err := z.db.HasResetRecordNear(a.ID, e.used/1000)
-		if err == nil && !dup {
+		if err != nil {
+			continue // 查询失败不推进锚点，下次同步重试
+		}
+		if !dup {
 			z.db.InsertClaimRecord(&ClaimRecord{
 				AccountID: a.ID,
 				Email:     a.Email,

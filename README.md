@@ -233,8 +233,8 @@ Go 单二进制实现的 **ZCode（Z.AI / GLM Coding Plan）多账号管理 + OA
 ## 6. SSE / 协议转换
 
 - **Anthropic→OpenAI chat**：`message_start→首 chunk(role)`、`content_block_delta.text_delta→delta.content`、`thinking_delta→delta.reasoning_content`、`tool_use→delta.tool_calls[index]`、`message_delta→finish_reason`、末尾 `usage chunk(include_usage)` + `[DONE]`。
-- **Anthropic→Responses**：`response.created/output_item.added/content_part.added/output_text.delta/function_call_arguments.delta/output_text.done/output_item.done/response.completed`；错误/断流发 `response.failed`。
-- **OpenAI→Anthropic 请求**：system/developer→`system` 串；tool→`tool_result`；assistant.tool_calls→`tool_use`；image_url(data:)→base64 image；tool_choice auto/required/name 映射。
+- **Anthropic→Responses**：`response.created/output_item.added/reasoning_summary_part.added/reasoning_summary_text.delta/reasoning_summary_text.done/reasoning_summary_part.done/content_part.added/output_text.delta/function_call_arguments.delta/output_text.done/output_item.done/response.completed`（思考以 `type:reasoning` 输出项流式发出，`response.completed.output` 与事件序列一致）；错误/断流发 `response.failed`。
+- **OpenAI→Anthropic 请求**：system/developer→`system` 串；tool→`tool_result`；assistant.tool_calls→`tool_use`；image_url 仅接受 data: base64（其余形态返回 400，不静默丢弃）；tool_choice auto/required/name 映射。reasoning_effort 透传至 GLM-5.3 思考档位，非 5.3 模型丢弃。
 - **Responses→Anthropic**：instructions→system；input[] 的 message/function_call/function_call_output 映射；reasoning.effort→reasoning_effort。
 - **健壮性**：SSE 解析缓冲上限 16MB（超限按流失败处理，不静默清空）、跨 chunk 断帧兼容 LF/CRLF；命名 `event:error`、匿名 `data:` 错误帧（顶层 `error` 字段或 `type=error`）与 `err!=io.EOF` 均按失败处理（不伪装成功）。
 
@@ -286,7 +286,7 @@ go vet .
 - `/v1/messages/count_tokens` 为保守估算（字符/4+开销；官方客户端 3.14.x 已不调用该端点，仅为兼容保留）。
 - GLM-5.3 思考参数对上游按官方 3.14.x wire 格式发送（`thinking:{type:adaptive}` + `output_config.effort`）；上游若回退旧版可能需重新调整。
 - 账号包导出使用 PBKDF2 60 万轮；旧 12 万轮加密包仅支持导入（自动回退），不再生成。
-- 库内凭证已静态加密（`vault1:`），密钥默认绑定本机（平台/home/用户名）；跨机器迁移 `data/` 时请同设 `ZCODE_PROXY_VAULT_SECRET`。
+- 库内凭证已静态加密（`vault1:` AES-256-GCM），密钥默认为随机生成的 `data/vault.key`（0600，首次启动创建）。**`vault.key` 必须与 `data/` 一同备份：丢失即库内凭证永久不可读**；跨机器迁移可改用 `ZCODE_PROXY_VAULT_SECRET` 指定种子（同样需妥善保管，env 模式不在磁盘留钥）。启动时自动迁移存量明文；注意迁移前的明文可能残留在 WAL/空闲页，敏感场景请迁移后执行 `VACUUM`。
 - `/async/v1/messages` 闲时通道为一次性应答、无会话记忆（上游语义）；多轮对话请在请求内携带历史。
 - 闲时通道（off-peak）：取票/排队/就绪/转发全链路已打通，但上游对消息转发返回 `3001 parameter error`（已对齐 stream 强制、x-coding-plan-api-key、metadata.user_id、小写模型、cache_control 等全部已知协议面）；疑似上游对账号状态或新版本有额外校验，待上游行为明确。
 
