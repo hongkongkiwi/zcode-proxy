@@ -34,11 +34,11 @@ type ResetUsed struct {
 
 // ResetStatus 重置状态
 type ResetStatus struct {
-	AvailableFiveHourResets  []ResetSlot `json:"available_five_hour_resets"`
-	AvailableWeekResets      []ResetSlot `json:"available_week_resets"`
-	LatestFiveHourReset      *ResetUsed  `json:"latest_five_hour_reset_history"`
-	LatestWeekReset          *ResetUsed  `json:"latest_week_reset_history"`
-	HasUnreadHistory         bool        `json:"has_unread_history"`
+	AvailableFiveHourResets []ResetSlot `json:"available_five_hour_resets"`
+	AvailableWeekResets     []ResetSlot `json:"available_week_resets"`
+	LatestFiveHourReset     *ResetUsed  `json:"latest_five_hour_reset_history"`
+	LatestWeekReset         *ResetUsed  `json:"latest_week_reset_history"`
+	HasUnreadHistory        bool        `json:"has_unread_history"`
 }
 
 // resetHeaders AC() 移植：双凭证 + 团队上下文
@@ -205,9 +205,9 @@ func (z *ZCodeAPI) resetForAccountLocked(a *Account) *ClaimResult {
 	resetType := ""
 	switch {
 	case len(st.AvailableFiveHourResets) > 0:
-		resetType = "five_hour"
+		resetType = "FIVE_HOUR"
 	case len(st.AvailableWeekResets) > 0:
-		resetType = "week"
+		resetType = "WEEK"
 	}
 	if resetType == "" {
 		record.Success = true
@@ -267,8 +267,8 @@ func (z *ZCodeAPI) SyncModelCatalog() ([]CatalogModel, error) {
 		Data struct {
 			BuiltinModels []CatalogModel `json:"builtinModels"`
 			Providers     []struct {
-				ID      string `json:"id"`
-				BaseURL string `json:"baseUrl"`
+				ID      string         `json:"id"`
+				BaseURL string         `json:"baseUrl"`
 				Models  []CatalogModel `json:"models"`
 			} `json:"providers"`
 		} `json:"data"`
