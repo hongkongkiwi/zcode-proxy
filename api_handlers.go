@@ -53,6 +53,7 @@ func (s *APIServer) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/accounts/oauth/start", s.handleOAuthStart)
 	mux.HandleFunc("POST /api/accounts/oauth/manual", s.handleOAuthManual)
 	mux.HandleFunc("GET /api/accounts/oauth/status", s.handleOAuthStatus)
+	mux.HandleFunc("GET /api/offpeak/availability", s.handleOffpeakAvailability)
 	mux.HandleFunc("POST /api/accounts/{id}/refresh", s.handleAccountRefresh)
 	mux.HandleFunc("POST /api/accounts/{id}/claim", s.handleAccountClaim)
 	mux.HandleFunc("POST /api/accounts/{id}/detect", s.handleAccountDetect)
@@ -169,18 +170,18 @@ func accountPublicView(a *Account) map[string]interface{} {
 		"has_jwt": a.ZCodeJWT != "", "has_api_key": a.APIKey != "",
 		"has_access_token": a.AccessToken != "", "has_creds_snapshot": a.CredsRaw != "",
 		"device_mid": a.DeviceMid,
-		"status": EffectiveStatus(a), "raw_status": a.Status, "enabled": a.Enabled,
+		"status":     EffectiveStatus(a), "raw_status": a.Status, "enabled": a.Enabled,
 		"group": a.AccountGroup, "remark": a.Remark,
 		"plan_tier": a.PlanTier, "plan_expire": a.PlanExpire,
 		"total_units": a.TotalUnits, "used_units": a.UsedUnits, "remaining": a.Remaining,
-		"quota":          quota,
-		"use_count":      a.UseCount,
-		"fail_count":     a.FailCount,
-		"last_used_at":   a.LastUsedAt,
+		"quota":           quota,
+		"use_count":       a.UseCount,
+		"fail_count":      a.FailCount,
+		"last_used_at":    a.LastUsedAt,
 		"last_checked_at": a.LastCheckedAt,
-		"cooling_until":  a.CoolingUntil,
-		"last_error":     a.LastError,
-		"last_claim_at":  a.LastClaimAt, "last_claim_plan": a.LastClaimPlan, "last_claim_msg": a.LastClaimMsg,
+		"cooling_until":   a.CoolingUntil,
+		"last_error":      a.LastError,
+		"last_claim_at":   a.LastClaimAt, "last_claim_plan": a.LastClaimPlan, "last_claim_msg": a.LastClaimMsg,
 		"created_at": a.CreatedAt, "updated_at": a.UpdatedAt,
 	}
 }
@@ -277,9 +278,23 @@ func (s *APIServer) handleImportBundle(w http.ResponseWriter, r *http.Request) {
 func (s *APIServer) handleOAuthStart(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		Manual bool   `json:"manual"`
+		Poll   bool   `json:"poll"` // 服务端中介轮询登录（免回调，免注册 redirect_uri）
 		Group  string `json:"group"`
 	}
 	json.NewDecoder(r.Body).Decode(&body)
+	if body.Poll {
+		flow, authURL, err := s.oauth.StartPollLogin(body.Group)
+		if err != nil {
+			writeAPIError(w, http.StatusBadGateway, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]interface{}{
+			"state":         flow.State,
+			"authorize_url": authURL,
+			"poll":          true,
+		})
+		return
+	}
 	flow, authURL := s.oauth.StartLogin(body.Manual, body.Group)
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"state":         flow.State,
@@ -312,6 +327,31 @@ func (s *APIServer) handleOAuthStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, flow)
+}
+
+// handleOffpeakAvailability 探闲时队列可用性（管理端，取第一个可用 JWT 账号）
+func (s *APIServer) handleOffpeakAvailability(w http.ResponseWriter, r *http.Request) {
+	accounts, err := s.db.ListAccounts("")
+	if err != nil {
+		writeAPIError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	tickets := offPeakTickets{z: s.zapi}
+	for _, a := range accounts {
+		if !a.Enabled || a.ZCodeJWT == "" || a.Provider != "zai" {
+			continue
+		}
+		canTake, nextTakeAt, err := tickets.Availability(a)
+		if err != nil {
+			writeJSON(w, http.StatusOK, map[string]interface{}{"ok": false, "error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]interface{}{
+			"ok": true, "can_take": canTake, "next_take_at": nextTakeAt, "account": a.DisplayNameOrEmail(),
+		})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{"ok": false, "error": "无可用 JWT 账号"})
 }
 
 func (s *APIServer) handleAccountRefresh(w http.ResponseWriter, r *http.Request) {
@@ -667,6 +707,9 @@ var settingsWhitelist = map[string]bool{
 	"selection_strategy": true, "quota_refresh_interval": true,
 	"upstream_proxy": true, "fingerprint": true, "custom_ja3": true,
 	"captcha_mode": true, "gateway_models": true,
+	// 闲时免费通道（off-peak ticket queue）
+	"async_enabled": true, "async_poll_interval_ms": true,
+	"async_keepalive_ms": true, "async_max_retries": true, "async_max_wait_sec": true,
 }
 
 func (s *APIServer) handleGetSettings(w http.ResponseWriter, r *http.Request) {

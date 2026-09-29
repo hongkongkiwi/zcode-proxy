@@ -18,6 +18,7 @@ type ZCodeAPI struct {
 	pool       *AccountPool
 	captcha    *CaptchaService
 	egress     *EgressProxy
+	routing    *EndpointRouter
 	appVersion string
 
 	claimMu    sync.Mutex
@@ -32,6 +33,7 @@ func NewZCodeAPI(cfg *FileConfig, db *DB, pool *AccountPool, captcha *CaptchaSer
 		pool:       pool,
 		captcha:    captcha,
 		egress:     NewEgressProxy(db),
+		routing:    NewEndpointRouter(""),
 		appVersion: appVersion,
 		claimLocks: make(map[int64]*sync.Mutex),
 	}

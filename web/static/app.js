@@ -562,7 +562,8 @@ function showOAuthModal() {
     <div class="form-group"><label>分组</label><select id="oauthGroup">${groupOptions('')}</select></div>
     <div class="form-group"><label>方式</label>
       <select id="oauthMode">
-        <option value="manual">手动粘贴（推荐：Z.AI 仅注册了 zcode.z.ai/login 回跳）</option>
+        <option value="poll">免回调登录（推荐：与桌面端相同的 CLI 轮询流程，授权后自动完成）</option>
+        <option value="manual">手动粘贴（备用）</option>
         <option value="auto">环回自动（实验：当前会报 Redirect URI not registered）</option>
       </select></div>
     <div id="oauthStep2"></div>
@@ -573,17 +574,22 @@ function showOAuthModal() {
 async function startOAuth() {
   let group = document.getElementById('oauthGroup').value;
   if (group === '__new__') { group = prompt('新分组名称:'); if (!group) return; }
-  const manual = document.getElementById('oauthMode').value === 'manual';
+  const mode = document.getElementById('oauthMode').value;
+  const manual = mode === 'manual';
+  const poll = mode === 'poll';
   const btn = document.getElementById('oauthStartBtn');
   btn.disabled = true;
   try {
-    const r = await api('/api/accounts/oauth/start', { method: 'POST', body: { manual, group } });
+    const r = await api('/api/accounts/oauth/start', { method: 'POST', body: { manual, poll, group } });
     window._oauthState = r.state;
     if (!manual) {
       window.open(r.authorize_url, '_blank');
+      const hint = poll
+        ? '已在新标签页打开授权页。完成授权后服务端自动收到结果（无需回跳本机），下方状态会自动更新。'
+        : '已在新标签页打开 Z.AI 授权页，登录并授权后自动跳回本网关完成入库。';
       document.getElementById('oauthStep2').innerHTML =
-        `<div class="hint" style="margin-top:10px">已在新标签页打开 Z.AI 授权页，登录并授权后自动跳回本网关完成入库。</div>
-         <div class="hint" style="margin-top:6px;color:var(--c-warning-dark)">若授权后浏览器没有自动跳回（或 Z.AI 页面报错），请复制授权后地址栏的完整 URL，切换到「手动粘贴」模式提交。</div>
+        `<div class="hint" style="margin-top:10px">${hint}</div>
+         <div class="hint" style="margin-top:6px;color:var(--c-warning-dark)">若长时间未完成，可切换到「手动粘贴」模式：复制授权后地址栏的完整 URL 提交。</div>
          <div id="oauthStatus" style="margin-top:8px;font-size:13px"></div>`;
       pollOAuth();
     } else {

@@ -44,11 +44,11 @@ var modelNameMap = map[string]string{
 type relayOutcome int
 
 const (
-	outcomeWritten       relayOutcome = iota // 响应已写回客户端
-	outcomeNextAccount                       // 账号不可用，换下一个
-	outcomeCaptchaRejected                   // 验证码被拒，尝试下一条路径
-	outcomeUpstreamError                     // 上游最终错误（已写回）
-	outcomeRiskBlocked                       // 风控拦截（3012），尝试本账号下一条路径
+	outcomeWritten         relayOutcome = iota // 响应已写回客户端
+	outcomeNextAccount                         // 账号不可用，换下一个
+	outcomeCaptchaRejected                     // 验证码被拒，尝试下一条路径
+	outcomeUpstreamError                       // 上游最终错误（已写回）
+	outcomeRiskBlocked                         // 风控拦截（3012），尝试本账号下一条路径
 )
 
 // protocol 客户端协议类型（决定响应转换）
@@ -384,6 +384,8 @@ func (z *ZCodeAPI) buildUpstreamRequest(a *Account, verifyParam, region string, 
 	} else {
 		urlStr = up.Zai
 	}
+	// 服务端可控的端点路由表（agent/configs proxyEndpoint.mapping，fail-open）
+	urlStr = z.routing.Resolve(urlStr)
 
 	// 客户端身份头（与桌面端一致）
 	id := NewClientIdentity(z.appVersion, a.DeviceMid)

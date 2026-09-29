@@ -26,26 +26,26 @@ import (
 // API Key 提取链: z/login → getCustomerInfo → api_keys(创建/复用 zcode-api-key) → copy → {key}.{secret}
 
 const (
-	OAuthAuthorizeURL = "https://chat.z.ai/api/oauth/authorize"
-	OAuthTokenURL     = "https://zcode.z.ai/api/v1/oauth/token"
-	OAuthUserInfoURL  = "https://chat.z.ai/api/oauth/userinfo"
-	OAuthClientID     = "client_P8X5CMWmlaRO9gyO-KSqtg"
+	OAuthAuthorizeURL   = "https://chat.z.ai/api/oauth/authorize"
+	OAuthTokenURL       = "https://zcode.z.ai/api/v1/oauth/token"
+	OAuthUserInfoURL    = "https://chat.z.ai/api/oauth/userinfo"
+	OAuthClientID       = "client_P8X5CMWmlaRO9gyO-KSqtg"
 	OAuthManualRedirect = "https://zcode.z.ai/login"
-	BizLoginURL       = "https://api.z.ai/api/auth/z/login"
-	CustomerInfoURL   = "https://api.z.ai/api/biz/customer/getCustomerInfo"
+	BizLoginURL         = "https://api.z.ai/api/auth/z/login"
+	CustomerInfoURL     = "https://api.z.ai/api/biz/customer/getCustomerInfo"
 )
 
 // OAuthFlow 一次登录流程的状态
 type OAuthFlow struct {
-	State       string `json:"state"`
-	RedirectURI string `json:"redirect_uri"`
-	Manual      bool   `json:"manual"`
-	Group       string `json:"group"`
-	CreatedAt   int64  `json:"created_at"`
-	Status      string `json:"status"` // pending | exchanging | ready | failed
-	Message     string `json:"message"`
-	AccountID   int64  `json:"account_id"`
-	Email       string `json:"email"`
+	State        string `json:"state"`
+	RedirectURI  string `json:"redirect_uri"`
+	Manual       bool   `json:"manual"`
+	Group        string `json:"group"`
+	CreatedAt    int64  `json:"created_at"`
+	Status       string `json:"status"` // pending | exchanging | ready | failed
+	Message      string `json:"message"`
+	AccountID    int64  `json:"account_id"`
+	Email        string `json:"email"`
 	AuthorizeURL string `json:"authorize_url"`
 }
 
@@ -236,7 +236,13 @@ func (m *OAuthManager) completeFlow(flow *OAuthFlow, code string) error {
 		log.Printf("[oauth] exchange failed: %v", err)
 		return fmt.Errorf("token 兑换失败: %w", err)
 	}
+	return m.ingestTokens(flow, data)
+}
 
+// ingestTokens 用已换取的 token 数据完成 API Key 提取与账号入库
+// （授权码兑换与 cli/poll 轮询两条登录路径共用；data 形如
+// {token(Coding Plan JWT), zai:{access_token, refresh_token}, user:{...}}）
+func (m *OAuthManager) ingestTokens(flow *OAuthFlow, data map[string]interface{}) error {
 	jwt := jsonStr(data, "token")
 	if jwt == "" {
 		m.finishFlow(flow, "", "返回数据中不含 Coding Plan JWT")

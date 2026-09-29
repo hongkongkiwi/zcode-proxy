@@ -113,6 +113,9 @@ func main() {
 	mux.HandleFunc("/v1/responses", zapi.HandleResponses)
 	mux.HandleFunc("/v1/models", zapi.HandleModels)
 
+	// 闲时免费通道（off-peak ticket queue；设置 async_enabled 开启）
+	mux.HandleFunc("/async/v1/messages", zapi.HandleAsyncMessages)
+
 	// OAuth 环回回调（浏览器授权后跳转，无需认证）
 	mux.HandleFunc("/oauth/callback", oauth.HandleCallback)
 
