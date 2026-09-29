@@ -172,7 +172,9 @@ func (z *ZCodeAPI) resetForAccountLocked(a *Account) *ClaimResult {
 		if bizMsg != "" {
 			record.Message = bizMsg
 		}
-		z.db.InsertClaimRecord(record)
+		if err := z.db.InsertClaimRecord(record); err != nil {
+			log.Printf("[reset] insert claim record: %v", err)
+		}
 		return &ClaimResult{Code: -1, Message: record.Message}
 	}
 	resetType := ""
@@ -185,13 +187,17 @@ func (z *ZCodeAPI) resetForAccountLocked(a *Account) *ClaimResult {
 	if resetType == "" {
 		record.Success = true
 		record.Message = "无可用重置机会（five_hour/week 均已用完）"
-		z.db.InsertClaimRecord(record)
+		if err := z.db.InsertClaimRecord(record); err != nil {
+			log.Printf("[reset] insert claim record: %v", err)
+		}
 		return &ClaimResult{OK: true, Message: record.Message}
 	}
 	used, _, msg, err := z.UseReset(a, resetType)
 	if err != nil || !used {
 		record.Message = fmt.Sprintf("重置执行失败(%s): %v %s", resetType, err, msg)
-		z.db.InsertClaimRecord(record)
+		if err := z.db.InsertClaimRecord(record); err != nil {
+			log.Printf("[reset] insert claim record: %v", err)
+		}
 		z.db.SetAccountClaimResult(a.ID, "配额重置", record.Message)
 		return &ClaimResult{Code: -1, Message: record.Message}
 	}

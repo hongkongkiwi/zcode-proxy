@@ -24,6 +24,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -128,9 +129,8 @@ func (t offPeakTickets) do(ctx context.Context, a *Account, method, path string,
 	}
 	// 信封解包规则（对齐 zcode-api client.ts request）：code===0 且有 data 才解包；
 	// code!==0 报错；无 code 的含 data 对象保守不解包
-	if codeVal, has := v["code"]; has {
+	if _, has := v["code"]; has {
 		n := jsonInt(v, "code")
-		_ = codeVal
 		if n != 0 {
 			return nil, fmt.Errorf("业务码 %d: %s", n, firstNonEmpty(jsonStr(v, "msg"), jsonStr(v, "message"), truncate(string(raw), 120)))
 		}
@@ -239,7 +239,8 @@ type offPeakCreds struct {
 func (t offPeakTickets) settleSnapshot(cred offPeakCreds, ticketID string) {
 	id := NewClientIdentity(cred.z.appVersion, cred.deviceMid)
 	ctx := context.Background()
-	req, err := http.NewRequestWithContext(ctx, "POST", offPeakControlBase+"/ticket/"+ticketID+"/settle", nil)
+	settleURL := offPeakControlBase + "/ticket/" + url.QueryEscape(ticketID) + "/settle"
+	req, err := http.NewRequestWithContext(ctx, "POST", settleURL, nil)
 	if err != nil {
 		log.Printf("[async] settle %s… failed: %v", safePrefixLog(ticketID, 8), err)
 		return
@@ -251,7 +252,7 @@ func (t offPeakTickets) settleSnapshot(cred offPeakCreds, ticketID string) {
 	if cred.apiKey != "" {
 		req.Header.Set("x-coding-plan-api-key", cred.apiKey)
 	}
-	client := ClientForURL(cred.proxyURL, offPeakControlBase+"/ticket/"+ticketID+"/settle", offPeakControlTo)
+	client := ClientForURL(cred.proxyURL, settleURL, offPeakControlTo)
 	resp, err := client.Do(req)
 	if err != nil {
 		log.Printf("[async] settle %s… failed: %v", safePrefixLog(ticketID, 8), err)
@@ -260,6 +261,11 @@ func (t offPeakTickets) settleSnapshot(cred offPeakCreds, ticketID string) {
 	defer resp.Body.Close()
 	io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))
 	if resp.StatusCode >= 400 {
+		if resp.StatusCode >= 500 {
+			// 5xx 是瞬时失败：票大概率仍有效但被本端放弃，会占用账号免费取票
+			// 配额直到上游过期。至少要留痕，否则泄漏不可见。
+			log.Printf("[async] settle %s… got HTTP %d (transient; ticket may linger until upstream expiry)", safePrefixLog(ticketID, 8), resp.StatusCode)
+		}
 		return // 4xx 视为服务端已清理
 	}
 }
@@ -353,7 +359,25 @@ type offPeakRunOpts struct {
 // 见 /api/offpeak/availability），因此选号只要求启用 + JWT，不做 exhausted/cooling 门禁。
 func (z *ZCodeAPI) runOffPeak(w http.ResponseWriter, r *http.Request, opts offPeakRunOpts) {
 	tickets := offPeakTickets{z: z}
-	accounts, err := z.db.ListAccounts(opts.group) // x-zcode-group 与 /v1 同语义
+	// x-zcode-group 与 /v1 同语义：逗号分隔多组的账号按组名逐段匹配
+	// （ListAccounts 的 SQL 精确等值会漏掉 "eu,failover" 这类多组账号）
+	allAccounts, err := z.db.ListAccounts("")
+	if err != nil {
+		log.Printf("[async] list accounts: %v", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]interface{}{
+			"error": map[string]string{"message": "账号查询失败", "type": "no_available_account"},
+		})
+		return
+	}
+	accounts := allAccounts
+	if opts.group != "" {
+		accounts = nil
+		for _, a := range allAccounts {
+			if matchAccountGroup(a, opts.group) {
+				accounts = append(accounts, a)
+			}
+		}
+	}
 	if err != nil {
 		log.Printf("[async] list accounts: %v", err)
 		writeJSON(w, http.StatusInternalServerError, map[string]interface{}{
@@ -447,7 +471,7 @@ func (z *ZCodeAPI) offPeakBridge(w http.ResponseWriter, r *http.Request, a *Acco
 		keepalive = 3 * time.Second
 	}
 	maxRetries := opts.maxRetries
-	if maxRetries <= 0 {
+	if maxRetries < 0 {
 		maxRetries = offPeakMaxRetries
 	}
 	hardDeadline := opts.hardDeadline // 请求级预算，由 runOffPeak 统一设定
@@ -619,7 +643,14 @@ func (z *ZCodeAPI) offPeakBridge(w http.ResponseWriter, r *http.Request, a *Acco
 		}
 		out := z.offPeakForward(w, r, a, ticket, opts)
 		if out == outcomeTicketRetry {
-			// 429/3105：票仍有效，同票稍后重试（不关票，attempt 预算照常消耗）
+			// 429/3105：票仍有效，同票稍后重试（不关票）。
+			// 预算在此强制执行——attempt 随循环增长但 retake 不经过此路径，
+			// 不检查则 async_max_wait_sec=0 时同一张票可无限重试
+			if attempt >= maxRetries {
+				settleCur()
+				z.pool.MarkFailed(a, "闲时通道同票重试预算用尽（429/3105）")
+				return outcomeNextAccount
+			}
 			continue
 		}
 		if out == outcomeTicketReclaimed {
@@ -774,10 +805,11 @@ func (z *ZCodeAPI) offPeakForward(w http.ResponseWriter, r *http.Request, a *Acc
 		return outcomeNextAccount
 	case resp.StatusCode >= 400:
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-		if offPeakBodyCode(body) == 3102 {
-			// 官方契约：400/3102 = 票已被回收但任务有效 → 同 task_id 重新取票续跑，
+		if code := offPeakBodyCode(body); code == 3102 || code == 3001 {
+			// 官方契约：400/3102 = 票已被回收但任务有效 → 同 task_id 重新取票续跑
+			// （3001 为滚动发布期旧语义，官方适配器同样按票过期处理），
 			// 而不是把整段排队等待作废成硬 400
-			log.Printf("[async] 3102: ticket reclaimed upstream; retaking with same task_id")
+			log.Printf("[async] %d: ticket reclaimed upstream; retaking with same task_id", code)
 			return outcomeTicketReclaimed
 		}
 		z.pool.MarkFailed(a, fmt.Sprintf("闲时通道上游错误 HTTP %d", resp.StatusCode))
@@ -909,7 +941,13 @@ func aggregateAnthropicStream(r io.Reader) ([]byte, *StreamUsage, error) {
 			case "tool_use":
 				nb["id"] = blk["id"]
 				nb["name"] = blk["name"]
-				nb["input"] = map[string]interface{}{}
+				// start 帧可能自带完整 input（上游偶发行为，convert.go 同守卫）：
+				// 先落盘，无 delta 或 delta 解析失败时兜底
+				if input, ok := blk["input"].(map[string]interface{}); ok {
+					nb["input"] = input
+				} else {
+					nb["input"] = map[string]interface{}{}
+				}
 				agg.toolJSON[idx] = &strings.Builder{}
 			}
 			for idx >= len(agg.blocks) {

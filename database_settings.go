@@ -48,6 +48,20 @@ func (db *DB) SetSetting(key, value string) error {
 	return err
 }
 
+// HasSetting 判断设置项是否存在（读原始值，不解密——用于区分
+// "未设置"与"存在但当前钥匙解不开"）
+func (db *DB) HasSetting(key string) (bool, error) {
+	var v string
+	err := db.conn.QueryRow(`SELECT value FROM settings WHERE key = ?`, key).Scan(&v)
+	if err == sql.ErrNoRows {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
 // AllSettings 返回全部设置
 func (db *DB) AllSettings() (map[string]string, error) {
 	rows, err := db.conn.Query(`SELECT key, value FROM settings`)

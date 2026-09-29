@@ -76,7 +76,15 @@ func generateRandomPassword(n int) (string, error) {
 func NewAuthManager(db *DB, password string) *AuthManager {
 	fallbackPwd := password
 	if fallbackPwd == "" && db != nil {
-		if stored, _ := db.GetPasswordHash(); stored == "" {
+		hashPresent, perr := db.HasSetting("password_hash")
+		stored, _ := db.GetPasswordHash()
+		if perr == nil && hashPresent && stored == "" {
+			// 哈希行存在但当前钥匙解不开（错误 env / 换钥匙后启动）：
+			// 覆盖会把原口令哈希永久销毁——跳过引导，保持 env 兜底并告警
+			log.Printf("[auth] WARNING: password hash exists but cannot be decrypted with the active vault key; " +
+				"password bootstrap skipped — restore the key or set ZCODE_PROXY_VAULT_SECRET. " +
+				"ZCODE_WEB_PASS (if set) still works")
+		} else if stored == "" {
 			// 全新数据库：随机生成初始管理口令（is_default_password=1，UI 会提示修改）
 			if pw, err := generateRandomPassword(20); err == nil {
 				fallbackPwd = pw

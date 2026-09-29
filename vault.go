@@ -166,12 +166,34 @@ func ResolveVaultSeed(db *DB, dbPath string) {
 				setVaultSeedOverride(seed)
 				return
 			}
-			// keyfile 只能解开部分密文。派生种子的可解性决定分支：
-			//   全部可解          → 崩溃轮换的孤儿 keyfile：删除后走重新轮换；
-			//   部分可解          → 混合钥匙库（丢 keyfile 期间降级写入）：
-			//                       把派生种子可解的行并入 keyfile 后采用 keyfile；
-			//   全部不可解        → 真钥匙不匹配（曾用 env / 异机库）：
-			//                       绝不采用解不开数据的钥匙，留在派生种子并告警。
+			// 按 keyfile 自身的可解比例分派（不以派生种子扫描结果为主判据——
+			// 否则"keyfile 行 + 卡死行"混存时会因派生种子全解不开而误判为
+			// 真钥匙不匹配，降级态自我维持、永不收敛）：
+			//   broken == 0        → 常规重启，直接采用（上方分支）；
+			//   0 < broken < total → keyfile 能解开部分数据，是（部分）正确的主钥匙：
+			//                        并入派生种子可解的行后采用（对卡死行是 no-op），
+			//                        混合钥匙库与"keyfile+卡死行"两种状态在此收敛；
+			//   broken == total    → keyfile 一条都解不开：
+			//                        派生种子全可解 → 崩溃轮换的孤儿 keyfile，删除重轮换；
+			//                        派生种子部分/全部不可解 → 真钥匙不匹配
+			//                        （曾用 env / 异机库），留在派生种子并告警。
+			if broken < total {
+				moved, stuck, cerr := db.consolidateMixedVaultRows(seed, legacy)
+				if cerr != nil {
+					log.Printf("[vault] WARNING: mixed-key consolidation failed (%v); staying on derived key", cerr)
+					return
+				}
+				log.Printf("[vault] consolidated %d mixed-key credential values under vault.key (%d left unreadable)", moved, stuck)
+				// keyfile 是唯一能解开部分数据的钥匙，采用它；仍解不开的值
+				// （env 期写入/损坏）只能等原钥匙恢复
+				setVaultSeedOverride(seed)
+				if t2, b2, e2 := db.scanVaultCiphertext(seed); e2 == nil && b2 > 0 {
+					log.Printf("[vault] WARNING: %d of %d values still need their original key (set ZCODE_PROXY_VAULT_SECRET) — "+
+						"those accounts stay credential-less until restored", b2, t2)
+				}
+				return
+			}
+			// broken == total：keyfile 解不开任何数据
 			lTotal, lBroken, lErr := db.scanVaultCiphertext(legacy)
 			if lErr != nil {
 				log.Printf("[vault] WARNING: derived-key scan failed (%v); staying on derived key", lErr)
@@ -184,26 +206,11 @@ func ResolveVaultSeed(db *DB, dbPath string) {
 				}
 				syncDir(filepath.Dir(keyFile))
 				log.Printf("[vault] removed orphan key file from an interrupted rotation; re-running rotation")
-			} else if lTotal > 0 && lBroken < lTotal {
-				moved, stuck, cerr := db.consolidateMixedVaultRows(seed, legacy)
-				if cerr != nil {
-					log.Printf("[vault] WARNING: mixed-key consolidation failed (%v); staying on derived key", cerr)
-					return
-				}
-				log.Printf("[vault] consolidated %d mixed-key credential values under vault.key (%d left unreadable)", moved, stuck)
-				// 重新盘点：并入完成后 keyfile 覆盖全部可读行；仍解不开的（env 期
-				// 写入）只能等钥匙恢复，但 keyfile 是更强的主钥匙，采用它
-				setVaultSeedOverride(seed)
-				if t2, b2, e2 := db.scanVaultCiphertext(seed); e2 == nil && b2 > 0 {
-					log.Printf("[vault] WARNING: %d of %d values still need their original key (set ZCODE_PROXY_VAULT_SECRET) — "+
-						"those accounts stay credential-less until restored", b2, t2)
-				}
-				return
 			} else {
-				log.Printf("[vault] WARNING: %d of %d encrypted credential values cannot be decrypted with vault.key "+
-					"(derived key decrypts %d of %d). If ZCODE_PROXY_VAULT_SECRET was previously set, run with it again; "+
-					"staying on the derived key for now — new writes will use it, restore the matching key to recover all rows.",
-					broken, total, lTotal-lBroken, lTotal)
+				log.Printf("[vault] WARNING: vault.key cannot decrypt any of %d encrypted credential values, and the derived key "+
+					"recovers %d of %d. If ZCODE_PROXY_VAULT_SECRET was previously set, run with it again; "+
+					"staying on the derived key — credential WRITES ARE REFUSED in this state until the matching key is restored.",
+					total, lTotal-lBroken, lTotal)
 				return
 			}
 		} else if _, statErr := os.Stat(keyFile); statErr == nil {
@@ -231,10 +238,10 @@ func ResolveVaultSeed(db *DB, dbPath string) {
 				return
 			}
 		}
-		// 生成/落盘失败：新写入将退回可从平台/用户名推算的派生密钥（弱保护），
+		// 生成/落盘失败：进入派生种子降级态——凭证加密写入将被拒绝，
 		// 恢复数据目录权限后重启即可重新生成
-		log.Printf("[vault] WARNING: key file unavailable (%v); falling back to derived key — "+
-			"credentials written now are only weakly protected, fix data-dir permissions and restart", errOr(err))
+		log.Printf("[vault] WARNING: key file unavailable (%v); entering degraded derived-key state — "+
+			"credential writes are refused until data-dir permissions are fixed and the proxy restarted", errOr(err))
 		return
 	}
 	if broken > 0 {
@@ -441,6 +448,17 @@ func (db *DB) ProbeVaultHealth() {
 	if broken > 0 {
 		log.Printf("[vault] WARNING: %d credential values cannot be decrypted with the active key "+
 			"(set ZCODE_PROXY_VAULT_SECRET or restore data/vault.key); affected accounts will fail auth until fixed", broken)
+	}
+	// 设置表机密项（网关 sk- 密钥、口令哈希）不在 scanVaultCiphertext 覆盖内，单独体检
+	for _, key := range vaultSecretSettings {
+		var val string
+		if err := db.conn.QueryRow(`SELECT value FROM settings WHERE key = ?`, key).Scan(&val); err != nil || val == "" || !strings.HasPrefix(val, vaultPrefix) {
+			continue
+		}
+		if _, err := DecryptCredential(encPrefix+strings.TrimPrefix(val, vaultPrefix), currentVaultSeed()); err != nil {
+			log.Printf("[vault] WARNING: setting %s cannot be decrypted with the active key "+
+				"(wrong ZCODE_PROXY_VAULT_SECRET or mismatched vault.key); gateway auth and admin login may fail", key)
+		}
 	}
 }
 
