@@ -35,12 +35,22 @@ var vaultCredentialColumns = []string{
 var (
 	vaultSeedMu       sync.RWMutex
 	vaultSeedOverride string
+	vaultSeedDerived  = true // 启动解析后仍为 true = 只有可推算的派生种子可用（降级态）
 )
 
 func setVaultSeedOverride(s string) {
 	vaultSeedMu.Lock()
 	vaultSeedOverride = s
+	vaultSeedDerived = s == "" // 清空覆盖 = 回到派生种子降级态
 	vaultSeedMu.Unlock()
+}
+
+// vaultSeedIsDerived 当前种子是否为可从平台/用户名推算的派生种子。
+// 派生种子仅允许解密与迁移读取，绝不用于加密写入（见 vaultEncrypt）。
+func vaultSeedIsDerived() bool {
+	vaultSeedMu.RLock()
+	defer vaultSeedMu.RUnlock()
+	return vaultSeedDerived
 }
 
 func currentVaultSeed() string {
@@ -85,19 +95,44 @@ func loadVaultKeyFile(path string) (string, bool) {
 	return s, true
 }
 
-// writeVaultKeyFile 新建密钥文件（0600）。仅应在确认文件不存在时调用，
+// writeVaultKeyFile 新建密钥文件（0600，fsync 落盘）。仅应在确认文件不存在时调用，
 // 绝不覆盖已有密钥——覆盖等于销毁存量密文唯一的钥匙。
+// fsync 是必需的：重加密提交依赖 keyfile 先于 WAL 落盘，断电窗口内丢 keyfile
+// 等于销毁全部凭证的钥匙。
 // 注：Windows 上 Go 的 Chmod 只映射只读位，0600 限制在 win32 不生效（ACL 限制需另做）。
 func writeVaultKeyFile(path, seed string) error {
 	if _, err := os.Stat(path); err == nil {
 		return fmt.Errorf("vault key file %s 已存在，拒绝覆盖", path)
 	}
-	if err := os.WriteFile(path, []byte(seed+"\n"), 0600); err != nil {
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+	if err != nil {
+		return err
+	}
+	if _, err := f.Write([]byte(seed + "\n")); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
 		return err
 	}
 	// umask 可能放宽权限，显式收紧
 	os.Chmod(path, 0600)
+	syncDir(filepath.Dir(path)) // 新文件的目录项也要落盘，否则断电可丢文件名
 	return nil
+}
+
+// syncDir 尽力 fsync 目录项（部分平台/文件系统不支持，失败可忽略）
+func syncDir(dir string) {
+	d, err := os.Open(dir)
+	if err != nil {
+		return
+	}
+	d.Sync()
+	d.Close()
 }
 
 // ResolveVaultSeed 启动时决定凭证加密种子，优先级：
@@ -117,19 +152,71 @@ func ResolveVaultSeed(db *DB, dbPath string) {
 	keyFile := vaultKeyFile(dbPath)
 	legacy := legacyVaultSeed()
 
-	// 1. 已有 keyfile：直接采用（这是重启后的常规路径）
+	// 1. 已有 keyfile：先按其种子全量验证再采用
 	if keyFile != "" {
 		if seed, ok := loadVaultKeyFile(keyFile); ok {
-			setVaultSeedOverride(seed)
-			return
-		}
-		if _, statErr := os.Stat(keyFile); statErr == nil {
+			total, broken, scanErr := db.scanVaultCiphertext(seed)
+			if scanErr != nil {
+				// 盘点失败（I/O）不得当作"无密文/全可解"处理：fail closed，留在派生种子
+				log.Printf("[vault] WARNING: ciphertext scan failed (%v); staying on derived key", scanErr)
+				return
+			}
+			if broken == 0 {
+				// keyfile 与全部密文匹配：常规重启路径，直接采用
+				setVaultSeedOverride(seed)
+				return
+			}
+			// keyfile 只能解开部分密文。派生种子的可解性决定分支：
+			//   全部可解          → 崩溃轮换的孤儿 keyfile：删除后走重新轮换；
+			//   部分可解          → 混合钥匙库（丢 keyfile 期间降级写入）：
+			//                       把派生种子可解的行并入 keyfile 后采用 keyfile；
+			//   全部不可解        → 真钥匙不匹配（曾用 env / 异机库）：
+			//                       绝不采用解不开数据的钥匙，留在派生种子并告警。
+			lTotal, lBroken, lErr := db.scanVaultCiphertext(legacy)
+			if lErr != nil {
+				log.Printf("[vault] WARNING: derived-key scan failed (%v); staying on derived key", lErr)
+				return
+			}
+			if lTotal > 0 && lBroken == 0 {
+				if rmErr := os.Remove(keyFile); rmErr != nil {
+					log.Printf("[vault] WARNING: failed to remove orphan key file %s (%v); rotation is blocked until it is removed manually", keyFile, rmErr)
+					return
+				}
+				syncDir(filepath.Dir(keyFile))
+				log.Printf("[vault] removed orphan key file from an interrupted rotation; re-running rotation")
+			} else if lTotal > 0 && lBroken < lTotal {
+				moved, stuck, cerr := db.consolidateMixedVaultRows(seed, legacy)
+				if cerr != nil {
+					log.Printf("[vault] WARNING: mixed-key consolidation failed (%v); staying on derived key", cerr)
+					return
+				}
+				log.Printf("[vault] consolidated %d mixed-key credential values under vault.key (%d left unreadable)", moved, stuck)
+				// 重新盘点：并入完成后 keyfile 覆盖全部可读行；仍解不开的（env 期
+				// 写入）只能等钥匙恢复，但 keyfile 是更强的主钥匙，采用它
+				setVaultSeedOverride(seed)
+				if t2, b2, e2 := db.scanVaultCiphertext(seed); e2 == nil && b2 > 0 {
+					log.Printf("[vault] WARNING: %d of %d values still need their original key (set ZCODE_PROXY_VAULT_SECRET) — "+
+						"those accounts stay credential-less until restored", b2, t2)
+				}
+				return
+			} else {
+				log.Printf("[vault] WARNING: %d of %d encrypted credential values cannot be decrypted with vault.key "+
+					"(derived key decrypts %d of %d). If ZCODE_PROXY_VAULT_SECRET was previously set, run with it again; "+
+					"staying on the derived key for now — new writes will use it, restore the matching key to recover all rows.",
+					broken, total, lTotal-lBroken, lTotal)
+				return
+			}
+		} else if _, statErr := os.Stat(keyFile); statErr == nil {
 			log.Printf("[vault] WARNING: key file %s 存在但格式非法，忽略（如需重置请手动删除）", keyFile)
 		}
 	}
 
 	// 2. 全量盘点库中密文在派生种子下的可解性
-	total, broken := db.scanVaultCiphertext(legacy)
+	total, broken, scanErr := db.scanVaultCiphertext(legacy)
+	if scanErr != nil {
+		log.Printf("[vault] WARNING: ciphertext scan failed (%v); staying on derived key", scanErr)
+		return
+	}
 	if total == 0 {
 		// 无存量密文：生成随机 keyfile 并启用
 		if keyFile == "" {
@@ -144,7 +231,10 @@ func ResolveVaultSeed(db *DB, dbPath string) {
 				return
 			}
 		}
-		log.Printf("[vault] key file unavailable (%v); falling back to derived key", errOr(err))
+		// 生成/落盘失败：新写入将退回可从平台/用户名推算的派生密钥（弱保护），
+		// 恢复数据目录权限后重启即可重新生成
+		log.Printf("[vault] WARNING: key file unavailable (%v); falling back to derived key — "+
+			"credentials written now are only weakly protected, fix data-dir permissions and restart", errOr(err))
 		return
 	}
 	if broken > 0 {
@@ -171,7 +261,11 @@ func ResolveVaultSeed(db *DB, dbPath string) {
 	if _, err := db.reencryptVaultColumns(legacy, newSeed); err != nil {
 		// 回滚：恢复派生种子并删掉刚建的 keyfile，否则下次启动会采用
 		// 一把和库中数据不匹配的钥匙
-		os.Remove(keyFile)
+		if rmErr := os.Remove(keyFile); rmErr != nil {
+			log.Printf("[vault] WARNING: rotation failed (%v) AND removing %s failed (%v); delete it manually or next start will adopt a mismatched key", err, keyFile, rmErr)
+			return
+		}
+		syncDir(filepath.Dir(keyFile))
 		log.Printf("[vault] key rotation failed (%v); rolled back to derived key and removed %s", err, keyFile)
 		return
 	}
@@ -186,17 +280,25 @@ func errOr(err error) string {
 	return err.Error()
 }
 
-// scanVaultCiphertext 全量扫描库中 vault1 密文，返回 (总数, 在给定种子下解密失败的条数)。
+// scanVaultCiphertext 全量扫描库中 vault1 密文，返回 (总数, 在给定种子下解密失败的条数, 错误)。
 // 轮换决策必须全量：抽样会漏掉个别损坏/异源行，导致重加密中途失败。
-func (db *DB) scanVaultCiphertext(seed string) (total, broken int) {
+// 查询/迭代失败必须上抛：调用方把"扫不到"当"没有"会基于错误前提换钥匙。
+func (db *DB) scanVaultCiphertext(seed string) (total, broken int, err error) {
 	for _, col := range vaultCredentialColumns {
 		rows, err := db.conn.Query(`SELECT ` + col + ` FROM accounts WHERE ` + col + ` LIKE '` + vaultPrefix + `%'`)
 		if err != nil {
-			continue
+			return total, broken, fmt.Errorf("scan %s: %w", col, err)
 		}
 		for rows.Next() {
 			var val string
-			if rows.Scan(&val) != nil || !strings.HasPrefix(val, vaultPrefix) {
+			if rows.Scan(&val) != nil {
+				// 扫不动（NULL/异型值）按 broken 计：否则轮换会在 reencrypt 阶段
+				// 撞上同一行才发现问题
+				total++
+				broken++
+				continue
+			}
+			if !strings.HasPrefix(val, vaultPrefix) {
 				continue
 			}
 			total++
@@ -204,9 +306,74 @@ func (db *DB) scanVaultCiphertext(seed string) (total, broken int) {
 				broken++
 			}
 		}
+		if rErr := rows.Err(); rErr != nil {
+			rows.Close()
+			return total, broken, fmt.Errorf("scan %s rows: %w", col, rErr)
+		}
 		rows.Close()
 	}
-	return total, broken
+	return total, broken, nil
+}
+
+// consolidateMixedVaultRows 逐行双种子解密，把 keySeed 解不开而 legacySeed 能解开的
+// 凭证值统一重加密到 keySeed（单事务）。返回 (迁移值数, 两种种子都解不开的值数)——
+// 计数按"值"而非"行"（同一行的多列可能分别落在两把钥匙下）。
+// 与 reencryptVaultColumns 的全量重加密不同：只动需要动的行，解不开的行保持原样。
+func (db *DB) consolidateMixedVaultRows(keySeed, legacySeed string) (int, int, error) {
+	tx, err := db.conn.Begin()
+	if err != nil {
+		return 0, 0, err
+	}
+	defer tx.Rollback()
+	moved, stuck := 0, 0
+	for _, col := range vaultCredentialColumns {
+		rows, err := tx.Query(`SELECT id, ` + col + ` FROM accounts WHERE ` + col + ` LIKE '` + vaultPrefix + `%'`)
+		if err != nil {
+			return moved, stuck, fmt.Errorf("consolidate query %s: %w", col, err)
+		}
+		type pending struct {
+			id  int64
+			enc string
+		}
+		var updates []pending
+		for rows.Next() {
+			var id int64
+			var val string
+			if err := rows.Scan(&id, &val); err != nil {
+				rows.Close()
+				return moved, stuck, err
+			}
+			if !strings.HasPrefix(val, vaultPrefix) {
+				continue
+			}
+			body := encPrefix + strings.TrimPrefix(val, vaultPrefix)
+			if _, kerr := DecryptCredential(body, keySeed); kerr == nil {
+				continue // 已在 keyfile 种子下
+			}
+			plain, lerr := DecryptCredential(body, legacySeed)
+			if lerr != nil {
+				stuck++ // 两种种子都解不开（env 期写入等）：保持原样等钥匙恢复
+				continue
+			}
+			enc, err := EncryptCredential(plain, keySeed)
+			if err != nil {
+				rows.Close()
+				return moved, stuck, fmt.Errorf("consolidate encrypt %s id=%d: %w", col, id, err)
+			}
+			updates = append(updates, pending{id: id, enc: vaultPrefix + strings.TrimPrefix(enc, encPrefix)})
+		}
+		rows.Close()
+		if rErr := rows.Err(); rErr != nil {
+			return moved, stuck, rErr
+		}
+		for _, up := range updates {
+			if _, err := tx.Exec(`UPDATE accounts SET `+col+` = ? WHERE id = ?`, up.enc, up.id); err != nil {
+				return moved, stuck, fmt.Errorf("consolidate update %s id=%d: %w", col, up.id, err)
+			}
+		}
+		moved += len(updates)
+	}
+	return moved, stuck, tx.Commit()
 }
 
 // reencryptVaultColumns 用 oldSeed 解密、newSeed 重加密所有 vault1 凭证列。
@@ -266,7 +433,11 @@ func (db *DB) reencryptVaultColumns(oldSeed, newSeed string) (int, error) {
 
 // ProbeVaultHealth 启动收尾的健康检查：统计当前种子解不开的密文数量并大声告警
 func (db *DB) ProbeVaultHealth() {
-	_, broken := db.scanVaultCiphertext(currentVaultSeed())
+	_, broken, err := db.scanVaultCiphertext(currentVaultSeed())
+	if err != nil {
+		log.Printf("[vault] WARNING: health probe failed: %v", err)
+		return
+	}
 	if broken > 0 {
 		log.Printf("[vault] WARNING: %d credential values cannot be decrypted with the active key "+
 			"(set ZCODE_PROXY_VAULT_SECRET or restore data/vault.key); affected accounts will fail auth until fixed", broken)
@@ -295,10 +466,24 @@ func legacyVaultSeed() string {
 }
 
 // vaultEncrypt 加密单值；失败必须由调用方中止写入——静默落明文会让
-// "加密存储"在加密层故障时变成明文存储且无人察觉
+// "加密存储"在加密层故障时变成明文存储且无人察觉。
+// 派生种子降级态下拒绝加密新明文：派生种子可从平台/用户名推算，
+// 用它加密等于明文等价保护。已是本种子可解密文的原值透传（幂等再写不产生新弱点）。
 func vaultEncrypt(plain string) (string, error) {
-	if plain == "" || strings.HasPrefix(plain, vaultPrefix) {
-		return plain, nil
+	if plain == "" {
+		return "", nil
+	}
+	if strings.HasPrefix(plain, vaultPrefix) {
+		// 已是密文形态：仅当确实能解开才透传（幂等再写）；解不开的
+		// "vault1:" 串是脏数据，写入库只会永久占位 broken 并在读取时变空
+		if _, err := DecryptCredential(encPrefix+strings.TrimPrefix(plain, vaultPrefix), VaultSecret()); err == nil {
+			return plain, nil
+		}
+		return "", fmt.Errorf("值带 vault1: 前缀但不是可解密文，拒绝写入")
+	}
+	if vaultSeedIsDerived() {
+		return "", fmt.Errorf("vault 处于降级状态（仅剩可推算的派生密钥）：拒绝加密写入新凭证 — " +
+			"恢复 data/vault.key 或设置 ZCODE_PROXY_VAULT_SECRET 后重启")
 	}
 	enc, err := EncryptCredential(plain, VaultSecret())
 	if err != nil {
@@ -321,8 +506,14 @@ func vaultDecrypt(value string) string {
 }
 
 // MigrateVault 把存量明文凭证列加密（幂等：已加密值跳过）。启动时调用一次。
+// 派生种子降级态下跳过：用可推算密钥"升级"明文只是伪装的保护，等待真钥匙恢复。
 func (db *DB) MigrateVault() error {
+	if vaultSeedIsDerived() {
+		log.Printf("[vault] 派生密钥降级态：跳过明文迁移（避免用可推算密钥加密存量明文）；恢复钥匙后重启将自动迁移")
+		return nil
+	}
 	secret := VaultSecret()
+	hadUpdates := false
 	for _, col := range vaultCredentialColumns {
 		rows, err := db.conn.Query(`SELECT id, ` + col + ` FROM accounts WHERE ` + col + ` != ''`)
 		if err != nil {
@@ -361,7 +552,34 @@ func (db *DB) MigrateVault() error {
 		}
 		if len(updates) > 0 {
 			log.Printf("[vault] encrypted %d plaintext values in column %s", len(updates), col)
+			hadUpdates = true
 		}
+	}
+	// 设置表机密项（网关 sk- 密钥、bcrypt 口令哈希）一并入库加密
+	for _, key := range vaultSecretSettings {
+		var val string
+		err := db.conn.QueryRow(`SELECT value FROM settings WHERE key = ?`, key).Scan(&val)
+		if err != nil || val == "" || strings.HasPrefix(val, vaultPrefix) {
+			continue
+		}
+		enc, err := EncryptCredential(val, secret)
+		if err != nil {
+			return fmt.Errorf("vault encrypt setting %s: %w", key, err)
+		}
+		if _, err := db.conn.Exec(`UPDATE settings SET value = ? WHERE key = ?`, vaultPrefix+strings.TrimPrefix(enc, encPrefix), key); err != nil {
+			return fmt.Errorf("vault update setting %s: %w", key, err)
+		}
+		hadUpdates = true
+		log.Printf("[vault] encrypted setting %s", key)
+	}
+	if hadUpdates {
+		// 迁移前的明文会残留在 WAL 与空闲页：checkpoint 截断 WAL，VACUUM 重写并清空 freelist
+		db.conn.Exec(`PRAGMA wal_checkpoint(TRUNCATE)`)
+		db.conn.Exec(`VACUUM`)
+		log.Printf("[vault] post-migration WAL checkpoint + VACUUM done (plaintext residue scrubbed)")
 	}
 	return nil
 }
+
+// vaultSecretSettings 需要静态加密的设置键
+var vaultSecretSettings = []string{"api_key", "password_hash"}

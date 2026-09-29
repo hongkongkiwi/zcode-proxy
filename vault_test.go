@@ -1,6 +1,7 @@
 package main
 
 import (
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -115,6 +116,64 @@ func TestVaultMigratesPlaintextRows(t *testing.T) {
 	}
 }
 
+// TestVaultOrphanKeyfileFromCrashedRotation 回归：崩溃轮换留下的孤儿 keyfile
+// （密文仍是派生种子加密）必须被删除并重新轮换，绝不能被误采用
+func TestVaultOrphanKeyfileFromCrashedRotation(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "vault-test.db")
+	t.Cleanup(resetVaultSeed)
+	resetVaultSeed()
+
+	db, err := NewDB(path)
+	if err != nil {
+		t.Fatalf("NewDB: %v", err)
+	}
+	// 直接插入"派生种子加密"的行（模拟轮换在重加密前崩溃时的库状态）
+	enc, err := EncryptCredential("orphan-scenario-jwt", legacyVaultSeed())
+	if err != nil {
+		t.Fatalf("encrypt: %v", err)
+	}
+	if _, err := db.conn.Exec(`INSERT INTO accounts (user_id, email, provider, auth_type, zcode_jwt, status, enabled)
+		VALUES ('u-orphan', 'orphan@test', 'zai', 'jwt', ?, 'active', 1)`,
+		vaultPrefix+strings.TrimPrefix(enc, encPrefix)); err != nil {
+		t.Fatalf("raw insert: %v", err)
+	}
+	db.Close()
+
+	// 伪造孤儿 keyfile（一把随机无关钥匙，模拟崩溃时已写 keyfile、重加密未提交）
+	orphanSeed, err := randomVaultSeed()
+	if err != nil {
+		t.Fatalf("random seed: %v", err)
+	}
+	keyFile := filepath.Join(dir, "vault.key")
+	if err := os.WriteFile(keyFile, []byte(orphanSeed+"\n"), 0600); err != nil {
+		t.Fatalf("write orphan keyfile: %v", err)
+	}
+
+	resetVaultSeed()
+	db2, err := NewDB(path)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer func() { db2.Close(); resetVaultSeed() }()
+
+	// 孤儿 keyfile 必须已被删除并替换为新轮换的 keyfile
+	loaded, ok := loadVaultKeyFile(keyFile)
+	if !ok {
+		t.Fatalf("rotation did not write a new keyfile")
+	}
+	if loaded == orphanSeed {
+		t.Fatalf("orphan keyfile was adopted instead of removed")
+	}
+	accounts, err := db2.ListAccounts("")
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if len(accounts) != 1 || accounts[0].ZCodeJWT != "orphan-scenario-jwt" {
+		t.Fatalf("credential not decryptable after orphan-keyfile recovery: %+v", accounts)
+	}
+}
+
 // TestVaultKeyPersistsAcrossRestart 回归测试：vault.key 必须在重启后被读取采用。
 // （历史缺陷：ResolveVaultSeed 只写不读，第二次重启后全部凭证解密失败）
 func TestVaultKeyPersistsAcrossRestart(t *testing.T) {
@@ -145,5 +204,141 @@ func TestVaultKeyPersistsAcrossRestart(t *testing.T) {
 		if got.ZCodeJWT != "jwt-across-restart" {
 			t.Fatalf("round %d: credential not decryptable after restart (keyfile not adopted?): %q", round, got.ZCodeJWT)
 		}
+	}
+}
+
+// TestVaultMixedKeyConsolidation 回归：派生种子降级态下拒绝新明文写入（P2），
+// 但库中可能仍存在旧版本二进制在降级窗口写入的派生种子密文——恢复 keyfile 后
+// 必须把这类行并入 keyfile 并采用它，而不是永久停在"钥匙不匹配"告警上。
+func TestVaultMixedKeyConsolidation(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "vault-test.db")
+	t.Cleanup(resetVaultSeed)
+	resetVaultSeed()
+
+	db, err := NewDB(path)
+	if err != nil {
+		t.Fatalf("NewDB: %v", err)
+	}
+	if _, err := db.UpsertAccount(&Account{
+		UserID: "u-mix-a", Email: "a@test", Provider: "zai", AuthType: "jwt",
+		ZCodeJWT: "jwt-under-keyfile", Status: StatusActive, Enabled: true,
+	}); err != nil {
+		t.Fatalf("upsert A: %v", err)
+	}
+	keyFile := filepath.Join(dir, "vault.key")
+	keySeed, ok := loadVaultKeyFile(keyFile)
+	if !ok {
+		t.Fatalf("keyfile not generated on fresh DB")
+	}
+	db.Close()
+
+	// 模拟"keyfile 丢失"窗口：删钥匙 → 重开（回落派生种子并告警）→
+	// 新明文写入必须被拒绝（P2：派生密钥加密 = 明文等价保护）
+	if err := os.Remove(keyFile); err != nil {
+		t.Fatalf("remove keyfile: %v", err)
+	}
+	resetVaultSeed()
+	db2, err := NewDB(path)
+	if err != nil {
+		t.Fatalf("reopen without keyfile: %v", err)
+	}
+	if _, err := db2.UpsertAccount(&Account{
+		UserID: "u-mix-b", Email: "b@test", Provider: "zai", AuthType: "jwt",
+		ZCodeJWT: "jwt-under-derived", Status: StatusActive, Enabled: true,
+	}); err == nil {
+		t.Fatal("derived-seed upsert must refuse new credential writes")
+	}
+	// 旧版本二进制在降级窗口写入的派生种子行（直接构造，验证合并修复能力）
+	legacyEnc, err := EncryptCredential("jwt-under-derived", legacyVaultSeed())
+	if err != nil {
+		t.Fatalf("encrypt legacy-era row: %v", err)
+	}
+	if _, err := db2.conn.Exec(`INSERT INTO accounts (user_id, email, provider, auth_type, zcode_jwt, status, enabled)
+		VALUES ('u-mix-b', 'b@test', 'zai', 'jwt', ?, 'active', 1)`,
+		vaultPrefix+strings.TrimPrefix(legacyEnc, encPrefix)); err != nil {
+		t.Fatalf("insert legacy-era row: %v", err)
+	}
+	db2.Close()
+
+	// 恢复原 keyfile → 重开：应触发混合钥匙合并并采用 keyfile
+	if err := os.WriteFile(keyFile, []byte(keySeed+"\n"), 0600); err != nil {
+		t.Fatalf("restore keyfile: %v", err)
+	}
+	resetVaultSeed()
+	db3, err := NewDB(path)
+	if err != nil {
+		t.Fatalf("reopen with restored keyfile: %v", err)
+	}
+	defer func() { db3.Close(); resetVaultSeed() }()
+
+	accounts, err := db3.ListAccounts("")
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	got := map[string]string{}
+	for _, a := range accounts {
+		got[a.UserID] = a.ZCodeJWT
+	}
+	if got["u-mix-a"] != "jwt-under-keyfile" {
+		t.Fatalf("keyfile-era row not decryptable: %q", got["u-mix-a"])
+	}
+	if got["u-mix-b"] != "jwt-under-derived" {
+		t.Fatalf("derived-era row not consolidated into keyfile: %q", got["u-mix-b"])
+	}
+	// 新写入必须落在 keyfile 种子下（当前激活种子）
+	if _, broken, err := db3.scanVaultCiphertext(keySeed); err != nil || broken != 0 {
+		t.Fatalf("post-consolidation scan: broken=%d err=%v", broken, err)
+	}
+}
+
+func TestVaultDerivedSeedRefusesNewPlaintextWrites(t *testing.T) {
+	db, _ := newVaultTestDB(t)
+	resetVaultSeed() // 回到派生种子降级态（相当于真钥匙丢失后的进程状态）
+	if _, err := vaultEncrypt("plain-secret"); err == nil {
+		t.Fatal("derived-seed vaultEncrypt must refuse new plaintext")
+	}
+	// 降级态迁移必须跳过：不得用可推算密钥加密存量明文
+	if err := db.MigrateVault(); err != nil {
+		t.Fatalf("MigrateVault under derived seed: %v", err)
+	}
+	// 派生种子下的解密（迁移源语义）仍然可用
+	enc, err := EncryptCredential("legacy-value", legacyVaultSeed())
+	if err != nil {
+		t.Fatalf("encrypt legacy: %v", err)
+	}
+	if got := vaultDecrypt(vaultPrefix + strings.TrimPrefix(enc, encPrefix)); got != "legacy-value" {
+		t.Fatalf("legacy decrypt under derived seed = %q", got)
+	}
+}
+
+func TestVaultWrongSecretDegradesReadToEmpty(t *testing.T) {
+	db, _ := newVaultTestDB(t)
+	if err := db.SetAPIKey("sk-secret-value"); err != nil {
+		t.Fatalf("set api key: %v", err)
+	}
+	if got, err := db.GetAPIKey(); err != nil || got != "sk-secret-value" {
+		t.Fatalf("roundtrip = %q, %v", got, err)
+	}
+	setVaultSeedOverride("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff")
+	if got, _ := db.GetAPIKey(); got != "" {
+		t.Fatalf("wrong-secret read should degrade to empty, got %q", got)
+	}
+}
+
+func TestVaultSettingsSecretsEncryptedAtRest(t *testing.T) {
+	db, _ := newVaultTestDB(t)
+	if err := db.SetPasswordHash("$2a$10$testhashvalue0000000000000000000000000000000000000000"); err != nil {
+		t.Fatalf("set password hash: %v", err)
+	}
+	var raw string
+	if err := db.conn.QueryRow(`SELECT value FROM settings WHERE key = 'password_hash'`).Scan(&raw); err != nil {
+		t.Fatalf("raw read: %v", err)
+	}
+	if !strings.HasPrefix(raw, vaultPrefix) {
+		t.Fatalf("password_hash not vault-encrypted at rest: %q", raw)
+	}
+	if got, err := db.GetPasswordHash(); err != nil || got != "$2a$10$testhashvalue0000000000000000000000000000000000000000" {
+		t.Fatalf("password hash roundtrip = %q, %v", got, err)
 	}
 }

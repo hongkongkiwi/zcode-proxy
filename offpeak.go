@@ -19,6 +19,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -41,6 +42,22 @@ const (
 	offPeakMaxRetries    = 3
 	offPeakMaxWaitSec    = 1800
 )
+
+// 闲时通道专用 outcome（基础集 outcomeWritten/NextAccount/UpstreamError 在 relay.go）。
+// 数值与主集错开：二者只做等值比较，不进 switch。
+const (
+	outcomeTicketRetry     relayOutcome = 101 // 429/3105：票仍有效，同票稍后重试（未写响应）
+	outcomeTicketReclaimed relayOutcome = 102 // 400/3102：票被回收，同 task_id 重取（未写响应）
+)
+
+// offPeakBodyCode 解析上游 JSON 信封的业务码（非 JSON/缺失返回 0）
+func offPeakBodyCode(body []byte) int {
+	var v map[string]interface{}
+	if json.Unmarshal(body, &v) != nil {
+		return 0
+	}
+	return jsonInt(v, "code")
+}
 
 // ---- 设置 ----
 
@@ -205,8 +222,45 @@ func (t offPeakTickets) status(ctx context.Context, a *Account, ticketID string)
 // settle 关票；4xx 已按成功处理；失败仅记日志（关票是 best-effort）。
 // 用独立 context：断连后的补偿关票不能随请求取消。
 func (t offPeakTickets) settle(a *Account, ticketID string) {
-	if _, err := t.do(context.Background(), a, "POST", "/ticket/"+ticketID+"/settle", nil, true); err != nil {
+	jwt, apiKey, deviceMid := a.credentialSnapshot()
+	t.settleSnapshot(offPeakCreds{z: t.z, jwt: jwt, apiKey: apiKey, deviceMid: deviceMid}, ticketID)
+}
+
+// offPeakCreds 关票 goroutine 用的凭证快照（无锁读取，避免与 setCredentials 竞争）
+type offPeakCreds struct {
+	z         *ZCodeAPI
+	jwt       string
+	apiKey    string
+	deviceMid string
+	proxyURL  string
+}
+
+// settleSnapshot 同 settle，但使用凭证快照（在 spawn 前取好）
+func (t offPeakTickets) settleSnapshot(cred offPeakCreds, ticketID string) {
+	id := NewClientIdentity(cred.z.appVersion, cred.deviceMid)
+	ctx := context.Background()
+	req, err := http.NewRequestWithContext(ctx, "POST", offPeakControlBase+"/ticket/"+ticketID+"/settle", nil)
+	if err != nil {
 		log.Printf("[async] settle %s… failed: %v", safePrefixLog(ticketID, 8), err)
+		return
+	}
+	for k, v := range ZaiClientHeaders(id) {
+		req.Header.Set(k, v)
+	}
+	req.Header.Set("Authorization", "Bearer "+cred.jwt)
+	if cred.apiKey != "" {
+		req.Header.Set("x-coding-plan-api-key", cred.apiKey)
+	}
+	client := ClientForURL(cred.proxyURL, offPeakControlBase+"/ticket/"+ticketID+"/settle", offPeakControlTo)
+	resp, err := client.Do(req)
+	if err != nil {
+		log.Printf("[async] settle %s… failed: %v", safePrefixLog(ticketID, 8), err)
+		return
+	}
+	defer resp.Body.Close()
+	io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))
+	if resp.StatusCode >= 400 {
+		return // 4xx 视为服务端已清理
 	}
 }
 
@@ -299,7 +353,7 @@ type offPeakRunOpts struct {
 // 见 /api/offpeak/availability），因此选号只要求启用 + JWT，不做 exhausted/cooling 门禁。
 func (z *ZCodeAPI) runOffPeak(w http.ResponseWriter, r *http.Request, opts offPeakRunOpts) {
 	tickets := offPeakTickets{z: z}
-	accounts, err := z.db.ListAccounts("")
+	accounts, err := z.db.ListAccounts(opts.group) // x-zcode-group 与 /v1 同语义
 	if err != nil {
 		log.Printf("[async] list accounts: %v", err)
 		writeJSON(w, http.StatusInternalServerError, map[string]interface{}{
@@ -315,6 +369,11 @@ func (z *ZCodeAPI) runOffPeak(w http.ResponseWriter, r *http.Request, opts offPe
 	if opts.maxWaitSec > 0 {
 		opts.hardDeadline = time.Now().Add(time.Duration(opts.maxWaitSec) * time.Second)
 	}
+	// 轮转起点：固定 DB 顺序会让并发闲时请求全部压在第一个账号上
+	if n := len(accounts); n > 1 {
+		start := int(z.asyncRotation.Add(1)) % n
+		accounts = append(accounts[start:], accounts[:start]...)
+	}
 	for _, a := range accounts {
 		if attempts >= maxAccountAttempts {
 			break
@@ -324,6 +383,11 @@ func (z *ZCodeAPI) runOffPeak(w http.ResponseWriter, r *http.Request, opts offPe
 		}
 		tried[a.ID] = true
 		attempts++
+		// 换号间隙不沉默：取票/兑换最长 30-45s，先补一帧保活防中间层掐断
+		if opts.clientStream && streamHeaders {
+			fmt.Fprint(w, ": switching account\n\n")
+			flushWriter(w)
+		}
 		out := z.offPeakBridge(w, r, a, tickets, opts, &streamHeaders)
 		if out == outcomeWritten {
 			return
@@ -396,13 +460,18 @@ func (z *ZCodeAPI) offPeakBridge(w http.ResponseWriter, r *http.Request, a *Acco
 		*streamHeaders = true
 	}
 
+	// settle 在独立 goroutine 读凭证：快照后再 spawn，避免与
+	// tryRefreshAccount 的 setCredentials 并发读写同一 Account
+	jwt, apiKey, deviceMid := a.credentialSnapshot()
+	cred := offPeakCreds{z: z, jwt: jwt, apiKey: apiKey, deviceMid: deviceMid,
+		proxyURL: z.egress.ProxyURLForAccount(a)} // 关票与取票同出口，维持 IP 一致性
 	settled := map[string]bool{}
 	settleOnce := func(ticketID string) {
 		if ticketID == "" || settled[ticketID] {
 			return
 		}
 		settled[ticketID] = true
-		go tickets.settle(a, ticketID)
+		go tickets.settleSnapshot(cred, ticketID)
 	}
 	// settleCur 关闭"当前"票（闭包捕获变量，随 retake 更新）。
 	// 只在终态路径调用：失败 / 放弃 / 客户端断开 / 响应完成——绝不取票即关。
@@ -418,6 +487,11 @@ func (z *ZCodeAPI) offPeakBridge(w http.ResponseWriter, r *http.Request, a *Acco
 	fail := func(status int, msg string) relayOutcome {
 		settleCur()
 		a.bumpFail(truncate(msg, 180))
+		// bumpFail 只改内存副本；同步推进 DB 的 fail_count/last_error，
+		// 否则仪表盘看不到反复超时的账号
+		if err := z.db.BumpAccountFail(a.ID, truncate(msg, 180)); err != nil {
+			log.Printf("[async] bump fail persist %s: %v", a.DisplayNameOrEmail(), err)
+		}
 		log.Printf("[async] account %s bridge failed: %s", a.DisplayNameOrEmail(), msg)
 		if opts.clientStream {
 			writeSSEErrorEvent(w, msg)
@@ -429,7 +503,8 @@ func (z *ZCodeAPI) offPeakBridge(w http.ResponseWriter, r *http.Request, a *Acco
 		return outcomeWritten
 	}
 	// takeFailed 取票失败：先判客户端取消（不得因此冷却健康账号），
-	// 再按错误类型标记（401/403 失效、429 短冷却、其余失败/冷却），
+	// 401/403 先试 refresh_token 兑换（与主转发路径同一恢复优先策略），
+	// 其余按错误类型标记（429 短冷却、其余失败/冷却），
 	// 未写任何响应，交给 runOffPeak 换下一个账号——不得终止整个请求
 	takeFailed := func(err error) relayOutcome {
 		if ctx.Err() != nil {
@@ -440,6 +515,12 @@ func (z *ZCodeAPI) offPeakBridge(w http.ResponseWriter, r *http.Request, a *Acco
 		s := err.Error()
 		switch {
 		case strings.Contains(s, "HTTP 401"), strings.Contains(s, "HTTP 403"):
+			if ok, inflight := z.tryRefreshAccount(a); ok || inflight {
+				return outcomeNextAccount
+			}
+			if z.credentialsAlreadyRotated(a) {
+				return outcomeNextAccount
+			}
 			z.pool.MarkInvalid(a, msg)
 		case strings.Contains(s, "HTTP 429"):
 			z.pool.MarkCooling(a, msg, 30)
@@ -451,6 +532,10 @@ func (z *ZCodeAPI) offPeakBridge(w http.ResponseWriter, r *http.Request, a *Acco
 		log.Printf("[async] account %s take failed, trying next: %s", a.DisplayNameOrEmail(), msg)
 		return outcomeNextAccount
 	}
+	// 官方语义：同一任务的 retake 复用同一 task_id（offPeakTaskService：
+	// "票据过期…同 task_id 重取号（已确认允许多次）"）；每次换新 id 会额外
+	// 占用服务端每账号任务配额（取号超限以 3103 暴露）
+	taskID := uuid.NewString()
 	// retake 重新取票：返回 (nil, outcome) 表示本账号到此为止——
 	// outcome 为 outcomeNextAccount 时未写响应，由 runOffPeak 换号；
 	// outcome 为 outcomeWritten 时 fail() 已写终态错误（排队超时）。
@@ -466,21 +551,22 @@ func (z *ZCodeAPI) offPeakBridge(w http.ResponseWriter, r *http.Request, a *Acco
 			return nil, fail(http.StatusServiceUnavailable, why+"；闲时排队总时长已超限")
 		}
 		settleCur() // 旧票已被回收/过期，显式关掉
-		next, err := tickets.take(ctx, a, uuid.NewString())
+		next, err := tickets.take(ctx, a, taskID)
 		if err != nil {
 			return nil, takeFailed(fmt.Errorf("%s；重新取票失败: %w", why, err))
 		}
 		log.Printf("[async] account %s retake #%d: %s… (%s)", a.DisplayNameOrEmail(), attempt+1, safePrefixLog(next.ID, 8), next.State)
-		return next, outcomeWritten
+		return next, outcomeNextAccount // 成功持有新票；调用方只看 next != nil
 	}
 
 	// ticket/err 由下方取票赋值；必须用 = 以让 settleCur 闭包捕获同一变量
-	ticket, err = tickets.take(ctx, a, uuid.NewString())
+	ticket, err = tickets.take(ctx, a, taskID)
 	if err != nil {
 		return takeFailed(err)
 	}
 	log.Printf("[async] account %s took ticket %s… state=%s pos=%d", a.DisplayNameOrEmail(), safePrefixLog(ticket.ID, 8), ticket.State, ticket.Position)
 
+	pollFailures := 0
 	for attempt := 0; ; attempt++ {
 		// WAIT：票未就绪时轮询 + 保活
 		for !offPeakStateReady(ticket.State) && !offPeakStateTerminal(ticket.State) {
@@ -501,9 +587,15 @@ func (z *ZCodeAPI) offPeakBridge(w http.ResponseWriter, r *http.Request, a *Acco
 			}
 			st, err := tickets.status(ctx, a, ticket.ID)
 			if err != nil {
+				// 查票连续失败设上限：maxWaitSec=0（无时间预算）时防无限占坑轮询
+				pollFailures++
 				log.Printf("[async] poll ticket %s…: %v", safePrefixLog(ticket.ID, 8), err)
+				if pollFailures >= 5 {
+					return fail(http.StatusBadGateway, "闲时查票连续失败: "+truncate(err.Error(), 160))
+				}
 				continue
 			}
+			pollFailures = 0
 			ticket = st
 		}
 
@@ -513,6 +605,7 @@ func (z *ZCodeAPI) offPeakBridge(w http.ResponseWriter, r *http.Request, a *Acco
 				return out
 			}
 			ticket = next
+			pollFailures = 0 // 新票重新计数
 			continue
 		}
 		if ticket.ActiveDeadline > 0 && time.Now().Unix() > ticket.ActiveDeadline {
@@ -521,9 +614,25 @@ func (z *ZCodeAPI) offPeakBridge(w http.ResponseWriter, r *http.Request, a *Acco
 				return out
 			}
 			ticket = next
+			pollFailures = 0
 			continue
 		}
 		out := z.offPeakForward(w, r, a, ticket, opts)
+		if out == outcomeTicketRetry {
+			// 429/3105：票仍有效，同票稍后重试（不关票，attempt 预算照常消耗）
+			continue
+		}
+		if out == outcomeTicketReclaimed {
+			// 400/3102：票被上游回收但任务有效——同 task_id 重取续跑
+			next, rout := retake(attempt, "票被上游回收（3102）")
+			if next == nil {
+				settleCur()
+				return rout
+			}
+			ticket = next
+			pollFailures = 0
+			continue
+		}
 		// 票已带入 READY/ACTIVE：所有出口都关票（幂等 best-effort）。
 		// 换号/断开路径不关票会泄漏票面，占用该账号的免费队列直到 active_deadline。
 		settleCur()
@@ -594,9 +703,13 @@ func (z *ZCodeAPI) offPeakForward(w http.ResponseWriter, r *http.Request, a *Acc
 
 	req, err := http.NewRequestWithContext(r.Context(), "POST", offPeakMessagesURL, bytes.NewReader(bodyBytes))
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]interface{}{
-			"error": map[string]string{"message": "上游请求构造失败", "type": "async_error"},
-		})
+		if opts.clientStream {
+			writeSSEErrorEvent(w, "上游请求构造失败")
+		} else {
+			writeJSON(w, http.StatusInternalServerError, map[string]interface{}{
+				"error": map[string]string{"message": "上游请求构造失败", "type": "async_error"},
+			})
+		}
 		return outcomeWritten
 	}
 	id := NewClientIdentity(z.appVersion, a.DeviceMid)
@@ -626,13 +739,47 @@ func (z *ZCodeAPI) offPeakForward(w http.ResponseWriter, r *http.Request, a *Acc
 
 	switch {
 	case resp.StatusCode == 401 || resp.StatusCode == 403:
+		// 与主转发/取票路径同一恢复优先策略：先试 refresh_token 兑换
+		if ok, inflight := z.tryRefreshAccount(a); ok || inflight {
+			return outcomeNextAccount
+		}
+		if z.credentialsAlreadyRotated(a) {
+			return outcomeNextAccount
+		}
 		z.pool.MarkInvalid(a, fmt.Sprintf("闲时通道鉴权失败 HTTP %d", resp.StatusCode))
 		return outcomeNextAccount
 	case resp.StatusCode == 429:
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		if offPeakBodyCode(body) == 3105 {
+			// 官方契约（offPeakMockGateway）：429/3105 + Retry-After = 票仍有效，
+			// 仅上游饱和 → 同票稍后重试，而不是废弃仍有效的票、冷却健康账号
+			wait := 15 * time.Second
+			if ra := strings.TrimSpace(resp.Header.Get("Retry-After")); ra != "" {
+				if sec, perr := strconv.Atoi(ra); perr == nil && sec > 0 && sec <= 45 {
+					wait = time.Duration(sec) * time.Second
+				}
+			}
+			log.Printf("[async] 429/3105 upstream saturation; same-ticket retry in %s", wait)
+			if !offPeakWait(r.Context(), wait, 15*time.Second, func() {
+				if opts.clientStream {
+					fmt.Fprint(w, ": keepalive\n\n")
+					flushWriter(w)
+				}
+			}, opts.clientStream) {
+				return outcomeUpstreamError
+			}
+			return outcomeTicketRetry
+		}
 		z.pool.MarkCooling(a, "闲时通道限流 429", 30)
 		return outcomeNextAccount
 	case resp.StatusCode >= 400:
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		if offPeakBodyCode(body) == 3102 {
+			// 官方契约：400/3102 = 票已被回收但任务有效 → 同 task_id 重新取票续跑，
+			// 而不是把整段排队等待作废成硬 400
+			log.Printf("[async] 3102: ticket reclaimed upstream; retaking with same task_id")
+			return outcomeTicketReclaimed
+		}
 		z.pool.MarkFailed(a, fmt.Sprintf("闲时通道上游错误 HTTP %d", resp.StatusCode))
 		z.recordUsage(a, r, opts.payload, resp.StatusCode, start, 0, nil, opts.clientStream)
 		msg := "闲时通道上游错误 HTTP " + strconv.Itoa(resp.StatusCode) + ": " + truncate(string(body), 300)
@@ -668,6 +815,7 @@ func (z *ZCodeAPI) offPeakForward(w http.ResponseWriter, r *http.Request, a *Acc
 		sniff := newUsageSniffReader(resp.Body)
 		flushWriter(w)
 		buf := make([]byte, 32<<10)
+		truncated := false
 		for {
 			n, rerr := sniff.Read(buf)
 			if n > 0 {
@@ -678,15 +826,33 @@ func (z *ZCodeAPI) offPeakForward(w http.ResponseWriter, r *http.Request, a *Acc
 				flushWriter(w)
 			}
 			if rerr != nil {
+				truncated = !errors.Is(rerr, io.EOF)
 				break
 			}
 		}
-		z.recordUsage(a, r, opts.payload, resp.StatusCode, start, 0, sniff.usage(), opts.clientStream)
+		recStatus := resp.StatusCode
+		// 中途断流或上游内联错误帧（嗅探到 ERR: 前缀）：补协议正确的 error 帧
+		// 并把记录状态修正为 502——不得把半截流伪装成干净的 200 成功
+		sniffed := sniff.usage()
+		inlineErr := sniffed != nil && strings.HasPrefix(sniffed.StopReason, "ERR:")
+		if truncated || inlineErr {
+			msg := "上游流中断"
+			if inlineErr {
+				msg = strings.TrimPrefix(sniffed.StopReason, "ERR:")
+			} else {
+				msg = "upstream stream interrupted"
+			}
+			writeSSEErrorEvent(w, msg)
+			recStatus = http.StatusBadGateway
+		}
+		z.recordUsage(a, r, opts.payload, recStatus, start, 0, sniffed, opts.clientStream)
 		return outcomeWritten
 	}
 	// 非流式客户端：上游强制流式返回，网关聚合成完整 Anthropic message
 	aggregated, usage, aerr := aggregateAnthropicStream(resp.Body)
 	if aerr != nil {
+		// 聚合失败也要落已提取的部分用量，不得整条丢失
+		z.recordUsage(a, r, opts.payload, http.StatusBadGateway, start, 0, usage, false)
 		msg := "闲时通道响应聚合失败: " + truncate(aerr.Error(), 200)
 		writeJSON(w, http.StatusBadGateway, map[string]interface{}{
 			"error": map[string]string{"message": msg, "type": "api_error"},
@@ -705,11 +871,12 @@ func (z *ZCodeAPI) offPeakForward(w http.ResponseWriter, r *http.Request, a *Acc
 
 // anthropicAgg 将上游 Anthropic SSE 流聚合为一条完整 message JSON
 type anthropicAgg struct {
-	id, model  string
-	blocks     []map[string]interface{}
-	stopReason string
-	in, out    int
-	toolJSON   map[int]*strings.Builder
+	id, model   string
+	blocks      []map[string]interface{}
+	stopReason  string
+	streamError string // 上游内联错误帧（独立于 stop_reason，不被后续 delta 掩盖）
+	in, out     int
+	toolJSON    map[int]*strings.Builder
 }
 
 func aggregateAnthropicStream(r io.Reader) ([]byte, *StreamUsage, error) {
@@ -752,17 +919,22 @@ func aggregateAnthropicStream(r io.Reader) ([]byte, *StreamUsage, error) {
 		case "content_block_delta":
 			idx := toInt(ev.Data["index"])
 			delta, _ := ev.Data["delta"].(map[string]interface{})
-			if delta == nil || idx >= len(agg.blocks) || agg.blocks[idx] == nil {
+			// idx < 0 或块类型与 delta 不匹配（上游违例帧）不得 panic
+			if delta == nil || idx < 0 || idx >= len(agg.blocks) || agg.blocks[idx] == nil {
 				return
 			}
 			switch delta["type"] {
 			case "text_delta":
 				if s, ok := delta["text"].(string); ok {
-					agg.blocks[idx]["text"] = agg.blocks[idx]["text"].(string) + s
+					if prev, ok2 := agg.blocks[idx]["text"].(string); ok2 {
+						agg.blocks[idx]["text"] = prev + s
+					}
 				}
 			case "thinking_delta":
 				if s, ok := delta["thinking"].(string); ok {
-					agg.blocks[idx]["thinking"] = agg.blocks[idx]["thinking"].(string) + s
+					if prev, ok2 := agg.blocks[idx]["thinking"].(string); ok2 {
+						agg.blocks[idx]["thinking"] = prev + s
+					}
 				}
 			case "input_json_delta":
 				if b, ok := agg.toolJSON[idx]; ok {
@@ -803,18 +975,22 @@ func aggregateAnthropicStream(r io.Reader) ([]byte, *StreamUsage, error) {
 					msg = m
 				}
 			}
-			agg.stopReason = "ERR:" + msg
+			agg.streamError = msg
 		}
 	}
 	buf := make([]byte, 32<<10)
 	for {
 		n, rerr := r.Read(buf)
 		if n > 0 {
-			p.feed(buf[:n], onEvent)
+			// 解析缓冲溢出（>16MB 无帧边界）必须按失败处理：
+			// 静默吞掉会把半截数据聚合成"成功空响应"
+			if ferr := p.feed(buf[:n], onEvent); ferr != nil {
+				return nil, partialUsage(agg), ferr
+			}
 		}
 		if rerr != nil {
-			if rerr.Error() != "EOF" {
-				return nil, nil, rerr
+			if !errors.Is(rerr, io.EOF) {
+				return nil, partialUsage(agg), rerr
 			}
 			break
 		}
@@ -826,8 +1002,8 @@ func aggregateAnthropicStream(r io.Reader) ([]byte, *StreamUsage, error) {
 			content = append(content, b)
 		}
 	}
-	if strings.HasPrefix(agg.stopReason, "ERR:") {
-		return nil, nil, fmt.Errorf("%s", strings.TrimPrefix(agg.stopReason, "ERR:"))
+	if agg.streamError != "" {
+		return nil, partialUsage(agg), fmt.Errorf("%s", agg.streamError)
 	}
 	sr := agg.stopReason
 	if sr == "" {
@@ -842,9 +1018,17 @@ func aggregateAnthropicStream(r io.Reader) ([]byte, *StreamUsage, error) {
 	}
 	raw, err := json.Marshal(out)
 	if err != nil {
-		return nil, nil, err
+		return nil, partialUsage(agg), err
 	}
 	return raw, &StreamUsage{InputTokens: agg.in, OutputTokens: agg.out}, nil
+}
+
+// partialUsage 聚合失败时返回已提取的部分用量（可为 nil），供失败路径落库
+func partialUsage(agg *anthropicAgg) *StreamUsage {
+	if agg.in == 0 && agg.out == 0 {
+		return nil
+	}
+	return &StreamUsage{InputTokens: agg.in, OutputTokens: agg.out}
 }
 
 // ---- SSE 透传期间的 usage 嗅探 ----
@@ -889,7 +1073,10 @@ func (u *usageSniffReader) sniffLine(line string) {
 		return
 	}
 	var v struct {
-		Type    string `json:"type"`
+		Type  string `json:"type"`
+		Error struct {
+			Message string `json:"message"`
+		} `json:"error"`
 		Message struct {
 			Usage struct {
 				InputTokens  int `json:"input_tokens"`
@@ -908,6 +1095,13 @@ func (u *usageSniffReader) sniffLine(line string) {
 		return
 	}
 	switch v.Type {
+	case "error":
+		// 上游内联错误帧：记入 StopReason，让用量记录如实反映失败
+		if m := v.Error.Message; m != "" {
+			u.acc.StopReason = "ERR:" + m
+		} else if u.acc.StopReason == "" || !strings.HasPrefix(u.acc.StopReason, "ERR:") {
+			u.acc.StopReason = "ERR:upstream stream error"
+		}
 	case "message_start":
 		if v.Message.Usage.InputTokens > u.acc.InputTokens {
 			u.acc.InputTokens = v.Message.Usage.InputTokens
@@ -919,7 +1113,8 @@ func (u *usageSniffReader) sniffLine(line string) {
 		if v.Usage.InputTokens > u.acc.InputTokens {
 			u.acc.InputTokens = v.Usage.InputTokens
 		}
-		if v.Delta.StopReason != "" {
+		// 已标记的内联错误（ERR: 前缀）不被后续 delta 的 stop_reason 掩盖
+		if v.Delta.StopReason != "" && !strings.HasPrefix(u.acc.StopReason, "ERR:") {
 			u.acc.StopReason = v.Delta.StopReason
 		}
 	}

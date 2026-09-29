@@ -144,40 +144,13 @@ func (z *ZCodeAPI) UseReset(a *Account, resetType string) (bool, int64, string, 
 		return false, 0, msg, fmt.Errorf("业务码 %d: %s", code, msg)
 	}
 	data, _ := v["data"].(map[string]interface{})
-	used := false
 	if d, ok := data["used"].(bool); ok {
-		used = d
+		return d, 0, msg, nil
 	}
-	return used, 0, msg, nil
-}
-
-// RequestResetOpportunity POST reset/opportunity（3301=机会授予）
-func (z *ZCodeAPI) RequestResetOpportunity(a *Account) (granted bool, nextTry int64, msg string, err error) {
-	idem := uuid.NewString()
-	v, status, err := z.resetRequest(a, "POST", "/opportunity", map[string]interface{}{
-		"idempotency_key": idem,
-	})
-	if err != nil {
-		return false, 0, "", err
-	}
-	if status == 429 {
-		return false, 0, "重置机会请求被限流", fmt.Errorf("HTTP 429 throttled")
-	}
-	code := jsonInt(v, "code")
-	data, _ := v["data"].(map[string]interface{})
-	if d, ok := data["granted"].(bool); ok && d {
-		return true, 0, firstNonEmpty(jsonStr(v, "msg"), "机会已授予"), nil
-	}
-	if d, ok := data["granted"].(bool); ok && !d {
-		if n := jsonNum(data, "next_try_at"); n != nil {
-			return false, int64(*n) * 1000, "机会未授予", nil
-		}
-		return false, 0, "机会未授予", nil
-	}
-	if code == 3301 {
-		return true, 0, "机会已授予（3301）", nil
-	}
-	return false, 0, firstNonEmpty(jsonStr(v, "msg"), jsonStr(v, "message")), fmt.Errorf("业务码 %d", code)
+	// 业务码 0 但响应未带 used 字段（响应形状逆向自 app.asar，无法保证该字段）：
+	// 视为已消耗并告警——按失败记录会诱导上层重复消耗一次真实重置机会
+	log.Printf("[reset] use %s: code=0 but data.used missing (msg=%q); treating as consumed", resetType, msg)
+	return true, 0, msg, nil
 }
 
 // ResetForAccount 组合流程：查状态 → 选 five_hour 优先否则 week → use → 刷新额度 → 落记录。
@@ -354,25 +327,35 @@ func (z *ZCodeAPI) SyncResetHistoryFromUpstream(a *Account) (int, error) {
 		_ = json.Unmarshal([]byte(raw), &anchor)
 	}
 
+	// 与 UseReset 本地落记录互斥（同一把账号级锁）：关闭"上游已接受重置、
+	// 本地尚未落记录"亚秒窗口内同步读到新 used_at 造成重复入库的竞态
+	mu := z.claimLockFor(a.ID)
+	mu.Lock()
+	defer mu.Unlock()
+
 	inserted := 0
 	changed := false
 	for _, e := range latest {
 		if e.used/1000 <= anchor[e.kind]/1000 {
 			continue
 		}
-		dup, err := z.db.HasResetRecordNear(a.ID, e.used/1000)
+		dup, err := z.db.HasResetRecordNear(a.ID, e.used/1000, e.kind)
 		if err != nil {
 			continue // 查询失败不推进锚点，下次同步重试
 		}
 		if !dup {
-			z.db.InsertClaimRecord(&ClaimRecord{
+			if err := z.db.InsertClaimRecord(&ClaimRecord{
 				AccountID: a.ID,
 				Email:     a.Email,
 				TaskType:  "reset",
 				PlanName:  "配额重置(" + e.kind + ")",
 				Success:   true,
 				Message:   "上游重置记录（非本网关执行）",
-			})
+			}); err != nil {
+				// 入库失败不推进锚点：下轮同步重试，否则该记录永久丢失
+				log.Printf("[reset] insert upstream reset record %s account=%s: %v", e.kind, a.Email, err)
+				continue
+			}
 			inserted++
 		}
 		anchor[e.kind] = e.used

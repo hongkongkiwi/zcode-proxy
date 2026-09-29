@@ -39,6 +39,7 @@ type Account struct {
 	Status       string  `json:"status"`      // active|exhausted|cooling|invalid|disabled|inactive
 	Enabled      bool    `json:"enabled"`     // 是否参与轮询
 	AccountGroup string  `json:"group"`       // 分组（空=未分组）
+	Priority     int64   `json:"priority"`    // priority 策略：数值小者优先（50=促销/免费层默认，100=普通默认）
 	QuotaJSON    string  `json:"-"`           // 最近一次额度快照（规范化 JSON）
 	PlanTier     string  `json:"plan_tier"`   // Start Plan / Lite / Pro / Max / 体验
 	PlanExpire   string  `json:"plan_expire"` // 套餐到期时间（展示用字符串）
@@ -167,6 +168,8 @@ func NewDB(dbPath string) (*DB, error) {
 		"PRAGMA synchronous=NORMAL",
 		"PRAGMA busy_timeout=5000",
 		"PRAGMA foreign_keys=ON",
+		// 凭证迁移/删除后，空闲页中的明文残留要在释放时即被清零
+		"PRAGMA secure_delete=ON",
 	}
 	for _, p := range pragmas {
 		if _, err := conn.Exec(p); err != nil {
@@ -181,6 +184,10 @@ func NewDB(dbPath string) (*DB, error) {
 	}
 	// 凭证加密种子解析（keyfile 生成/轮换）必须先于任何账号读写
 	ResolveVaultSeed(db, dbPath)
+	// priority 列增量迁移（旧库无此列；已存在时报错忽略）
+	if _, err := db.conn.Exec(`ALTER TABLE accounts ADD COLUMN priority INTEGER NOT NULL DEFAULT 100`); err == nil {
+		log.Printf("[db] added accounts.priority column (default 100)")
+	}
 	// 存量明文凭证列静态加密迁移（幂等；失败不阻断启动，下轮再试）
 	if err := db.MigrateVault(); err != nil {
 		log.Printf("[vault] migrate: %v", err)
@@ -337,10 +344,10 @@ func (db *DB) initSchema() error {
 	if _, err := db.conn.Exec(schema); err != nil {
 		return fmt.Errorf("init schema: %w", err)
 	}
-	// 默认设置项
+	// 默认设置项。注意 is_default_password 不在此播种：该标记只由认证引导
+	// 显式写入（随机口令生成时置 1，修改口令时清 0），无标记 = 非缺省口令
 	defaults := map[string]string{
 		"admin_user":             "admin",
-		"is_default_password":    "1",
 		"api_key":                "",
 		"selection_strategy":     "round_robin",
 		"quota_refresh_interval": "60",
