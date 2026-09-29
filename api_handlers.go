@@ -455,7 +455,12 @@ func (s *APIServer) handleResetStatus(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]interface{}{"ok": false, "message": firstNonEmpty(bizMsg, err.Error()), "http_status": httpStatus})
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]interface{}{"ok": true, "status": st})
+	synced, syncErr := s.zapi.SyncResetHistoryFromUpstream(a)
+	resp := map[string]interface{}{"ok": true, "status": st, "upstream_synced": synced}
+	if syncErr != nil {
+		resp["sync_message"] = syncErr.Error()
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
 
 // handleModelSync 同步官方模型目录

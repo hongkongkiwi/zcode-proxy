@@ -83,6 +83,21 @@ func (db *DB) UpdateClaimPlanRun(id int64, status, msg string) error {
 
 // ---- 活动领取记录 ----
 
+// HasResetRecordNear 是否已存在该账号 ±15 分钟内的成功重置记录
+// （用于上游 used_at 去重：官方客户端等外部执行的重置不必重复入库）
+// 注意：created_at 存的是 localtime 墙钟字符串，strftime('%s') 会按 UTC 解析，
+// 需减去本地时区偏移才是真实 epoch。
+func (db *DB) HasResetRecordNear(accountID int64, usedAtSec int64) (bool, error) {
+	_, offset := time.Now().Zone()
+	var n int
+	err := db.conn.QueryRow(
+		`SELECT COUNT(1) FROM claim_records
+		 WHERE account_id=? AND task_type='reset' AND success=1
+		   AND ABS(strftime('%s',created_at)-?-?)<900`,
+		accountID, offset, usedAtSec).Scan(&n)
+	return n > 0, err
+}
+
 func (db *DB) InsertClaimRecord(r *ClaimRecord) error {
 	_, err := db.conn.Exec(`
 		INSERT INTO claim_records (account_id, email, task_type, plan_id, plan_name, success, code, message, next_at)

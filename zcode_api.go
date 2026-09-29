@@ -23,21 +23,33 @@ type ZCodeAPI struct {
 
 	claimMu    sync.Mutex
 	claimLocks map[int64]*sync.Mutex // 账号级领取互斥（防 UI+cron 并发双领）
+
+	resetSyncMu sync.Mutex
+	resetSyncAt map[int64]time.Time // 上游重置历史同步节流（每账号）
 }
 
 // NewZCodeAPI 创建上游 API 封装，并把额度刷新函数注入账号池
 func NewZCodeAPI(cfg *FileConfig, db *DB, pool *AccountPool, captcha *CaptchaService, appVersion string) *ZCodeAPI {
 	z := &ZCodeAPI{
-		cfg:        cfg,
-		db:         db,
-		pool:       pool,
-		captcha:    captcha,
-		egress:     NewEgressProxy(db),
-		routing:    NewEndpointRouter(""),
-		appVersion: appVersion,
-		claimLocks: make(map[int64]*sync.Mutex),
+		cfg:         cfg,
+		db:          db,
+		pool:        pool,
+		captcha:     captcha,
+		egress:      NewEgressProxy(db),
+		routing:     NewEndpointRouter(""),
+		appVersion:  appVersion,
+		claimLocks:  make(map[int64]*sync.Mutex),
+		resetSyncAt: make(map[int64]time.Time),
 	}
-	pool.SetQuotaFetcher(z.RefreshAccountQuota)
+	pool.SetQuotaFetcher(func(a *Account) error {
+		err := z.RefreshAccountQuota(a)
+		if n, serr := z.SyncResetHistoryFromUpstream(a); serr != nil {
+			log.Printf("[reset] 上游重置历史同步失败 account=%s: %v", a.Email, serr)
+		} else if n > 0 {
+			log.Printf("[reset] 同步到 %d 条上游重置记录 account=%s", n, a.Email)
+		}
+		return err
+	})
 	return z
 }
 

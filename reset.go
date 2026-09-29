@@ -312,3 +312,73 @@ func (z *ZCodeAPI) GetModelCatalog() []CatalogModel {
 	json.Unmarshal([]byte(raw), &out)
 	return out
 }
+
+// resetHistorySyncInterval 单账号上游重置历史同步最小间隔（防风控）
+const resetHistorySyncInterval = 10 * time.Minute
+
+// SyncResetHistoryFromUpstream 拉取上游 reset/status 的 latest_*_reset_history，
+// 把非本网关执行的重置（官方客户端、其他设备等）补记到 claim_records，
+// 使重置历史与真实一致。used_at 为毫秒时间戳；
+// 去重：本地 ±15 分钟内已有成功重置记录则不重复入库；锚点存 settings。
+func (z *ZCodeAPI) SyncResetHistoryFromUpstream(a *Account) (int, error) {
+	if a == nil || a.ZCodeJWT == "" {
+		return 0, nil
+	}
+	z.resetSyncMu.Lock()
+	if last, ok := z.resetSyncAt[a.ID]; ok && time.Since(last) < resetHistorySyncInterval {
+		z.resetSyncMu.Unlock()
+		return 0, nil
+	}
+	z.resetSyncAt[a.ID] = time.Now()
+	z.resetSyncMu.Unlock()
+
+	st, _, _, err := z.FetchResetStatus(a)
+	if err != nil {
+		return 0, err
+	}
+	type slot struct {
+		kind string
+		used int64 // 毫秒
+	}
+	var latest []slot
+	if st.LatestFiveHourReset != nil && st.LatestFiveHourReset.UsedAt > 0 {
+		latest = append(latest, slot{"FIVE_HOUR", st.LatestFiveHourReset.UsedAt})
+	}
+	if st.LatestWeekReset != nil && st.LatestWeekReset.UsedAt > 0 {
+		latest = append(latest, slot{"WEEK", st.LatestWeekReset.UsedAt})
+	}
+
+	anchorKey := fmt.Sprintf("reset_history_seen:%d", a.ID)
+	anchor := map[string]int64{}
+	if raw, err := z.db.GetSetting(anchorKey); err == nil && raw != "" {
+		_ = json.Unmarshal([]byte(raw), &anchor)
+	}
+
+	inserted := 0
+	changed := false
+	for _, e := range latest {
+		if e.used/1000 <= anchor[e.kind]/1000 {
+			continue
+		}
+		dup, err := z.db.HasResetRecordNear(a.ID, e.used/1000)
+		if err == nil && !dup {
+			z.db.InsertClaimRecord(&ClaimRecord{
+				AccountID: a.ID,
+				Email:     a.Email,
+				TaskType:  "reset",
+				PlanName:  "配额重置(" + e.kind + ")",
+				Success:   true,
+				Message:   "上游重置记录（非本网关执行）",
+			})
+			inserted++
+		}
+		anchor[e.kind] = e.used
+		changed = true
+	}
+	if changed {
+		if raw, err := json.Marshal(anchor); err == nil {
+			z.db.SetSetting(anchorKey, string(raw))
+		}
+	}
+	return inserted, nil
+}
