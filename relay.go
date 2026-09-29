@@ -128,6 +128,10 @@ func (z *ZCodeAPI) relay(w http.ResponseWriter, r *http.Request, rc *relayCtx) {
 		detail = detail[:400] + "…"
 	}
 	msg := "所有账号均不可用或额度已用完，请在后台检查账号状态"
+	// 达到单次尝试上限时如实说明：仅尝试了部分账号，其余本次未尝试
+	if len(tried) >= maxAccountAttempts {
+		msg = fmt.Sprintf("已尝试 %d 个账号达到单次请求上限，其余账号本次未尝试，请稍后重试或在后台检查账号状态", len(tried))
+	}
 	// 若因冷却导致无可用账号，给出预计恢复时间
 	if until, reason := z.pool.CoolingInfo(rc.provider, rc.group); until > 0 {
 		secs := until - time.Now().Unix()
@@ -158,25 +162,26 @@ func (z *ZCodeAPI) tryAccount(w http.ResponseWriter, r *http.Request, a *Account
 
 	needsCaptcha := rc.provider == "zai" && a.AuthType == "jwt" && a.ZCodeJWT != ""
 
-	// 路径 1：JWT + 阿里云无痕验证码（含失效重解重试）
+	// 路径 1：JWT + 阿里云无痕验证码（含失效重解重试）；无可用验证参数时跳过（与路径 2 直连等价）
 	if needsCaptcha {
 		verifyParam, region, err := z.captcha.GetVerifyParam(a)
 		if err != nil {
-			verifyParam = ""
 			note("人机校验求解失败: " + truncate(err.Error(), 180))
-		}
-		out := z.forwardOnce(w, r, a, payload, verifyParam, region, false, maxCaptchaRetries, rc, start, "jwt-captcha")
-		switch out {
-		case outcomeWritten, outcomeUpstreamError:
-			return out
-		case outcomeNextAccount:
-			note("账号不可用: " + firstNonEmpty(a.LastError, a.Status))
-			return outcomeNextAccount
-		case outcomeRiskBlocked:
-			riskBlocked = true
-			note("免费通道风控拦截（unusual activity）")
-		case outcomeCaptchaRejected:
-			note("带验证码请求被上游拒绝")
+		} else if verifyParam != "" {
+			out := z.forwardOnce(w, r, a, payload, verifyParam, region, false, maxCaptchaRetries, rc, start, "jwt-captcha")
+			switch out {
+			case outcomeWritten, outcomeUpstreamError:
+				return out
+			case outcomeNextAccount:
+				st, lastErr := a.statusError()
+				note("账号不可用: " + firstNonEmpty(lastErr, st))
+				return outcomeNextAccount
+			case outcomeRiskBlocked:
+				riskBlocked = true
+				note("免费通道风控拦截（unusual activity）")
+			case outcomeCaptchaRejected:
+				note("带验证码请求被上游拒绝")
+			}
 		}
 	}
 
@@ -187,7 +192,8 @@ func (z *ZCodeAPI) tryAccount(w http.ResponseWriter, r *http.Request, a *Account
 		case outcomeWritten, outcomeUpstreamError:
 			return out
 		case outcomeNextAccount:
-			note("账号不可用: " + firstNonEmpty(a.LastError, a.Status))
+			st, lastErr := a.statusError()
+			note("账号不可用: " + firstNonEmpty(lastErr, st))
 			return outcomeNextAccount
 		case outcomeRiskBlocked:
 			riskBlocked = true
@@ -204,7 +210,8 @@ func (z *ZCodeAPI) tryAccount(w http.ResponseWriter, r *http.Request, a *Account
 		case outcomeWritten, outcomeUpstreamError:
 			return out
 		case outcomeNextAccount:
-			note("API Key 回退失败: " + firstNonEmpty(a.LastError, a.Status))
+			st, lastErr := a.statusError()
+			note("API Key 回退失败: " + firstNonEmpty(lastErr, st))
 			return outcomeNextAccount
 		case outcomeRiskBlocked:
 			note("API Key 通道也被风控拦截")
@@ -665,6 +672,11 @@ func dedup(in []string) []string {
 
 // writeUpstreamErrorForProto 上游错误按客户端协议回传
 func writeUpstreamErrorForProto(w http.ResponseWriter, resp *http.Response, text string, proto protocol) {
+	// 客户端状态码：真实上游 4xx/5xx 透传；2xx/3xx（WAF 挑战页等非错误内容）一律按 502 回传
+	status := resp.StatusCode
+	if status < 400 {
+		status = http.StatusBadGateway
+	}
 	if proto != protocolAnthropic {
 		// OpenAI 风格错误
 		msg := "upstream error"
@@ -676,8 +688,8 @@ func writeUpstreamErrorForProto(w http.ResponseWriter, resp *http.Response, text
 				}
 			}
 		}
-		writeJSON(w, resp.StatusCode, map[string]interface{}{
-			"error": map[string]interface{}{"message": truncate(msg, 500), "type": "api_error", "code": resp.StatusCode},
+		writeJSON(w, status, map[string]interface{}{
+			"error": map[string]interface{}{"message": truncate(msg, 500), "type": "api_error", "code": status},
 		})
 		return
 	}
@@ -687,7 +699,7 @@ func writeUpstreamErrorForProto(w http.ResponseWriter, resp *http.Response, text
 		}
 	}
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	w.WriteHeader(resp.StatusCode)
+	w.WriteHeader(status)
 	var v map[string]interface{}
 	if json.Unmarshal([]byte(text), &v) == nil {
 		w.Write([]byte(text))
@@ -703,7 +715,7 @@ func (z *ZCodeAPI) RefreshAccountQuotaThrottled(a *Account) {
 	if a.Provider != "zai" || a.ZCodeJWT == "" {
 		return
 	}
-	if time.Now().Unix()-a.LastCheckedAt < 30 {
+	if time.Now().Unix()-a.lastCheckedAt() < 30 {
 		return
 	}
 	if err := z.RefreshAccountQuota(a); err != nil {

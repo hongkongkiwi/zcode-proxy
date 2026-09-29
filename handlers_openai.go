@@ -325,10 +325,12 @@ func openaiToAnthropic(body map[string]interface{}) (map[string]interface{}, err
 		}
 	}
 
-	// tool_choice 转换
+	// tool_choice 转换；Anthropic 无 "none"：连同 tools 一起从上游请求中省略
 	switch tc := body["tool_choice"].(type) {
 	case string:
-		if tc == "auto" {
+		if tc == "none" {
+			delete(out, "tools")
+		} else if tc == "auto" {
 			out["tool_choice"] = map[string]interface{}{"type": "auto"}
 		} else if tc == "required" {
 			out["tool_choice"] = map[string]interface{}{"type": "any"}

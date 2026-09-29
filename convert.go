@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -34,18 +35,23 @@ type sseEvent struct {
 // maxSSEBuffer 单个流解析缓冲上限（16MB）
 const maxSSEBuffer = 16 << 20
 
+// errSSEOverflow 解析缓冲超限（上游持续不发空行分帧），流不可恢复
+var errSSEOverflow = errors.New("sse buffer overflow")
+
 // sseParser 增量 SSE 帧解析器（处理跨 chunk 断帧，兼容 LF/CRLF）
 type sseParser struct {
 	buf strings.Builder
 }
 
-func (p *sseParser) feed(chunk []byte, fn func(sseEvent)) {
+func (p *sseParser) feed(chunk []byte, fn func(sseEvent)) error {
 	p.buf.Write(chunk)
-	// 缓冲上限：上游持续不发空行分隔时防止无界增长（OOM 面）
+	p.drain(fn)
+	// 缓冲上限：上游持续不发空行分隔时防止无界增长（OOM 面），按流失败处理
 	if p.buf.Len() > maxSSEBuffer {
 		p.buf.Reset()
+		return errSSEOverflow
 	}
-	p.drain(fn)
+	return nil
 }
 
 func (p *sseParser) drain(fn func(sseEvent)) {
@@ -97,7 +103,20 @@ func parseSSEBlock(block string) (sseEvent, bool) {
 	if err := json.Unmarshal([]byte(dataStr), &ev.Data); err != nil {
 		return ev, false
 	}
+	// 上游常省略 event: 行直接以 data 发错误帧，归一化为 error 事件，避免被各消费方忽略
+	if ev.Event == "" && isDataErrorFrame(ev.Data) {
+		ev.Event = "error"
+	}
 	return ev, ev.Event != "" || ev.Data != nil
+}
+
+// isDataErrorFrame data-only 帧内嵌错误：顶层 error 字段或 type=="error"
+func isDataErrorFrame(data map[string]interface{}) bool {
+	if t, _ := data["type"].(string); t == "error" {
+		return true
+	}
+	e, ok := data["error"]
+	return ok && e != nil
 }
 
 // parseAnthropicUsageJSON 非流式 Anthropic 响应提取 usage
@@ -332,9 +351,12 @@ func streamProtocolResponse(w http.ResponseWriter, rc *relayCtx, resp *http.Resp
 				if flusher != nil {
 					flusher.Flush()
 				}
-				parser.feed(buf[:n], func(ev sseEvent) {
+				if ferr := parser.feed(buf[:n], func(ev sseEvent) {
 					applyEventToUsage(ev, &usage, &activeTool, &texts, &thinks)
-				})
+				}); ferr != nil {
+					readErr = ferr
+					break
+				}
 			}
 			if err != nil {
 				readErr = err
@@ -373,7 +395,9 @@ func streamProtocolResponse(w http.ResponseWriter, rc *relayCtx, resp *http.Resp
 		var texts, thinks []string
 		parser := &sseParser{}
 		all, readErr := io.ReadAll(io.LimitReader(resp.Body, 64<<20))
-		parser.feed(all, func(ev sseEvent) { applyEventToUsage(ev, &usage, &activeTool, &texts, &thinks) })
+		if ferr := parser.feed(all, func(ev sseEvent) { applyEventToUsage(ev, &usage, &activeTool, &texts, &thinks) }); ferr != nil {
+			readErr = ferr
+		}
 		parser.flush(func(ev sseEvent) { applyEventToUsage(ev, &usage, &activeTool, &texts, &thinks) })
 		finalizeToolCalls(&usage)
 		// 上游流内错误或中途断流：不得伪装成成功空响应
@@ -500,7 +524,10 @@ func (z *ZCodeAPI) streamOpenAI(w http.ResponseWriter, flusher http.Flusher, res
 	for {
 		n, err := resp.Body.Read(buf)
 		if n > 0 {
-			parser.feed(buf[:n], handle)
+			if ferr := parser.feed(buf[:n], handle); ferr != nil {
+				readErr = ferr
+				break
+			}
 		}
 		if err != nil {
 			readErr = err
@@ -578,6 +605,7 @@ func (z *ZCodeAPI) streamResponses(w http.ResponseWriter, flusher http.Flusher, 
 		texts       []string
 	}
 	blocks := map[int]*blockState{}
+	var outputItems []map[string]interface{} // 已流式发出的最终输出项，completed 复用其 ID
 
 	writeEvent := func(name string, evPayload map[string]interface{}) {
 		evPayload["sequence_number"] = sequence
@@ -622,13 +650,15 @@ func (z *ZCodeAPI) streamResponses(w http.ResponseWriter, flusher http.Flusher, 
 		writeEvent("response.content_part.done", map[string]interface{}{
 			"item_id": blk.itemID, "output_index": blk.outputIndex, "content_index": 0, "part": part,
 		})
+		item := map[string]interface{}{
+			"id": blk.itemID, "type": "message", "status": "completed",
+			"role": "assistant", "content": []interface{}{part},
+		}
 		writeEvent("response.output_item.done", map[string]interface{}{
 			"output_index": blk.outputIndex,
-			"item": map[string]interface{}{
-				"id": blk.itemID, "type": "message", "status": "completed",
-				"role": "assistant", "content": []interface{}{part},
-			},
+			"item":         item,
 		})
+		outputItems = append(outputItems, item)
 		delete(blocks, idx)
 	}
 
@@ -674,13 +704,15 @@ func (z *ZCodeAPI) streamResponses(w http.ResponseWriter, flusher http.Flusher, 
 		writeEvent("response.function_call_arguments.done", map[string]interface{}{
 			"item_id": blk.itemID, "output_index": blk.outputIndex, "arguments": arguments,
 		})
+		item := map[string]interface{}{
+			"id": blk.itemID, "type": "function_call", "status": "completed",
+			"call_id": blk.callID, "name": blk.name, "arguments": arguments,
+		}
 		writeEvent("response.output_item.done", map[string]interface{}{
 			"output_index": blk.outputIndex,
-			"item": map[string]interface{}{
-				"id": blk.itemID, "type": "function_call", "status": "completed",
-				"call_id": blk.callID, "name": blk.name, "arguments": arguments,
-			},
+			"item":         item,
 		})
+		outputItems = append(outputItems, item)
 		delete(blocks, idx)
 	}
 
@@ -697,7 +729,7 @@ func (z *ZCodeAPI) streamResponses(w http.ResponseWriter, flusher http.Flusher, 
 			ttft = int(time.Since(start).Milliseconds())
 		}
 		switch ev.Event {
-		case "message_start", "message_delta":
+		case "message_start", "message_delta", "error":
 			applyEventToUsage(ev, &usage, &activeTool, &texts, &thinks)
 			return
 		}
@@ -778,7 +810,10 @@ func (z *ZCodeAPI) streamResponses(w http.ResponseWriter, flusher http.Flusher, 
 	for {
 		n, err := resp.Body.Read(buf)
 		if n > 0 {
-			parser.feed(buf[:n], handle)
+			if ferr := parser.feed(buf[:n], handle); ferr != nil {
+				readErr = ferr
+				break
+			}
 		}
 		if err != nil {
 			readErr = err
@@ -827,9 +862,8 @@ func (z *ZCodeAPI) streamResponses(w http.ResponseWriter, flusher http.Flusher, 
 		closeMessageEvents(emptyIdx)
 	}
 	writeEvent("response.completed", map[string]interface{}{
-		"response": responsesResponse(model, responseID, fullText, fullThinking, &usage),
+		"response": responsesResponseWithItems(model, responseID, outputItems, fullText, fullThinking, &usage),
 	})
-	fmt.Fprint(w, "data: [DONE]\n\n")
 	if flusher != nil {
 		flusher.Flush()
 	}
@@ -895,6 +929,12 @@ func openaiResponse(model, text, thinking string, usage *StreamUsage) map[string
 func newResponseID() string { return "resp_" + randomHex(12) }
 
 func responsesResponse(model, responseID, text, thinking string, usage *StreamUsage) map[string]interface{} {
+	return responsesResponseWithItems(model, responseID, nil, text, thinking, usage)
+}
+
+// responsesResponseWithItems 构造 Response 对象；items 为流式阶段已发出的最终输出项时
+// 直接复用（保留 msg_/fc_ ID 供客户端关联事件序列），仅补合成流中未出现的 reasoning 项
+func responsesResponseWithItems(model, responseID string, items []map[string]interface{}, text, thinking string, usage *StreamUsage) map[string]interface{} {
 	var output []map[string]interface{}
 	if thinking != "" {
 		output = append(output, map[string]interface{}{
@@ -902,28 +942,32 @@ func responsesResponse(model, responseID, text, thinking string, usage *StreamUs
 			"summary": []map[string]interface{}{{"type": "summary_text", "text": thinking}},
 		})
 	}
-	if usage != nil {
-		for _, c := range usage.ToolCalls {
-			id, _ := c["id"].(string)
-			if id == "" {
-				id = "call_" + randomHex(8)
+	if len(items) > 0 {
+		output = append(output, items...)
+	} else {
+		if usage != nil {
+			for _, c := range usage.ToolCalls {
+				id, _ := c["id"].(string)
+				if id == "" {
+					id = "call_" + randomHex(8)
+				}
+				name, _ := c["name"].(string)
+				args, _ := json.Marshal(c["input"])
+				output = append(output, map[string]interface{}{
+					"id": "fc_" + randomHex(8), "type": "function_call",
+					"call_id": id, "name": name, "arguments": string(args),
+				})
 			}
-			name, _ := c["name"].(string)
-			args, _ := json.Marshal(c["input"])
+		}
+		if text != "" || len(output) == 0 {
 			output = append(output, map[string]interface{}{
-				"id": "fc_" + randomHex(8), "type": "function_call",
-				"call_id": id, "name": name, "arguments": string(args),
+				"id": "msg_" + randomHex(8), "type": "message", "status": "completed",
+				"role": "assistant",
+				"content": []map[string]interface{}{
+					{"type": "output_text", "text": text, "annotations": []interface{}{}},
+				},
 			})
 		}
-	}
-	if text != "" || len(output) == 0 {
-		output = append(output, map[string]interface{}{
-			"id": "msg_" + randomHex(8), "type": "message", "status": "completed",
-			"role": "assistant",
-			"content": []map[string]interface{}{
-				{"type": "output_text", "text": text, "annotations": []interface{}{}},
-			},
-		})
 	}
 	in, out := 0, 0
 	if usage != nil {
@@ -943,5 +987,3 @@ func responsesResponse(model, responseID, text, thinking string, usage *StreamUs
 func randomHex(n int) string {
 	return strings.ReplaceAll(uuid.NewString(), "-", "")[:n]
 }
-
-var _ = log.Printf
