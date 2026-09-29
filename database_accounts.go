@@ -13,6 +13,9 @@ import (
 // device_mid / creds_raw 用 COALESCE 保留旧值：
 // 新值为空时不会被后续导入清空（设备指纹与本地凭证快照不被抹掉）。
 func (db *DB) UpsertAccount(a *Account) (int64, error) {
+	// 凭证列静态加密（写入密文，内存结构保持明文供调用方继续使用）
+	encAccess, encRefresh, encJWT, encAPIKey := vaultEncrypt(a.AccessToken), vaultEncrypt(a.RefreshToken), vaultEncrypt(a.ZCodeJWT), vaultEncrypt(a.APIKey)
+	encUserInfo, encCredsRaw := vaultEncrypt(a.UserInfo), vaultEncrypt(a.CredsRaw)
 	res, err := db.conn.Exec(`
 		INSERT INTO accounts (
 			user_id, email, display_name, provider, auth_type,
@@ -37,8 +40,8 @@ func (db *DB) UpsertAccount(a *Account) (int64, error) {
 			remark        = COALESCE(NULLIF(excluded.remark,''), accounts.remark),
 			updated_at    = datetime('now','localtime')`,
 		a.UserID, a.Email, a.DisplayName, a.Provider, a.AuthType,
-		a.AccessToken, a.RefreshToken, a.ZCodeJWT, a.APIKey, a.UserInfo,
-		a.DeviceMid, a.CredsRaw, a.Status, boolInt(a.Enabled), a.AccountGroup, a.Remark)
+		encAccess, encRefresh, encJWT, encAPIKey, encUserInfo,
+		a.DeviceMid, encCredsRaw, a.Status, boolInt(a.Enabled), a.AccountGroup, a.Remark)
 	if err != nil {
 		return 0, err
 	}
@@ -81,6 +84,13 @@ func scanAccount(row interface{ Scan(...interface{}) error }) (*Account, error) 
 		return nil, err
 	}
 	a.Enabled = enabled == 1
+	// 凭证列静态加密：读取时透明解密
+	a.AccessToken = vaultDecrypt(a.AccessToken)
+	a.RefreshToken = vaultDecrypt(a.RefreshToken)
+	a.ZCodeJWT = vaultDecrypt(a.ZCodeJWT)
+	a.APIKey = vaultDecrypt(a.APIKey)
+	a.UserInfo = vaultDecrypt(a.UserInfo)
+	a.CredsRaw = vaultDecrypt(a.CredsRaw)
 	return &a, nil
 }
 
@@ -224,7 +234,7 @@ func (db *DB) UpdateAccountFields(id int64, group, remark string, enabled bool) 
 	return err
 }
 
-// UpdateAccountTokens 更新凭证字段（OAuth 刷新 / 手动编辑）
+// UpdateAccountTokens 更新凭证字段（OAuth 刷新 / 手动编辑）；凭证列静态加密
 func (db *DB) UpdateAccountTokens(id int64, accessToken, refreshToken, zcodeJWT, apiKey, userInfo string) error {
 	_, err := db.conn.Exec(`
 		UPDATE accounts SET
@@ -234,7 +244,9 @@ func (db *DB) UpdateAccountTokens(id int64, accessToken, refreshToken, zcodeJWT,
 			api_key       = COALESCE(NULLIF(?,''), api_key),
 			user_info     = COALESCE(NULLIF(?,''), user_info),
 			updated_at = datetime('now','localtime')
-		WHERE id = ?`, accessToken, refreshToken, zcodeJWT, apiKey, userInfo, id)
+		WHERE id = ?`,
+		vaultEncrypt(accessToken), vaultEncrypt(refreshToken), vaultEncrypt(zcodeJWT),
+		vaultEncrypt(apiKey), vaultEncrypt(userInfo), id)
 	return err
 }
 

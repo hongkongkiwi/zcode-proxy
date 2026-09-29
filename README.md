@@ -50,8 +50,9 @@ Go 单二进制实现的 **ZCode（Z.AI / GLM Coding Plan）多账号管理 + OA
 
 | 模块 | 说明 |
 |---|---|
-| 多账号管理 | 本地客户端一键导入 / OAuth 登录（手动粘贴为主，环回为实验）/ 粘贴 JWT·API Key；分组、启用策略（random / round_robin / best_quota）、状态机 |
-| 2API 网关 | `/v1/messages`（Anthropic 原生）、`/v1/chat/completions`、`/v1/responses`、`/v1/models`、`/v1/messages/count_tokens`；SSE 流式 + 用量/TTFT 记录 |
+| 多账号管理 | 本地客户端一键导入 / OAuth 登录（免回调 CLI 轮询为主，手动粘贴备用）/ 粘贴 JWT·API Key；分组、启用策略（random / round_robin / best_quota）、状态机 |
+| 2API 网关 | `/v1/messages`（Anthropic 原生）、`/v1/chat/completions`、`/v1/responses`、`/v1/models`、`/v1/messages/count_tokens`；SSE 流式 + 用量/TTFT 记录；上游端点按服务端 `agent/configs` 路由表自动重写（fail-open） |
+| 闲时通道 | `/async/v1/messages`（Anthropic 原生）经上游 **off-peak 免费算力队列**：取票排队、SSE 注释帧保活、`X-Off-Peak-Ticket-ID` 调用、幂等关票、票回收自动重取；设置 `async_enabled` 开启 |
 | 额度监控 | 后台周期刷新；账号页额度条**可点开**查看分套餐槽位与逐模型额度构成；驱动状态机 |
 | 活动体系 | 检测（billing/preview）、领取（billing/claim + 阿里云无痕验证码）、激活（event/report）、**Coding Plan 配额重置**（reset/status·use·opportunity·history/read）；cron 调度 + 账号间防风控延迟 |
 | 人机验证 | go-rod 驱动**本机真实 Chrome/Edge** 无头求解；失败自动升级有头手动；参数按出口代理分组缓存 |
@@ -59,7 +60,7 @@ Go 单二进制实现的 **ZCode（Z.AI / GLM Coding Plan）多账号管理 + OA
 | 出口代理 | 分组绑定节点（SOCKS5/HTTP CONNECT）、默认节点、全局代理、系统代理探测、端口探测、出口 IP 测试 |
 | 本地联动 | 解密 `~/.zcode/v2/credentials.json` 导入；一键切回（备份+原子写）；加密账号包 `zcb1:` 导出/导入 |
 | LLM 测试页 | 三协议 × 流式/非流式在线测试（状态/延迟/TTFT/tokens/SSE 事件数/内容/历史） |
-| 安全 | 首次启动随机生成口令（`ZCODE_WEB_PASS` 可覆盖，无默认口令）+ bcrypt + 登录限速退避（按 RemoteAddr）；`sk-` Key 常数时间比较；会话 SameSite=Strict；账号包导出需管理员密码二次确认；凭证不落日志 |
+| 安全 | 首次启动随机生成口令（`ZCODE_WEB_PASS` 可覆盖，无默认口令）+ bcrypt + 登录限速退避（按 RemoteAddr）；`sk-` Key 常数时间比较；会话 SameSite=Strict；账号包导出需管理员密码二次确认；库内凭证 `vault1:` AES-256-GCM 静态加密（`ZCODE_PROXY_VAULT_SECRET` 可自定义种子，启动自动迁移存量明文）；凭证不落日志 |
 
 ## 功能详解
 
@@ -90,10 +91,10 @@ Go 单二进制实现的 **ZCode（Z.AI / GLM Coding Plan）多账号管理 + OA
 
 ### OAuth 登录（新账号）
 
-- 发起后打开 Z.AI 授权页；因该公开 client 仅注册 `https://zcode.z.ai/login` 回跳，**默认手动粘贴模式**：
-  授权后复制地址栏 `zcode.z.ai/login?code=…` 完整 URL 贴回网关，同步兑换并入库（失败显示具体业务码）；
+- **免回调轮询登录（默认，推荐）**：与官方桌面端相同的 CLI 轮询流程 —— `POST /api/v1/oauth/cli/init` 取授权 URL（附加桌面中转参数）→ 浏览器任意设备打开并授权（中转页在服务端记录结果，不回连本机，无需注册 redirect_uri）→ 网关轮询 `/oauth/cli/poll/{flow_id}` 自动入库；
+- 手动粘贴（备用）：复制授权后地址栏 `zcode.z.ai/login?code=…` 完整 URL 贴回网关兑换；
 - 环回模式（`127.0.0.1:8687/oauth/callback`）保留为实验项（当前会报 `Redirect URI not registered`）；
-- 兑换链：`code → Coding Plan JWT + access_token` → 自动提取 API Key（z/login → customer → api_keys → copy）→ 补查 userinfo → 入库 + 刷新额度。
+- 兑换链：`code/poll → Coding Plan JWT + access_token` → 自动提取 API Key（z/login → customer → api_keys → copy）→ 补查 userinfo → 入库 + 刷新额度。
 
 ### 活动检测 / 领取 / 激活 / 配额重置
 
@@ -260,7 +261,7 @@ Go 单二进制实现的 **ZCode（Z.AI / GLM Coding Plan）多账号管理 + OA
 ## 10. 配置参考
 
 `config/config.json`（首次运行生成）：`listen_addr`、`app_version`(空=注册表探测)、`models[]`、`upstream{zai,zai_fallback,bigmodel}`。
-`settings`（界面/`PUT /api/settings`）：`selection_strategy`、`quota_refresh_interval`(0=关闭)、`upstream_proxy`、`fingerprint`、`custom_ja3`、`captcha_mode`(auto/manual/off)、`gateway_models`、`api_key`、`password_hash`(bcrypt)。
+`settings`（界面/`PUT /api/settings`）：`selection_strategy`、`quota_refresh_interval`(0=关闭)、`upstream_proxy`、`fingerprint`、`custom_ja3`、`captcha_mode`(auto/manual/off)、`gateway_models`、`api_key`、`password_hash`(bcrypt)、`async_enabled`(闲时通道开关)、`async_poll_interval_ms`、`async_keepalive_ms`、`async_max_retries`、`async_max_wait_sec`。
 
 ## 11. 管理 API（节选，session 鉴权）
 
@@ -282,7 +283,8 @@ go vet .
 - 多出口代理下验证码参数按代理分组缓存，跨组不共享；
 - `/v1/messages/count_tokens` 为保守估算（字符/4+开销）。
 - 账号包导出使用 PBKDF2 60 万轮；旧 12 万轮加密包仅支持导入（自动回退），不再生成。
-- SQLite 中账号凭证为明文存储，依赖操作系统文件权限保护 `data/` 目录（请勿多用户共享主机）。
+- 库内凭证已静态加密（`vault1:`），密钥默认绑定本机（平台/home/用户名）；跨机器迁移 `data/` 时请同设 `ZCODE_PROXY_VAULT_SECRET`。
+- `/async/v1/messages` 闲时通道为一次性应答、无会话记忆（上游语义）；多轮对话请在请求内携带历史。
 
 ## 仓库与数据边界
 

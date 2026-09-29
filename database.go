@@ -179,6 +179,10 @@ func NewDB(dbPath string) (*DB, error) {
 		conn.Close()
 		return nil, err
 	}
+	// 存量明文凭证列静态加密迁移（幂等；失败不阻断启动，下轮再试）
+	if err := db.MigrateVault(); err != nil {
+		log.Printf("[vault] migrate: %v", err)
+	}
 	return db, nil
 }
 
