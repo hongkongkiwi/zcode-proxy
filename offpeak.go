@@ -236,12 +236,39 @@ func (z *ZCodeAPI) HandleAsyncMessages(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	// 闲时端点按小写模型名校验（桌面/网关常规通道大小写不敏感，此处敏感）
+	if m, ok := body["model"].(string); ok {
+		body["model"] = strings.ToLower(m)
+	}
+	// 桌面端 transform 语义：最后一条非 system 消息的最后一个 block 打 ephemeral 缓存标
+	if msgs, ok := body["messages"].([]interface{}); ok {
+		for i := len(msgs) - 1; i >= 0; i-- {
+			mm, ok := msgs[i].(map[string]interface{})
+			if !ok || mm["role"] == "system" {
+				continue
+			}
+			if blocks, ok := mm["content"].([]interface{}); ok && len(blocks) > 0 {
+				if last, ok := blocks[len(blocks)-1].(map[string]interface{}); ok {
+					last["cache_control"] = map[string]interface{}{"type": "ephemeral"}
+				}
+			} else if s, ok := mm["content"].(string); ok {
+				mm["content"] = []interface{}{map[string]interface{}{
+					"type": "text", "text": s,
+					"cache_control": map[string]interface{}{"type": "ephemeral"},
+				}}
+			}
+			break
+		}
+	}
 	if err := validateMessagesBody(body); err != nil {
 		writeAPIError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	payload, _ := json.Marshal(body)
+	// 上游闲时端点只接受流式调用（3001 parameter error on stream:false）：
+	// 一律强制 stream=true，非流式客户端由网关聚合 SSE 后返回完整 message
 	clientStream, _ := body["stream"].(bool)
+	body["stream"] = true
+	payload, _ := json.Marshal(body)
 
 	z.runOffPeak(w, r, offPeakRunOpts{
 		payload:      payload,
@@ -264,20 +291,30 @@ type offPeakRunOpts struct {
 	maxWaitSec   int
 }
 
-// runOffPeak 选号并执行闲时桥接；跨账号重试语义与 relay 一致
+// runOffPeak 选号并执行闲时桥接。闲时是独立免费额度桶（billing 耗尽仍可取票，
+// 见 /api/offpeak/availability），因此选号只要求启用 + JWT，不做 exhausted/cooling 门禁。
 func (z *ZCodeAPI) runOffPeak(w http.ResponseWriter, r *http.Request, opts offPeakRunOpts) {
 	tickets := offPeakTickets{z: z}
+	accounts, err := z.db.ListAccounts("")
+	if err != nil {
+		log.Printf("[async] list accounts: %v", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]interface{}{
+			"error": map[string]string{"message": "账号查询失败", "type": "no_available_account"},
+		})
+		return
+	}
 	tried := map[int64]bool{}
+	attempts := 0
 	var reasons []string
-	for attempt := 0; attempt < maxAccountAttempts; attempt++ {
-		a := z.pool.Select("zai", opts.group, tried)
-		if a == nil {
+	for _, a := range accounts {
+		if attempts >= maxAccountAttempts {
 			break
 		}
-		tried[a.ID] = true
-		if a.ZCodeJWT == "" {
+		if !a.Enabled || a.Provider != "zai" || a.ZCodeJWT == "" || tried[a.ID] {
 			continue
 		}
+		tried[a.ID] = true
+		attempts++
 		if z.offPeakBridge(w, r, a, tickets, opts) == outcomeWritten {
 			return
 		}
@@ -338,7 +375,19 @@ func (z *ZCodeAPI) offPeakBridge(w http.ResponseWriter, r *http.Request, a *Acco
 		settled[ticketID] = true
 		go tickets.settle(a, ticketID)
 	}
+	// settleCur 关闭"当前"票（闭包捕获变量，随 retake 更新）。
+	// 只在终态路径调用：失败 / 放弃 / 客户端断开 / 响应完成——绝不取票即关。
+	var (
+		ticket *offTicket
+		err    error
+	)
+	settleCur := func() {
+		if ticket != nil {
+			settleOnce(ticket.ID)
+		}
+	}
 	fail := func(status int, msg string) relayOutcome {
+		settleCur()
 		a.LastError = truncate(msg, 180)
 		log.Printf("[async] account %s bridge failed: %s", a.DisplayNameOrEmail(), msg)
 		if opts.clientStream {
@@ -359,28 +408,28 @@ func (z *ZCodeAPI) offPeakBridge(w http.ResponseWriter, r *http.Request, a *Acco
 			fail(http.StatusServiceUnavailable, why+"；闲时排队总时长已超限")
 			return nil, false
 		}
+		settleCur() // 旧票已被回收/过期，显式关掉
 		next, err := tickets.take(a, uuid.NewString())
 		if err != nil {
 			fail(http.StatusBadGateway, why+"；重新取票失败: "+err.Error())
 			return nil, false
 		}
-		settleOnce(next.ID)
 		log.Printf("[async] account %s retake #%d: %s… (%s)", a.DisplayNameOrEmail(), attempt+1, safePrefixLog(next.ID, 8), next.State)
 		return next, true
 	}
 
-	ticket, err := tickets.take(a, uuid.NewString())
+	ticket, err = tickets.take(a, uuid.NewString())
 	if err != nil {
 		return fail(http.StatusBadGateway, "取票失败: "+err.Error())
 	}
-	settleOnce(ticket.ID)
 	log.Printf("[async] account %s took ticket %s… state=%s pos=%d", a.DisplayNameOrEmail(), safePrefixLog(ticket.ID, 8), ticket.State, ticket.Position)
 
 	for attempt := 0; ; attempt++ {
 		// WAIT：票未就绪时轮询 + 保活
 		for !offPeakStateReady(ticket.State) && !offPeakStateTerminal(ticket.State) {
 			if ctx.Err() != nil {
-				return outcomeUpstreamError // 对端已断开；票由 settleOnce 兜底
+				settleCur() // 对端已断开，放弃当前票
+				return outcomeUpstreamError
 			}
 			if !hardDeadline.IsZero() && time.Now().After(hardDeadline) {
 				return fail(http.StatusServiceUnavailable, "闲时排队超时，请稍后重试或改用 /v1/messages")
@@ -390,6 +439,7 @@ func (z *ZCodeAPI) offPeakBridge(w http.ResponseWriter, r *http.Request, a *Acco
 				sleep = time.Duration(ticket.NextPollSec) * time.Second
 			}
 			if !offPeakWait(ctx, sleep, keepalive, func() { fmt.Fprint(w, ": keepalive\n\n"); flushWriter(w) }, opts.clientStream) {
+				settleCur()
 				return outcomeUpstreamError
 			}
 			st, err := tickets.status(a, ticket.ID)
@@ -416,7 +466,11 @@ func (z *ZCodeAPI) offPeakBridge(w http.ResponseWriter, r *http.Request, a *Acco
 			ticket = next
 			continue
 		}
-		return z.offPeakForward(w, r, a, ticket, opts)
+		out := z.offPeakForward(w, r, a, ticket, opts)
+		if out == outcomeWritten {
+			settleCur() // 响应已写回（含终态错误帧）；票已消费，幂等关票
+		}
+		return out
 	}
 }
 
@@ -465,12 +519,23 @@ func offPeakWait(ctx context.Context, sleep, keepalive time.Duration, emitKeepal
 // offPeakForward READY → 带票调用上游闲时消息端点并透传响应（协议两侧同为 Anthropic）
 func (z *ZCodeAPI) offPeakForward(w http.ResponseWriter, r *http.Request, a *Account, ticket *offTicket, opts offPeakRunOpts) relayOutcome {
 	start := time.Now()
-	var reqBody struct {
-		Stream bool `json:"stream"`
-	}
-	json.Unmarshal(opts.payload, &reqBody)
 
-	req, err := http.NewRequestWithContext(r.Context(), "POST", offPeakMessagesURL, bytes.NewReader(opts.payload))
+	// metadata.user_id：桌面端所有 Anthropic 调用都携带（JSON 字符串形式的
+	// {device_id, account_uuid, session_id}），off-peak 端点对其做参数校验
+	bodyBytes := opts.payload
+	var m map[string]interface{}
+	if json.Unmarshal(bodyBytes, &m) == nil && m != nil {
+		if _, has := m["metadata"]; !has {
+			m["metadata"] = map[string]interface{}{
+				"user_id": fmt.Sprintf(`{"device_id":%q,"account_uuid":"","session_id":""}`, a.DeviceMid),
+			}
+			if raw, merr := json.Marshal(m); merr == nil {
+				bodyBytes = raw
+			}
+		}
+	}
+
+	req, err := http.NewRequestWithContext(r.Context(), "POST", offPeakMessagesURL, bytes.NewReader(bodyBytes))
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]interface{}{
 			"error": map[string]string{"message": "上游请求构造失败", "type": "async_error"},
@@ -482,15 +547,12 @@ func (z *ZCodeAPI) offPeakForward(w http.ResponseWriter, r *http.Request, a *Acc
 		req.Header.Set(k, v)
 	}
 	req.Header.Set("Authorization", "Bearer "+a.ZCodeJWT)
+	req.Header.Set("x-coding-plan-api-key", a.APIKey)
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("anthropic-version", anthropicVersionH)
 	req.Header.Set("X-ZCode-Agent", "glm")
 	req.Header.Set("X-Off-Peak-Ticket-ID", ticket.ID)
-	if reqBody.Stream {
-		req.Header.Set("Accept", "text/event-stream")
-	} else {
-		req.Header.Set("Accept", "application/json")
-	}
+	req.Header.Set("Accept", "text/event-stream")
 
 	client := ClientForURL(z.egress.ProxyURLForAccount(a), offPeakMessagesURL, 0)
 	resp, err := client.Do(req)
@@ -527,7 +589,7 @@ func (z *ZCodeAPI) offPeakForward(w http.ResponseWriter, r *http.Request, a *Acc
 
 	z.pool.MarkUsed(a)
 
-	if reqBody.Stream {
+	if opts.clientStream {
 		sniff := newUsageSniffReader(resp.Body)
 		flushWriter(w)
 		buf := make([]byte, 32<<10)
@@ -547,23 +609,166 @@ func (z *ZCodeAPI) offPeakForward(w http.ResponseWriter, r *http.Request, a *Acc
 		z.recordUsage(a, r, opts.payload, resp.StatusCode, start, 0, sniff.usage(), opts.clientStream)
 		return outcomeWritten
 	}
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 64<<20))
-	if err != nil {
-		msg := "闲时通道响应读取失败: " + truncate(err.Error(), 160)
-		if opts.clientStream {
-			writeSSEErrorEvent(w, msg)
-		} else {
-			writeJSON(w, http.StatusBadGateway, map[string]interface{}{
-				"error": map[string]string{"message": msg, "type": "api_error"},
-			})
-		}
+	// 非流式客户端：上游强制流式返回，网关聚合成完整 Anthropic message
+	aggregated, usage, aerr := aggregateAnthropicStream(resp.Body)
+	if aerr != nil {
+		msg := "闲时通道响应聚合失败: " + truncate(aerr.Error(), 200)
+		writeJSON(w, http.StatusBadGateway, map[string]interface{}{
+			"error": map[string]string{"message": msg, "type": "api_error"},
+		})
 		return outcomeWritten
 	}
-	z.recordUsage(a, r, opts.payload, resp.StatusCode, start, 0, parseAnthropicUsageJSON(body), opts.clientStream)
-	w.Header().Set("Content-Type", firstNonEmpty(resp.Header.Get("Content-Type"), "application/json"))
+	z.recordUsage(a, r, opts.payload, resp.StatusCode, start, 0, usage, false)
+	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(resp.StatusCode)
-	w.Write(body)
+	w.Write(aggregated)
 	return outcomeWritten
+}
+
+// ---- SSE 聚合（非流式客户端）----
+
+// anthropicAgg 将上游 Anthropic SSE 流聚合为一条完整 message JSON
+type anthropicAgg struct {
+	id, model  string
+	blocks     []map[string]interface{}
+	stopReason string
+	in, out    int
+	toolJSON   map[int]*strings.Builder
+}
+
+func aggregateAnthropicStream(r io.Reader) ([]byte, *StreamUsage, error) {
+	p := &sseParser{}
+	agg := &anthropicAgg{toolJSON: map[int]*strings.Builder{}}
+	onEvent := func(ev sseEvent) {
+		switch ev.Event {
+		case "message_start":
+			if msg, ok := ev.Data["message"].(map[string]interface{}); ok {
+				agg.id, _ = msg["id"].(string)
+				agg.model, _ = msg["model"].(string)
+				if u, ok := msg["usage"].(map[string]interface{}); ok {
+					if n := toInt(u["input_tokens"]); n > agg.in {
+						agg.in = n
+					}
+				}
+			}
+		case "content_block_start":
+			idx := toInt(ev.Data["index"])
+			blk, _ := ev.Data["content_block"].(map[string]interface{})
+			if blk == nil {
+				return
+			}
+			nb := map[string]interface{}{"type": blk["type"]}
+			switch blk["type"] {
+			case "text":
+				nb["text"] = ""
+			case "thinking":
+				nb["thinking"] = ""
+			case "tool_use":
+				nb["id"] = blk["id"]
+				nb["name"] = blk["name"]
+				nb["input"] = map[string]interface{}{}
+				agg.toolJSON[idx] = &strings.Builder{}
+			}
+			for idx >= len(agg.blocks) {
+				agg.blocks = append(agg.blocks, nil)
+			}
+			agg.blocks[idx] = nb
+		case "content_block_delta":
+			idx := toInt(ev.Data["index"])
+			delta, _ := ev.Data["delta"].(map[string]interface{})
+			if delta == nil || idx >= len(agg.blocks) || agg.blocks[idx] == nil {
+				return
+			}
+			switch delta["type"] {
+			case "text_delta":
+				if s, ok := delta["text"].(string); ok {
+					agg.blocks[idx]["text"] = agg.blocks[idx]["text"].(string) + s
+				}
+			case "thinking_delta":
+				if s, ok := delta["thinking"].(string); ok {
+					agg.blocks[idx]["thinking"] = agg.blocks[idx]["thinking"].(string) + s
+				}
+			case "input_json_delta":
+				if b, ok := agg.toolJSON[idx]; ok {
+					if s, ok := delta["partial_json"].(string); ok {
+						b.WriteString(s)
+					}
+				}
+			}
+		case "content_block_stop":
+			idx := toInt(ev.Data["index"])
+			if b, ok := agg.toolJSON[idx]; ok {
+				var parsed interface{}
+				if err := json.Unmarshal([]byte(b.String()), &parsed); err == nil {
+					agg.blocks[idx]["input"] = parsed
+				}
+				delete(agg.toolJSON, idx)
+			}
+		case "message_delta":
+			if u, ok := ev.Data["usage"].(map[string]interface{}); ok {
+				if v, ok := u["output_tokens"]; ok {
+					agg.out = toInt(v)
+				}
+				if v, ok := u["input_tokens"]; ok {
+					if n := toInt(v); n > agg.in {
+						agg.in = n
+					}
+				}
+			}
+			if d, ok := ev.Data["delta"].(map[string]interface{}); ok {
+				if sr, ok := d["stop_reason"].(string); ok && sr != "" {
+					agg.stopReason = sr
+				}
+			}
+		case "error":
+			msg := "upstream stream error"
+			if e, ok := ev.Data["error"].(map[string]interface{}); ok {
+				if m, ok := e["message"].(string); ok && m != "" {
+					msg = m
+				}
+			}
+			agg.stopReason = "ERR:" + msg
+		}
+	}
+	buf := make([]byte, 32<<10)
+	for {
+		n, rerr := r.Read(buf)
+		if n > 0 {
+			p.feed(buf[:n], onEvent)
+		}
+		if rerr != nil {
+			if rerr.Error() != "EOF" {
+				return nil, nil, rerr
+			}
+			break
+		}
+	}
+	p.flush(onEvent)
+	content := make([]interface{}, 0, len(agg.blocks))
+	for _, b := range agg.blocks {
+		if b != nil {
+			content = append(content, b)
+		}
+	}
+	if strings.HasPrefix(agg.stopReason, "ERR:") {
+		return nil, nil, fmt.Errorf("%s", strings.TrimPrefix(agg.stopReason, "ERR:"))
+	}
+	sr := agg.stopReason
+	if sr == "" {
+		sr = "end_turn"
+	}
+	out := map[string]interface{}{
+		"id": agg.id, "type": "message", "role": "assistant", "model": agg.model,
+		"content":       content,
+		"stop_reason":   sr,
+		"stop_sequence": nil,
+		"usage":         map[string]interface{}{"input_tokens": agg.in, "output_tokens": agg.out},
+	}
+	raw, err := json.Marshal(out)
+	if err != nil {
+		return nil, nil, err
+	}
+	return raw, &StreamUsage{InputTokens: agg.in, OutputTokens: agg.out}, nil
 }
 
 // ---- SSE 透传期间的 usage 嗅探 ----

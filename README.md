@@ -288,6 +288,7 @@ go vet .
 - 账号包导出使用 PBKDF2 60 万轮；旧 12 万轮加密包仅支持导入（自动回退），不再生成。
 - 库内凭证已静态加密（`vault1:`），密钥默认绑定本机（平台/home/用户名）；跨机器迁移 `data/` 时请同设 `ZCODE_PROXY_VAULT_SECRET`。
 - `/async/v1/messages` 闲时通道为一次性应答、无会话记忆（上游语义）；多轮对话请在请求内携带历史。
+- 闲时通道（off-peak）：取票/排队/就绪/转发全链路已打通，但上游对消息转发返回 `3001 parameter error`（已对齐 stream 强制、x-coding-plan-api-key、metadata.user_id、小写模型、cache_control 等全部已知协议面）；疑似上游对账号状态或新版本有额外校验，待上游行为明确。
 
 ## 仓库与数据边界
 
