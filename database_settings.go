@@ -42,7 +42,7 @@ func (db *DB) AllSettings() (map[string]string, error) {
 
 // ---- 认证相关设置 ----
 
-func (db *DB) GetPasswordHash() (string, error) { return db.GetSetting("password_hash") }
+func (db *DB) GetPasswordHash() (string, error)  { return db.GetSetting("password_hash") }
 func (db *DB) SetPasswordHash(hash string) error { return db.SetSetting("password_hash", hash) }
 
 func (db *DB) IsDefaultPassword() (bool, error) {

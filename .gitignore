@@ -30,3 +30,4 @@ run.sh
 .secrets.env
 zcode-proxy
 connect-zcode.sh
+.agents/

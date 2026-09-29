@@ -2,6 +2,8 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
+	"io"
 	"net/http"
 	"strconv"
 	"strings"
@@ -204,7 +206,11 @@ func (s *APIServer) handleImportLocal(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		Group string `json:"group"`
 	}
-	json.NewDecoder(r.Body).Decode(&body)
+	// body 可选（group 默认空），但必须是合法 JSON：截断/畸形请求不得静默按空值导入
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil && err != io.EOF {
+		writeAPIError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
 	a, err := s.acctMgr.ImportFromLocalClient(body.Group)
 	if err != nil {
 		writeAPIError(w, http.StatusBadRequest, err.Error())
@@ -243,12 +249,20 @@ func (s *APIServer) handleExportBundle(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
+	// 导出会带走全部凭据。独立限速键 ip|export（与登录的 ip|user 分开计数），
+	// 同样走指数退避：stolen session 无法无节流爆破管理员口令
+	rateKey := clientIP(r) + "|export"
+	if wait := s.auth.checkLoginRate(rateKey); wait > 0 {
+		writeAPIError(w, http.StatusTooManyRequests,
+			fmt.Sprintf("尝试过于频繁，请 %d 秒后再试", int(wait.Seconds())+1))
+		return
+	}
 	if !s.auth.verifyPassword(body.AdminPassword) {
-		// 与登录共用限速器： stolen session 无法无节流爆破管理员口令
-		s.auth.recordLoginFail(clientIP(r))
+		s.auth.recordLoginFail(rateKey)
 		writeAPIError(w, http.StatusUnauthorized, "管理员密码验证失败，请输入当前管理员密码")
 		return
 	}
+	s.auth.clearLoginFail(rateKey)
 	bundle, err := s.acctMgr.ExportBundle(body.Password, body.IDs)
 	if err != nil {
 		writeAPIError(w, http.StatusBadRequest, err.Error())
@@ -281,7 +295,11 @@ func (s *APIServer) handleOAuthStart(w http.ResponseWriter, r *http.Request) {
 		Poll   bool   `json:"poll"` // 服务端中介轮询登录（免回调，免注册 redirect_uri）
 		Group  string `json:"group"`
 	}
-	json.NewDecoder(r.Body).Decode(&body)
+	// body 可选，但畸形 JSON 会把 poll 请求静默变成回调流程——必须报错
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil && err != io.EOF {
+		writeAPIError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
 	if body.Poll {
 		flow, authURL, err := s.oauth.StartPollLogin(body.Group)
 		if err != nil {
@@ -337,18 +355,24 @@ func (s *APIServer) handleOffpeakAvailability(w http.ResponseWriter, r *http.Req
 		return
 	}
 	tickets := offPeakTickets{z: s.zapi}
+	lastErr := ""
 	for _, a := range accounts {
 		if !a.Enabled || a.ZCodeJWT == "" || a.Provider != "zai" {
 			continue
 		}
-		canTake, nextTakeAt, err := tickets.Availability(a)
+		canTake, nextTakeAt, err := tickets.Availability(r.Context(), a)
 		if err != nil {
-			writeJSON(w, http.StatusOK, map[string]interface{}{"ok": false, "error": err.Error()})
-			return
+			// 单个账号（如 JWT 过期）不应让整个队列显示不可用：继续探测下一个
+			lastErr = a.DisplayNameOrEmail() + ": " + err.Error()
+			continue
 		}
 		writeJSON(w, http.StatusOK, map[string]interface{}{
 			"ok": true, "can_take": canTake, "next_take_at": nextTakeAt, "account": a.DisplayNameOrEmail(),
 		})
+		return
+	}
+	if lastErr != "" {
+		writeJSON(w, http.StatusOK, map[string]interface{}{"ok": false, "error": "所有账号探测失败（" + truncate(lastErr, 300) + "）"})
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{"ok": false, "error": "无可用 JWT 账号"})
@@ -537,7 +561,10 @@ func (s *APIServer) handleSwitchBack(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		KillClient bool `json:"kill_client"`
 	}
-	json.NewDecoder(r.Body).Decode(&body)
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil && err != io.EOF {
+		writeAPIError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
 	if err := s.acctMgr.SwitchBackToLocal(id, body.KillClient); err != nil {
 		writeAPIError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -652,7 +679,15 @@ func (s *APIServer) handleRunPlan(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := s.scheduler.RunPlanNow(id); err != nil {
-		writeAPIError(w, http.StatusBadRequest, err.Error())
+		msg := err.Error()
+		switch {
+		case strings.Contains(msg, "不存在"):
+			writeAPIError(w, http.StatusNotFound, msg)
+		case strings.Contains(msg, "正在执行"):
+			writeAPIError(w, http.StatusConflict, msg)
+		default:
+			writeAPIError(w, http.StatusBadRequest, msg)
+		}
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{"success": true, "message": "计划已开始执行"})
@@ -741,6 +776,10 @@ func (s *APIServer) handlePutSettings(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	updated := []string{}
+	// 两阶段：先整体校验再落库。map 迭代顺序随机，边验边写会在批次含非法值时
+	// 非确定性地写入一半设置却返回 400
+	type settingKV struct{ k, v string }
+	pending := []settingKV{}
 	for k, v := range body {
 		if !settingsWhitelist[k] {
 			continue
@@ -770,11 +809,14 @@ func (s *APIServer) handlePutSettings(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		}
-		if err := s.db.SetSetting(k, v); err != nil {
+		pending = append(pending, settingKV{k, v})
+	}
+	for _, kv := range pending {
+		if err := s.db.SetSetting(kv.k, kv.v); err != nil {
 			writeAPIError(w, http.StatusInternalServerError, err.Error())
 			return
 		}
-		updated = append(updated, k)
+		updated = append(updated, kv.k)
 	}
 	// 指纹/代理变更：失效并关闭缓存的上游客户端连接池
 	for _, k := range updated {
@@ -894,7 +936,10 @@ func (s *APIServer) handleTestProxyURL(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		URL string `json:"url"`
 	}
-	json.NewDecoder(r.Body).Decode(&body)
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil && err != io.EOF {
+		writeAPIError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
 	ip, elapsed, err := TestProxyExitIP(strings.TrimSpace(body.URL))
 	resp := map[string]interface{}{
 		"ok": err == nil, "exit_ip": ip, "elapsed_ms": elapsed.Milliseconds(),
@@ -931,7 +976,10 @@ func (s *APIServer) handleCaptchaSolve(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		AccountID int64 `json:"account_id"`
 	}
-	json.NewDecoder(r.Body).Decode(&body)
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil && err != io.EOF {
+		writeAPIError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
 	var a *Account
 	if body.AccountID > 0 {
 		a, _ = s.db.GetAccount(body.AccountID)

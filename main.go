@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"embed"
 	"flag"
 	"fmt"
@@ -8,8 +9,10 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -169,10 +172,35 @@ func main() {
 	// 显式 Server：ReadHeaderTimeout 防 Slowloris；SSE 决定不设 WriteTimeout
 	srv := &http.Server{
 		Addr:              listenAddr,
-		Handler:           auth.Middleware(mux),
+		Handler:           limitBody(auth.Middleware(mux)),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
-	if err := srv.ListenAndServe(); err != nil {
-		log.Fatalf("server error: %v", err)
+
+	// 优雅停机：等待 SIGINT/SIGTERM，给在途请求（含 SSE）一个有界排水窗口
+	go func() {
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("server error: %v", err)
+		}
+	}()
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
+	<-stop
+	log.Printf("[main] shutting down...")
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := srv.Shutdown(shutdownCtx); err != nil {
+		log.Printf("[main] shutdown: %v", err)
 	}
+}
+
+// limitBody 全局请求体上限：管理 API 与登录接口此前无大小限制，
+// 超大 JSON 会在 Decode 时整体载入内存（未认证 /api/login 即可触发）。
+// /v1 转发路径另有 8MB 的 readJSONBody 上限，互不影响。
+func limitBody(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Body != nil {
+			r.Body = http.MaxBytesReader(w, r.Body, 32<<20)
+		}
+		next.ServeHTTP(w, r)
+	})
 }

@@ -337,15 +337,18 @@ func matchField(field string, value, min, max int) bool {
 		return true
 	}
 	if strings.HasPrefix(field, "*/") {
+		// 与 matchStep 同一锚点语义：*/n 从字段下限起算（日域 1,1+n,1+2n…），
+		// 而非 value%n==0（会得到 5,10,15… 且月末不齐）
 		step, err := strconv.Atoi(field[2:])
 		if err != nil || step <= 0 {
 			return false
 		}
-		return value%step == 0
+		return (value-min)%step == 0
 	}
 	if strings.Contains(field, ",") {
+		// 列表内每部分递归回 matchField：支持 "1-5,20"、"*/3,15" 等混合写法
 		for _, p := range strings.Split(field, ",") {
-			if matchSinglePart(p, value) {
+			if matchField(strings.TrimSpace(p), value, min, max) {
 				return true
 			}
 		}

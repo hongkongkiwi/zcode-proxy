@@ -264,11 +264,11 @@ func writeProtocolResponse(w http.ResponseWriter, proto protocol, status int, co
 	// OpenAI / Responses：从 Anthropic JSON 提取文本/思考/工具调用
 	var resp struct {
 		Content []struct {
-			Type     string `json:"type"`
-			Text     string `json:"text"`
-			Thinking string `json:"thinking"`
-			ID       string `json:"id"`
-			Name     string `json:"name"`
+			Type     string          `json:"type"`
+			Text     string          `json:"text"`
+			Thinking string          `json:"thinking"`
+			ID       string          `json:"id"`
+			Name     string          `json:"name"`
 			Input    json.RawMessage `json:"input"`
 		} `json:"content"`
 		StopReason string `json:"stop_reason"`
@@ -437,6 +437,8 @@ func (z *ZCodeAPI) streamOpenAI(w http.ResponseWriter, flusher http.Flusher, res
 	var texts, thinks []string
 	first := true
 	toolIndices := map[int]int{}
+	toolArgsSeen := map[int]bool{}    // 该工具块是否已收到过 input_json_delta
+	toolStartArgs := map[int]string{} // content_block_start 自带的完整 input（无 delta 时补发用）
 	nextToolIndex := 0
 	ttft := 0
 
@@ -469,6 +471,11 @@ func (z *ZCodeAPI) streamOpenAI(w http.ResponseWriter, flusher http.Flusher, res
 				toolIdx := nextToolIndex
 				nextToolIndex++
 				toolIndices[srcIdx] = toolIdx
+				// 上游偶尔把完整参数放在 start 而不发任何 delta：先留存，
+				// stop 时补发，避免客户端累计的 arguments 停留在 ""
+				if raw, merr := json.Marshal(block["input"]); merr == nil && len(raw) > 0 && string(raw) != "null" {
+					toolStartArgs[srcIdx] = string(raw)
+				}
 				if first {
 					first = false
 					writeChunk(map[string]interface{}{"role": "assistant", "content": ""}, nil, nil)
@@ -507,12 +514,30 @@ func (z *ZCodeAPI) streamOpenAI(w http.ResponseWriter, flusher http.Flusher, res
 				writeChunk(map[string]interface{}{"reasoning_content": t}, nil, nil)
 			case "input_json_delta":
 				srcIdx := toInt(ev.Data["index"])
+				toolArgsSeen[srcIdx] = true
 				toolIdx := toolIndices[srcIdx]
 				pj, _ := delta["partial_json"].(string)
 				writeChunk(map[string]interface{}{
 					"tool_calls": []map[string]interface{}{{
-						"index": toolIdx,
+						"index":    toolIdx,
 						"function": map[string]interface{}{"arguments": pj},
+					}},
+				}, nil, nil)
+			}
+		case "content_block_stop":
+			// 无任何 delta 的工具块：补发 start 携带的完整 input（无则 "{}"）终结参数，
+			// 否则客户端累计的 arguments 停留在 ""，json.loads 会炸
+			srcIdx := toInt(ev.Data["index"])
+			if toolIdx, ok := toolIndices[srcIdx]; ok && !toolArgsSeen[srcIdx] {
+				toolArgsSeen[srcIdx] = true
+				args := toolStartArgs[srcIdx]
+				if args == "" {
+					args = "{}"
+				}
+				writeChunk(map[string]interface{}{
+					"tool_calls": []map[string]interface{}{{
+						"index":    toolIdx,
+						"function": map[string]interface{}{"arguments": args},
 					}},
 				}, nil, nil)
 			}
@@ -601,6 +626,7 @@ func (z *ZCodeAPI) streamResponses(w http.ResponseWriter, flusher http.Flusher, 
 		callID      string
 		name        string
 		jsonBuf     string
+		startArgs   string // content_block_start 自带的完整 input（无 delta 时用作终结参数）
 		outputIndex int
 		texts       []string
 	}
@@ -662,6 +688,46 @@ func (z *ZCodeAPI) streamResponses(w http.ResponseWriter, flusher http.Flusher, 
 		delete(blocks, idx)
 	}
 
+	openReasoningEvents := func(idx int) {
+		blk := blocks[idx]
+		blk.itemID = "rs_" + randomHex(8)
+		writeEvent("response.output_item.added", map[string]interface{}{
+			"output_index": blk.outputIndex,
+			"item": map[string]interface{}{
+				"id": blk.itemID, "type": "reasoning", "summary": []interface{}{},
+			},
+		})
+		writeEvent("response.reasoning_summary_part.added", map[string]interface{}{
+			"item_id": blk.itemID, "output_index": blk.outputIndex, "summary_index": 0,
+			"part": map[string]interface{}{"type": "summary_text", "text": ""},
+		})
+	}
+
+	closeReasoningEvents := func(idx int) {
+		blk, ok := blocks[idx]
+		if !ok || blk.itemID == "" || blk.kind != "thinking" {
+			return
+		}
+		text := strings.Join(blk.texts, "")
+		part := map[string]interface{}{"type": "summary_text", "text": text}
+		writeEvent("response.reasoning_summary_text.done", map[string]interface{}{
+			"item_id": blk.itemID, "output_index": blk.outputIndex, "summary_index": 0, "text": text,
+		})
+		writeEvent("response.reasoning_summary_part.done", map[string]interface{}{
+			"item_id": blk.itemID, "output_index": blk.outputIndex, "summary_index": 0, "part": part,
+		})
+		item := map[string]interface{}{
+			"id": blk.itemID, "type": "reasoning",
+			"summary": []map[string]interface{}{part},
+		}
+		writeEvent("response.output_item.done", map[string]interface{}{
+			"output_index": blk.outputIndex,
+			"item":         item,
+		})
+		outputItems = append(outputItems, item)
+		delete(blocks, idx)
+	}
+
 	openToolEvents := func(idx int, block map[string]interface{}) {
 		blk := blocks[idx]
 		callID, _ := block["id"].(string)
@@ -673,6 +739,10 @@ func (z *ZCodeAPI) streamResponses(w http.ResponseWriter, flusher http.Flusher, 
 		blk.name, _ = block["name"].(string)
 		if blk.name == "" {
 			blk.name = "tool"
+		}
+		// start 自带的完整参数：无 input_json_delta 时由 closeToolEvents 补发
+		if raw, merr := json.Marshal(block["input"]); merr == nil && len(raw) > 0 && string(raw) != "null" {
+			blk.startArgs = string(raw)
 		}
 		blk.outputIndex = nextOutputIndex
 		nextOutputIndex++
@@ -691,6 +761,9 @@ func (z *ZCodeAPI) streamResponses(w http.ResponseWriter, flusher http.Flusher, 
 			return
 		}
 		arguments := blk.jsonBuf
+		if arguments == "" {
+			arguments = blk.startArgs
+		}
 		if arguments == "" {
 			arguments = "{}"
 		}
@@ -760,6 +833,8 @@ func (z *ZCodeAPI) streamResponses(w http.ResponseWriter, flusher http.Flusher, 
 				closeToolEvents(idx)
 			} else if blk.kind == "text" {
 				closeMessageEvents(idx)
+			} else if blk.kind == "thinking" {
+				closeReasoningEvents(idx)
 			}
 		case "content_block_delta":
 			delta, _ := ev.Data["delta"].(map[string]interface{})
@@ -773,8 +848,25 @@ func (z *ZCodeAPI) streamResponses(w http.ResponseWriter, flusher http.Flusher, 
 			}
 			switch delta["type"] {
 			case "thinking_delta":
-				if t, ok := delta["thinking"].(string); ok {
+				if t, ok := delta["thinking"].(string); ok && t != "" {
 					thinks = append(thinks, t)
+					if blk.kind == "" {
+						blk.kind = "thinking"
+					}
+					if blk.kind != "thinking" {
+						return
+					}
+					// 思考作为 reasoning 输出项流式发出：客户端事件序列可重放出
+					// 与 response.completed.output 一致的状态
+					if blk.itemID == "" {
+						blk.outputIndex = nextOutputIndex
+						nextOutputIndex++
+						openReasoningEvents(idx)
+					}
+					blk.texts = append(blk.texts, t)
+					writeEvent("response.reasoning_summary_text.delta", map[string]interface{}{
+						"item_id": blk.itemID, "output_index": blk.outputIndex, "summary_index": 0, "delta": t,
+					})
 				}
 			case "input_json_delta":
 				if blk.kind == "tool" {
@@ -786,6 +878,10 @@ func (z *ZCodeAPI) streamResponses(w http.ResponseWriter, flusher http.Flusher, 
 				}
 			case "text_delta":
 				t, _ := delta["text"].(string)
+				if t == "" {
+					// 空 delta 不得开启一个空 message 项（会与补空响应的合成项重复）
+					return
+				}
 				if blk.kind == "" {
 					blk.kind = "text"
 				}
@@ -829,6 +925,8 @@ func (z *ZCodeAPI) streamResponses(w http.ResponseWriter, flusher http.Flusher, 
 			closeToolEvents(idx)
 		} else if blk.kind == "text" && blk.itemID != "" {
 			closeMessageEvents(idx)
+		} else if blk.kind == "thinking" && blk.itemID != "" {
+			closeReasoningEvents(idx)
 		}
 	}
 
@@ -933,10 +1031,18 @@ func responsesResponse(model, responseID, text, thinking string, usage *StreamUs
 }
 
 // responsesResponseWithItems 构造 Response 对象；items 为流式阶段已发出的最终输出项时
-// 直接复用（保留 msg_/fc_ ID 供客户端关联事件序列），仅补合成流中未出现的 reasoning 项
+// 直接复用（保留 msg_/fc_/rs_ ID 供客户端关联事件序列），仅当流中没有出现过
+// reasoning 项时才补合成（非流式聚合路径的 items 为 nil，走合成）
 func responsesResponseWithItems(model, responseID string, items []map[string]interface{}, text, thinking string, usage *StreamUsage) map[string]interface{} {
 	var output []map[string]interface{}
-	if thinking != "" {
+	hasReasoning := false
+	for _, it := range items {
+		if it["type"] == "reasoning" {
+			hasReasoning = true
+			break
+		}
+	}
+	if thinking != "" && !hasReasoning {
 		output = append(output, map[string]interface{}{
 			"id": "rs_" + randomHex(8), "type": "reasoning",
 			"summary": []map[string]interface{}{{"type": "summary_text", "text": thinking}},

@@ -13,10 +13,33 @@ import (
 // device_mid / creds_raw 用 COALESCE 保留旧值：
 // 新值为空时不会被后续导入清空（设备指纹与本地凭证快照不被抹掉）。
 func (db *DB) UpsertAccount(a *Account) (int64, error) {
-	// 凭证列静态加密（写入密文，内存结构保持明文供调用方继续使用）
-	encAccess, encRefresh, encJWT, encAPIKey := vaultEncrypt(a.AccessToken), vaultEncrypt(a.RefreshToken), vaultEncrypt(a.ZCodeJWT), vaultEncrypt(a.APIKey)
-	encUserInfo, encCredsRaw := vaultEncrypt(a.UserInfo), vaultEncrypt(a.CredsRaw)
-	res, err := db.conn.Exec(`
+	// 凭证列静态加密（写入密文，内存结构保持明文供调用方继续使用）；
+	// 任一列加密失败即中止写入——不得静默落明文
+	encAccess, err := vaultEncrypt(a.AccessToken)
+	if err != nil {
+		return 0, err
+	}
+	encRefresh, err := vaultEncrypt(a.RefreshToken)
+	if err != nil {
+		return 0, err
+	}
+	encJWT, err := vaultEncrypt(a.ZCodeJWT)
+	if err != nil {
+		return 0, err
+	}
+	encAPIKey, err := vaultEncrypt(a.APIKey)
+	if err != nil {
+		return 0, err
+	}
+	encUserInfo, err := vaultEncrypt(a.UserInfo)
+	if err != nil {
+		return 0, err
+	}
+	encCredsRaw, err := vaultEncrypt(a.CredsRaw)
+	if err != nil {
+		return 0, err
+	}
+	if _, err := db.conn.Exec(`
 		INSERT INTO accounts (
 			user_id, email, display_name, provider, auth_type,
 			access_token, refresh_token, zcode_jwt, api_key, user_info,
@@ -41,17 +64,15 @@ func (db *DB) UpsertAccount(a *Account) (int64, error) {
 			updated_at    = datetime('now','localtime')`,
 		a.UserID, a.Email, a.DisplayName, a.Provider, a.AuthType,
 		encAccess, encRefresh, encJWT, encAPIKey, encUserInfo,
-		a.DeviceMid, encCredsRaw, a.Status, boolInt(a.Enabled), a.AccountGroup, a.Remark)
-	if err != nil {
+		a.DeviceMid, encCredsRaw, a.Status, boolInt(a.Enabled), a.AccountGroup, a.Remark); err != nil {
 		return 0, err
 	}
-	// 取回真实 ID（插入取 LastInsertId，冲突更新按 user_id 查）
-	id, err := res.LastInsertId()
-	if err != nil || id == 0 {
-		row := db.conn.QueryRow(`SELECT id FROM accounts WHERE user_id = ?`, a.UserID)
-		if err := row.Scan(&id); err != nil {
-			return 0, err
-		}
+	// 冲突更新分支不会推进 last_insert_rowid，驱动返回的是连接上一次
+	// INSERT 的残留值——用它会给错误账户写额度/状态。按自然键回查真实 ID。
+	var id int64
+	row := db.conn.QueryRow(`SELECT id FROM accounts WHERE user_id = ?`, a.UserID)
+	if err := row.Scan(&id); err != nil {
+		return 0, err
 	}
 	return id, nil
 }
@@ -236,7 +257,27 @@ func (db *DB) UpdateAccountFields(id int64, group, remark string, enabled bool) 
 
 // UpdateAccountTokens 更新凭证字段（OAuth 刷新 / 手动编辑）；凭证列静态加密
 func (db *DB) UpdateAccountTokens(id int64, accessToken, refreshToken, zcodeJWT, apiKey, userInfo string) error {
-	_, err := db.conn.Exec(`
+	encAccess, err := vaultEncrypt(accessToken)
+	if err != nil {
+		return err
+	}
+	encRefresh, err := vaultEncrypt(refreshToken)
+	if err != nil {
+		return err
+	}
+	encJWT, err := vaultEncrypt(zcodeJWT)
+	if err != nil {
+		return err
+	}
+	encAPIKey, err := vaultEncrypt(apiKey)
+	if err != nil {
+		return err
+	}
+	encUserInfo, err := vaultEncrypt(userInfo)
+	if err != nil {
+		return err
+	}
+	_, err = db.conn.Exec(`
 		UPDATE accounts SET
 			access_token  = COALESCE(NULLIF(?,''), access_token),
 			refresh_token = COALESCE(NULLIF(?,''), refresh_token),
@@ -245,8 +286,7 @@ func (db *DB) UpdateAccountTokens(id int64, accessToken, refreshToken, zcodeJWT,
 			user_info     = COALESCE(NULLIF(?,''), user_info),
 			updated_at = datetime('now','localtime')
 		WHERE id = ?`,
-		vaultEncrypt(accessToken), vaultEncrypt(refreshToken), vaultEncrypt(zcodeJWT),
-		vaultEncrypt(apiKey), vaultEncrypt(userInfo), id)
+		encAccess, encRefresh, encJWT, encAPIKey, encUserInfo, id)
 	return err
 }
 

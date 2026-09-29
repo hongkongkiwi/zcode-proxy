@@ -56,8 +56,8 @@ type ClaimResult struct {
 	Message    string       `json:"message"`
 	PlanID     string       `json:"plan_id"`
 	PlanName   string       `json:"plan_name"`
-	NextAt     int64        `json:"next_at"`      // 1005 时下次可领时间 epoch 毫秒
-	ServerTime int64        `json:"server_time"`  // 官方 data.server_time（毫秒）
+	NextAt     int64        `json:"next_at"`     // 1005 时下次可领时间 epoch 毫秒
+	ServerTime int64        `json:"server_time"` // 官方 data.server_time（毫秒）
 	Plan       *ClaimedPlan `json:"plan,omitempty"`
 }
 
@@ -215,7 +215,7 @@ func formatUnits(n float64) string {
 
 func math_Round(x float64) float64 {
 	if x < 0 {
-		return -float64(int64(-x+0.5))
+		return -float64(int64(-x + 0.5))
 	}
 	return float64(int64(x + 0.5))
 }
@@ -328,22 +328,22 @@ func (z *ZCodeAPI) ReportActivation(a *Account) error {
 	client := ClientForURL(z.egress.ProxyURLForAccount(a), EventReportURL, 15*time.Second)
 	for _, element := range []string{"app_launch", "app_daily_active"} {
 		payload := map[string]interface{}{
-			"event_id":            uuid.NewString(),
-			"client_timezone":     clientTimezoneValue(),
-			"client_language":     zcodeLang,
-			"element_name":        element,
-			"event_region":        "app",
-			"event_type":          "view",
-			"event_text":          "",
-			"event_extra_detail":  map[string]interface{}{},
-			"user_id":             userID,
-			"screen_resolution":   screenResolution,
-			"app_version":         z.appVersion,
-			"device_os_category":  osCategoryValue(),
-			"device_os_version":   cachedOSVer,
-			"device_mid":          mid,
-			"mac_id":              "",
-			"marketing_params":    "{}",
+			"event_id":           uuid.NewString(),
+			"client_timezone":    clientTimezoneValue(),
+			"client_language":    zcodeLang,
+			"element_name":       element,
+			"event_region":       "app",
+			"event_type":         "view",
+			"event_text":         "",
+			"event_extra_detail": map[string]interface{}{},
+			"user_id":            userID,
+			"screen_resolution":  screenResolution,
+			"app_version":        z.appVersion,
+			"device_os_category": osCategoryValue(),
+			"device_os_version":  cachedOSVer,
+			"device_mid":         mid,
+			"mac_id":             "",
+			"marketing_params":   "{}",
 		}
 		body, _ := json.Marshal(payload)
 		req, err := http.NewRequest("POST", EventReportURL, bytes.NewReader(body))

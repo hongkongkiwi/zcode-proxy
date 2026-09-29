@@ -109,6 +109,28 @@ func (m *OAuthManager) StartLogin(manual bool, group string) (*OAuthFlow, string
 	return flow, authURL
 }
 
+// beginExchange 单次消费闸门：原子地检查状态并置为 exchanging。
+// ready/exchanging 状态拒绝——刷新结果页或重复提交会带着已被上游消费的
+// code 再次兑换，把已成功的登录翻转成 failed
+func (m *OAuthManager) beginExchange(f *OAuthFlow) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	switch f.Status {
+	case "ready":
+		return errFlowDone
+	case "exchanging":
+		return errFlowBusy
+	}
+	f.Status = "exchanging"
+	f.Message = "正在兑换 token…"
+	return nil
+}
+
+var (
+	errFlowDone = plainError("该登录流程已完成，请勿重复提交")
+	errFlowBusy = plainError("该登录流程正在兑换中，请稍候")
+)
+
 // HandleCallback 浏览器环回回调：捕获 code → 后台兑换 → 返回结果页
 func (m *OAuthManager) HandleCallback(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
@@ -128,6 +150,15 @@ func (m *OAuthManager) HandleCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if errParam != "" {
+		m.mu.Lock()
+		st := flow.Status
+		m.mu.Unlock()
+		if st == "ready" || st == "exchanging" {
+			// 重放/伪造的 error 回调不得翻转已成功或兑换中的流程
+			fmt.Fprint(w, `<html><body style="font-family:sans-serif;text-align:center;padding-top:80px">
+				<h2>ℹ️ 登录流程已在进行中或已完成</h2><p>请回到管理界面查看登录状态。</p></body></html>`)
+			return
+		}
 		m.finishFlow(flow, "", fmt.Sprintf("授权被拒绝: %s", firstNonEmpty(errDesc, errParam)))
 		fmt.Fprint(w, `<html><body style="font-family:sans-serif;text-align:center;padding-top:80px">
 			<h2>❌ 授权被拒绝</h2><p>`+escapeHTML(firstNonEmpty(errDesc, errParam))+`</p></body></html>`)
@@ -139,8 +170,22 @@ func (m *OAuthManager) HandleCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 单次消费：重放（如刷新结果页）按既有状态如实回显，不重复兑换
+	if err := m.beginExchange(flow); err != nil {
+		m.mu.Lock()
+		st, email := flow.Status, flow.Email
+		m.mu.Unlock()
+		if st == "ready" {
+			fmt.Fprint(w, `<html><body style="font-family:sans-serif;text-align:center;padding-top:80px">
+				<h2>✅ 授权已完成</h2><p>账号 `+escapeHTML(email)+` 已入库，请回到管理界面查看。</p>
+				<script>setTimeout(function(){window.close()},3000)</script></body></html>`)
+			return
+		}
+		fmt.Fprint(w, `<html><body style="font-family:sans-serif;text-align:center;padding-top:80px">
+			<h2>⏳ `+escapeHTML(err.Error())+`</h2><p>请回到管理界面查看登录状态。</p></body></html>`)
+		return
+	}
 	// 同步兑换：页面直接展示成功（含邮箱）或具体错误，避免"显示成功但后台静默失败"
-	m.setFlowStatus(flow, "exchanging", "正在兑换 token…")
 	log.Printf("[oauth] callback arrived: state=%s… code_len=%d", safePrefixLog(state, 8), len(code))
 	if err := m.completeFlow(flow, code); err != nil {
 		fmt.Fprint(w, `<html><body style="font-family:sans-serif;text-align:center;padding-top:80px">
@@ -178,7 +223,10 @@ func (m *OAuthManager) SubmitManual(state, raw string) error {
 	if code == "" {
 		return fmt.Errorf("未能从输入中提取授权码")
 	}
-	m.setFlowStatus(flow, "exchanging", "正在兑换 token…")
+	// 单次消费：已完成/进行中的流程拒绝重复兑换
+	if err := m.beginExchange(flow); err != nil {
+		return err
+	}
 	log.Printf("[oauth] manual submit: state=%s… code_len=%d", safePrefixLog(state, 8), len(code))
 	return m.completeFlow(flow, code)
 }
@@ -207,6 +255,7 @@ func (m *OAuthManager) FlowStatus(state string) *OAuthFlow {
 	return &cp
 }
 
+// setFlowStatus 更新流程状态与提示（poll 路径的中间态）
 func (m *OAuthManager) setFlowStatus(f *OAuthFlow, status, msg string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -250,6 +299,9 @@ func (m *OAuthManager) ingestTokens(flow *OAuthFlow, data map[string]interface{}
 	}
 	zai, _ := data["zai"].(map[string]interface{})
 	accessToken := jsonStr(zai, "access_token")
+	if accessToken == "" {
+		accessToken = jsonStr(zai, "accessToken") // 官方 ready 载荷两种拼写都可能出现
+	}
 	refreshToken := jsonStr(zai, "refresh_token")
 	user, _ := data["user"].(map[string]interface{})
 	if user == nil {

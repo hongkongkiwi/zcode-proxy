@@ -212,6 +212,11 @@ func openaiToAnthropic(body map[string]interface{}) (map[string]interface{}, err
 								"type": "base64", "media_type": mime, "data": data,
 							},
 						})
+					} else {
+						// 不支持的图片形态（http(s) URL、字符串形态、null/空 url）一律
+						// 显式报错：静默丢弃会让纯图片消息整体消失，模型看到的对话
+						// 与客户端发送的不一致
+						return nil, errString("image_url must be an object with a data: base64 URL; other image forms are not supported by the upstream")
 					}
 				}
 			}
@@ -265,11 +270,12 @@ func openaiToAnthropic(body map[string]interface{}) (map[string]interface{}, err
 	if len(systemParts) > 0 {
 		out["system"] = strings.Join(systemParts, "\n\n")
 	}
-	if mt, ok := body["max_tokens"]; ok {
+	if mt, ok := body["max_tokens"]; ok && mt != nil {
 		out["max_tokens"] = mt
-	} else if mct, ok := body["max_completion_tokens"]; ok {
+	} else if mct, ok := body["max_completion_tokens"]; ok && mct != nil {
 		out["max_tokens"] = mct
-	} else {
+	} else if mt == nil && mct == nil {
+		// 显式 null 等同未提供：交给 normalizeBody 补默认值，而不是 400
 		out["max_tokens"] = float64(4096)
 	}
 	if t, ok := body["temperature"]; ok && t != nil {
@@ -285,6 +291,11 @@ func openaiToAnthropic(body map[string]interface{}) (map[string]interface{}, err
 		case string:
 			out["stop_sequences"] = []interface{}{s}
 		}
+	}
+	// 透传 reasoning_effort：fixThinking 依赖它推导 output_config.effort，
+	// 丢弃会导致 GLM-5.3 恒定以 high 档运行（low/max 请求被静默降级/升级）
+	if e, ok := body["reasoning_effort"]; ok && e != nil {
+		out["reasoning_effort"] = e
 	}
 
 	// tools 转换
@@ -448,9 +459,9 @@ func responsesToAnthropic(body map[string]interface{}) (map[string]interface{}, 
 		sysMsg := map[string]interface{}{"role": "system", "content": strings.Join(systemParts, "\n\n")}
 		chatBody["messages"] = append([]interface{}{sysMsg}, chatBody["messages"].([]interface{})...)
 	}
-	if mot, ok := body["max_output_tokens"]; ok {
+	if mot, ok := body["max_output_tokens"]; ok && mot != nil {
 		chatBody["max_tokens"] = mot
-	} else if mt, ok := body["max_tokens"]; ok {
+	} else if mt, ok := body["max_tokens"]; ok && mt != nil {
 		chatBody["max_tokens"] = mt
 	}
 	if t, ok := body["temperature"]; ok && t != nil {

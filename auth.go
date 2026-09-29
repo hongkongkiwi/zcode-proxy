@@ -80,7 +80,9 @@ func NewAuthManager(db *DB, password string) *AuthManager {
 			// 全新数据库：随机生成初始管理口令（is_default_password=1，UI 会提示修改）
 			if pw, err := generateRandomPassword(20); err == nil {
 				fallbackPwd = pw
-				if err := db.SetPasswordHash(hashPassword(pw)); err != nil {
+				if hash, err := hashPassword(pw); err != nil {
+					log.Printf("[auth] persist initial admin password hash failed: %v", err)
+				} else if err := db.SetPasswordHash(hash); err != nil {
 					log.Printf("[auth] persist initial admin password hash failed: %v", err)
 				} else {
 					db.SetDefaultPasswordFlag(true)
@@ -99,13 +101,20 @@ func NewAuthManager(db *DB, password string) *AuthManager {
 	}
 }
 
-// hashPassword bcrypt 哈希（新口令）
-func hashPassword(pwd string) string {
+// maxPasswordBytes bcrypt 只取前 72 字节，超长口令在 x/crypto 中直接报错；
+// 请求路径上必须在哈希前拒绝，而不是让服务进程退出
+const maxPasswordBytes = 72
+
+// hashPassword bcrypt 哈希（新口令）；输入超长返回错误而非崩溃
+func hashPassword(pwd string) (string, error) {
+	if len(pwd) > maxPasswordBytes {
+		return "", fmt.Errorf("password exceeds %d bytes", maxPasswordBytes)
+	}
 	h, err := bcrypt.GenerateFromPassword([]byte(pwd), bcrypt.DefaultCost)
 	if err != nil {
-		log.Fatalf("[auth] bcrypt hash failed: %v", err)
+		return "", err
 	}
-	return string(h)
+	return string(h), nil
 }
 
 // legacyHash 旧版无盐 SHA-256（仅用于透明迁移比对）
@@ -125,8 +134,14 @@ func (am *AuthManager) verifyPassword(pwd string) bool {
 			return bcrypt.CompareHashAndPassword([]byte(stored), []byte(pwd)) == nil
 		}
 		if legacyHash(pwd) == stored {
-			am.db.SetPasswordHash(hashPassword(pwd))
-			log.Printf("[auth] password hash migrated to bcrypt")
+			// 透明升级为 bcrypt；超长口令无法哈希时保持旧哈希（下次登录再试），
+			// 登录本身仍以 legacy 比对结果为准
+			if hash, err := hashPassword(pwd); err == nil {
+				am.db.SetPasswordHash(hash)
+				log.Printf("[auth] password hash migrated to bcrypt")
+			} else {
+				log.Printf("[auth] bcrypt migration skipped: %v", err)
+			}
 			return true
 		}
 		return false
@@ -152,10 +167,20 @@ func (am *AuthManager) checkLoginRate(key string) time.Duration {
 	return 0
 }
 
-// recordLoginFail 记录失败并按指数退避锁定
+// recordLoginFail 记录失败并按指数退避锁定。
+// 键由客户端可控输入构成且 /api/login 免认证：无界增长会被用来打爆内存，
+// 超过容量上限时机会性清掉未锁定条目。
 func (am *AuthManager) recordLoginFail(key string) {
 	am.failMu.Lock()
 	defer am.failMu.Unlock()
+	if len(am.failures) >= 4096 {
+		now := time.Now()
+		for k, f := range am.failures {
+			if now.After(f.lockedUntil) {
+				delete(am.failures, k)
+			}
+		}
+	}
 	f := am.failures[key]
 	if f == nil {
 		f = &loginFail{}
@@ -219,9 +244,8 @@ func (am *AuthManager) Login(username, password, clientIP string) (string, bool,
 		return "", false, wait
 	}
 
-	am.mu.Lock()
-	defer am.mu.Unlock()
-
+	// 口令验证（bcrypt 比较耗时数十至百毫秒）放在会话锁外，
+	// 避免登录风暴期间阻塞所有持读锁的 /api 请求
 	if username != am.adminUser() {
 		am.recordLoginFail(rateKey)
 		return "", false, 0
@@ -230,6 +254,10 @@ func (am *AuthManager) Login(username, password, clientIP string) (string, bool,
 		am.recordLoginFail(rateKey)
 		return "", false, 0
 	}
+
+	am.mu.Lock()
+	// 极小窗口：验证通过后、拿锁前口令被修改，会签出一个旧口令会话；
+	// 下次登录即失效，可接受
 	am.clearLoginFail(rateKey)
 
 	now := time.Now()
@@ -240,6 +268,7 @@ func (am *AuthManager) Login(username, password, clientIP string) (string, bool,
 	}
 	token := generateToken()
 	am.sessions[token] = &sessionEntry{username: username, createdAt: now, expiresAt: now.Add(sessionExpiry)}
+	am.mu.Unlock()
 	log.Printf("[auth] login success: user=%s", username)
 	return token, true, 0
 }
@@ -306,8 +335,8 @@ func (am *AuthManager) Middleware(next http.Handler) http.Handler {
 			return
 		}
 
-		// /v1/* 使用 API Key 认证（Authorization: Bearer 或 x-api-key）
-		if strings.HasPrefix(path, "/v1/") {
+		// /v1/* 与 /async/*（闲时通道）使用 API Key 认证（Authorization: Bearer 或 x-api-key）
+		if strings.HasPrefix(path, "/v1/") || strings.HasPrefix(path, "/async/") {
 			var apiKey string
 			if xKey := r.Header.Get("x-api-key"); xKey != "" {
 				apiKey = xKey
@@ -333,11 +362,11 @@ func (am *AuthManager) Middleware(next http.Handler) http.Handler {
 			return
 		}
 
-		// /api/* 使用 session 认证
+		// /api/* 使用 session 认证（错误形状与其余 handler 统一为嵌套结构）
 		if strings.HasPrefix(path, "/api/") {
 			token := extractToken(r)
 			if token == "" || !am.IsValid(token) {
-				writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
+				writeAPIError(w, http.StatusUnauthorized, "unauthorized")
 				return
 			}
 		}
@@ -373,6 +402,7 @@ func (am *AuthManager) HandleLogin(w http.ResponseWriter, r *http.Request) {
 		HttpOnly: true,
 		MaxAge:   int(sessionExpiry.Seconds()),
 		SameSite: http.SameSiteStrictMode,
+		Secure:   r.TLS != nil, // TLS 部署下防降级泄露；纯 http 本机部署保持可用
 	})
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"success":             true,
@@ -397,6 +427,7 @@ func (am *AuthManager) HandleCheckAuth(w http.ResponseWriter, r *http.Request) {
 	if token != "" && am.IsValid(token) {
 		writeJSON(w, http.StatusOK, map[string]interface{}{
 			"authenticated":       true,
+			"username":            am.adminUser(), // UI 顶栏显示真实管理员名（可自定义）
 			"is_default_password": am.isDefaultPassword(),
 		})
 		return
@@ -418,6 +449,10 @@ func (am *AuthManager) HandleChangePassword(w http.ResponseWriter, r *http.Reque
 		writeAPIError(w, http.StatusBadRequest, "new_password is required")
 		return
 	}
+	if len(body.NewPassword) > maxPasswordBytes {
+		writeAPIError(w, http.StatusBadRequest, fmt.Sprintf("new_password must be at most %d bytes", maxPasswordBytes))
+		return
+	}
 	am.mu.Lock()
 	defer am.mu.Unlock()
 
@@ -426,7 +461,12 @@ func (am *AuthManager) HandleChangePassword(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	if am.db != nil {
-		if err := am.db.SetPasswordHash(hashPassword(body.NewPassword)); err != nil {
+		hash, err := hashPassword(body.NewPassword)
+		if err != nil {
+			writeAPIError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		if err := am.db.SetPasswordHash(hash); err != nil {
 			writeAPIError(w, http.StatusInternalServerError, "failed to save password")
 			return
 		}
@@ -461,6 +501,8 @@ func (am *AuthManager) HandleGenerateAPIKey(w http.ResponseWriter, r *http.Reque
 // ---- HTTP 辅助 ----
 
 func writeJSON(w http.ResponseWriter, status int, v interface{}) {
+	// 管理接口会回显密钥/凭据/配置，禁止任何缓存层落盘
+	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(status)
 	json.NewEncoder(w).Encode(v)

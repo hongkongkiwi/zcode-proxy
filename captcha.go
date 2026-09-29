@@ -1,6 +1,9 @@
 package main
 
 import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -26,7 +29,8 @@ import (
 //   5. 参数按出口代理分组缓存 45s；过期后 300s 宽限期内返回旧参数并后台刷新
 //   6. 无头失败自动升级有头窗口让用户手动过，结果同样入缓存
 // 并发模型：按出口代理分组的容量 1 信号量（组间互不阻塞），前台求解有界等待 45s、
-// 超时返回繁忙错误，后台刷新非阻塞 TryAcquire，不存在锁泄漏路径。
+// 超时返回繁忙错误，后台刷新非阻塞 TryAcquire；浏览器操作全程有 context 上界，
+// 代理黑洞/页面卡死只会占用信号量到上限，不会永久占坑。
 
 const (
 	captchaCacheTTL       = 45 * time.Second
@@ -35,6 +39,7 @@ const (
 	captchaConfigTTL      = 10 * time.Minute
 	captchaAcquireTimeout = 45 * time.Second
 	captchaSolveTimeout   = 40 * time.Second
+	captchaLaunchTimeout  = 30 * time.Second
 	captchaSolveRetries   = 4
 	captchaChromeUA       = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
 )
@@ -415,8 +420,10 @@ func (s *CaptchaService) solveWithBrowser(cc *CaptchaConfig, headless bool, a *A
 	} else {
 		log.Printf("[captcha] real Chrome/Edge not found, using rod managed browser (may be flagged)")
 	}
-	// 持久化浏览器配置：保留阿里云风控 cookie，避免每次求解都被视为新设备
-	if profileDir := browserProfileDir(); profileDir != "" {
+	// 持久化浏览器配置：保留阿里云风控 cookie，避免每次求解都被视为新设备。
+	// 每个代理组独立 profile：Chrome 按 user-data-dir 强制进程单例，
+	// 共用目录会让组间并行求解的第二次 Launch 静默失败
+	if profileDir := browserProfileDirForGroup(s.cacheKey(a)); profileDir != "" {
 		l = l.UserDataDir(profileDir)
 	}
 	// 走账号组出口代理（与上游请求同 IP，避免风控不一致）
@@ -424,9 +431,26 @@ func (s *CaptchaService) solveWithBrowser(cc *CaptchaConfig, headless bool, a *A
 		l = l.Proxy(proxyURL)
 	}
 
-	controlURL, err := l.Launch()
-	if err != nil {
-		return "", fmt.Errorf("启动浏览器失败: %w", err)
+	// Launch 有界：Chrome 起不来/卡死时不能无限期占住组信号量
+	type launchResult struct {
+		url string
+		err error
+	}
+	lch := make(chan launchResult, 1)
+	go func() {
+		u, err := l.Launch()
+		lch <- launchResult{u, err}
+	}()
+	var controlURL string
+	select {
+	case res := <-lch:
+		if res.err != nil {
+			return "", fmt.Errorf("启动浏览器失败: %w", res.err)
+		}
+		controlURL = res.url
+	case <-time.After(captchaLaunchTimeout):
+		l.Kill() // 卡死的 Launch：回收残留进程
+		return "", fmt.Errorf("启动浏览器超时（%v）", captchaLaunchTimeout)
 	}
 	// Launch 成功后立即登记兜底回收：Connect/后续任何失败都杀进程
 	killed := false
@@ -436,14 +460,22 @@ func (s *CaptchaService) solveWithBrowser(cc *CaptchaConfig, headless bool, a *A
 		}
 	}()
 
-	browser := rod.New().ControlURL(controlURL)
+	// 浏览器全链路（Connect/Page/Expose/WaitLoad/Close）绑定有界 context：
+	// 任一环节卡死只占用信号量到上限，随后由 Kill 兜底回收进程
+	bctx, bcancel := context.WithTimeout(context.Background(), captchaSolveTimeout+captchaLaunchTimeout)
+	defer bcancel()
+	browser := rod.New().ControlURL(controlURL).Context(bctx)
 	if err = browser.Connect(); err != nil {
 		return "", fmt.Errorf("连接浏览器失败: %w", err)
 	}
-	// Connect 成功：交由 browser.Close 回收（含进程），取消兜底 Kill
+	// Connect 成功：交由 browser.Close 回收（含进程）；Close 失败（如超时）
+	// 时 Kill 兜底，对已死进程幂等
 	defer func() {
 		killed = true
-		browser.Close()
+		if err := browser.Close(); err != nil {
+			log.Printf("[captcha] browser close: %v", err)
+			l.Kill()
+		}
 	}()
 
 	page, err := browser.Page(proto.TargetCreateTarget{URL: "https://zcode.z.ai/"})
@@ -510,11 +542,17 @@ var captchaProxyHook = func(a *Account) string { return "" }
 // browserProfileHook 由 main 注入：返回持久化浏览器配置目录
 var browserProfileHook = func() string { return "" }
 
-func browserProfileDir() string {
-	dir := browserProfileHook()
-	if dir == "" {
+// browserProfileDirForGroup 每个代理组独立 profile 子目录（组 key 哈希命名）
+func browserProfileDirForGroup(group string) string {
+	base := browserProfileHook()
+	if base == "" {
 		return ""
 	}
+	if group == "" {
+		group = "default"
+	}
+	sum := sha256.Sum256([]byte(group))
+	dir := filepath.Join(base, hex.EncodeToString(sum[:8]))
 	os.MkdirAll(dir, 0755)
 	return dir
 }

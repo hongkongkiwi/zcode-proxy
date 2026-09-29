@@ -290,6 +290,10 @@ func (z *ZCodeAPI) forwardOnce(w http.ResponseWriter, r *http.Request, a *Accoun
 
 			switch {
 			case resp.StatusCode == 401 || resp.StatusCode == 403:
+				// 先尝试 refresh_token 兑换；成功则账号已恢复，交回池子换号续用
+				if z.tryRefreshAccount(a) {
+					return outcomeNextAccount
+				}
 				z.pool.MarkInvalid(a, fmt.Sprintf("鉴权失败 HTTP %d", resp.StatusCode))
 				return outcomeNextAccount
 			case resp.StatusCode == 429:
@@ -306,6 +310,7 @@ func (z *ZCodeAPI) forwardOnce(w http.ResponseWriter, r *http.Request, a *Accoun
 					time.Sleep(time.Duration(retryAfter) * time.Second)
 					continue
 				}
+				resp.Body.Close() // 最后一次重试也必须关 body，否则泄漏连接
 				z.pool.MarkCooling(a, fmt.Sprintf("上游限流 429（model=%s）", rcModel(payload)), 30)
 				return outcomeNextAccount
 			case isRiskBlocked(text):
@@ -564,17 +569,28 @@ func normalizeBody(body map[string]interface{}, z *ZCodeAPI) error {
 func fixThinking(body map[string]interface{}) {
 	model, _ := body["model"].(string)
 	if !strings.Contains(model, "5.3") {
+		// 上游不认识 reasoning_effort：非 5.3 模型直接丢弃，避免整单被参数校验拒绝
+		delete(body, "reasoning_effort")
 		return
 	}
 	effort := ""
-	if e, ok := body["reasoning_effort"].(string); ok {
-		effort = normalizeEffort(e)
+	if oc, ok := body["output_config"].(map[string]interface{}); ok {
+		// 3.14 原生客户端已发 output_config.effort：显式请求优先保留，不得静默改档
+		if e, ok := oc["effort"].(string); ok {
+			effort = normalizeEffort(e)
+		}
+	}
+	if effort == "" {
+		if e, ok := body["reasoning_effort"].(string); ok {
+			effort = normalizeEffort(e)
+		}
 	}
 	thinking, _ := body["thinking"].(map[string]interface{})
 	if thinking != nil {
 		if t, _ := thinking["type"].(string); t == "disabled" {
 			body["thinking"] = map[string]interface{}{"type": "disabled"}
 			delete(body, "reasoning_effort")
+			delete(body, "output_config")
 			return
 		}
 		if effort == "" {
@@ -735,7 +751,7 @@ func writeUpstreamErrorForProto(w http.ResponseWriter, resp *http.Response, text
 	})
 }
 
-// RefreshAccountQuotaThrottled 成功请求后的即时额度刷新（30s 节流）
+// RefreshAccountQuotaThrottled 成功请求后的即时额度刷新（30s 节流 + 进程内单飞）
 func (z *ZCodeAPI) RefreshAccountQuotaThrottled(a *Account) {
 	if a.Provider != "zai" || a.ZCodeJWT == "" {
 		return
@@ -743,6 +759,12 @@ func (z *ZCodeAPI) RefreshAccountQuotaThrottled(a *Account) {
 	if time.Now().Unix()-a.lastCheckedAt() < 30 {
 		return
 	}
+	// lastCheckedAt 来自 ListAccounts 的库内快照，N 个并发请求可能同时选中同一
+	// 账号副本并通过节流检查；LoadOrStore 把它们收敛为一次 billing 拉取
+	if _, busy := z.quotaRefreshInflight.LoadOrStore(a.ID, struct{}{}); busy {
+		return
+	}
+	defer z.quotaRefreshInflight.Delete(a.ID)
 	if err := z.RefreshAccountQuota(a); err != nil {
 		log.Printf("[quota] throttled refresh %s: %v", a.Email, err)
 	}

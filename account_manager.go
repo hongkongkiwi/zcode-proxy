@@ -153,21 +153,21 @@ func (m *AccountManager) ImportFromLocalClient(group string) (*Account, error) {
 	snapshotJSON, _ := json.Marshal(snapshot)
 
 	a := &Account{
-		UserID:      userID,
-		Email:       email,
-		DisplayName: displayName,
-		Provider:    provider,
-		AuthType:    "jwt",
-		AccessToken: accessToken,
-		ZCodeJWT:    zcodeJWT,
-		APIKey:      apiKey,
-		UserInfo:    userInfo,
-		DeviceMid:   deviceMid,
-		CredsRaw:    string(snapshotJSON),
-		Status:      StatusActive,
-		Enabled:     true,
+		UserID:       userID,
+		Email:        email,
+		DisplayName:  displayName,
+		Provider:     provider,
+		AuthType:     "jwt",
+		AccessToken:  accessToken,
+		ZCodeJWT:     zcodeJWT,
+		APIKey:       apiKey,
+		UserInfo:     userInfo,
+		DeviceMid:    deviceMid,
+		CredsRaw:     string(snapshotJSON),
+		Status:       StatusActive,
+		Enabled:      true,
 		AccountGroup: group,
-		Remark:      "本地客户端导入",
+		Remark:       "本地客户端导入",
 	}
 	if zcodeJWT == "" {
 		a.AuthType = "apikey"
@@ -443,7 +443,12 @@ func (m *AccountManager) RestoreLocalFromSnapshot(accountID int64) error {
 			continue
 		}
 		tmp := path + ".tmp-zproxy"
-		if err := os.WriteFile(tmp, []byte(content), 0644); err != nil {
+		// 快照含账号 JWT / API Key，与切回路径同样限权 0600；
+		// 临时文件复用旧名时 WriteFile 不改既有权限，故显式 Chmod
+		if err := os.WriteFile(tmp, []byte(content), 0600); err != nil {
+			return err
+		}
+		if err := os.Chmod(tmp, 0600); err != nil {
 			return err
 		}
 		if err := os.Rename(tmp, path); err != nil {

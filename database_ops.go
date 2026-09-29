@@ -255,23 +255,38 @@ func (db *DB) ListProxyNodes() ([]*ProxyNode, error) {
 }
 
 func (db *DB) SaveProxyNode(n *ProxyNode) (int64, error) {
+	// 清默认 + 写新默认必须同事务：清了不写会留下零默认节点，
+	// 写了不清会撞 idx_proxy_nodes_default 唯一约束
+	tx, err := db.conn.Begin()
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
 	if n.IsDefault {
-		db.conn.Exec(`UPDATE proxy_nodes SET is_default = 0`)
+		if _, err := tx.Exec(`UPDATE proxy_nodes SET is_default = 0`); err != nil {
+			return 0, err
+		}
 	}
 	if n.ID > 0 {
-		_, err := db.conn.Exec(`
+		_, err := tx.Exec(`
 			UPDATE proxy_nodes SET name=?, type=?, host=?, port=?, username=?, password=?,
 			is_default=?, group_name=?, enabled=?, updated_at=datetime('now','localtime') WHERE id=?`,
 			n.Name, n.Type, n.Host, n.Port, n.Username, n.Password,
 			boolInt(n.IsDefault), n.GroupName, boolInt(n.Enabled), n.ID)
-		return n.ID, err
+		if err != nil {
+			return 0, err
+		}
+		return n.ID, tx.Commit()
 	}
-	res, err := db.conn.Exec(`
+	res, err := tx.Exec(`
 		INSERT INTO proxy_nodes (name, type, host, port, username, password, is_default, group_name, enabled)
 		VALUES (?,?,?,?,?,?,?,?,?)`,
 		n.Name, n.Type, n.Host, n.Port, n.Username, n.Password,
 		boolInt(n.IsDefault), n.GroupName, boolInt(n.Enabled))
 	if err != nil {
+		return 0, err
+	}
+	if err := tx.Commit(); err != nil {
 		return 0, err
 	}
 	return res.LastInsertId()

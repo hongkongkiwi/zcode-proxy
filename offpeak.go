@@ -64,8 +64,10 @@ func (z *ZCodeAPI) asyncIntSetting(key string, def int) int {
 
 type offPeakTickets struct{ z *ZCodeAPI }
 
-// do 控制面请求；settle4xxOK 时 4xx 视为服务端已清理的成功（settle 专用）
-func (t offPeakTickets) do(a *Account, method, path string, body interface{}, settle4xxOK bool) (map[string]interface{}, error) {
+// do 控制面请求；settle4xxOK 时 4xx 视为服务端已清理的成功（settle 专用）。
+// ctx 由调用方提供：取票/查票随请求上下文取消；settle 用 context.Background()
+// （常在客户端断开后异步执行，不能被请求取消波及）。
+func (t offPeakTickets) do(ctx context.Context, a *Account, method, path string, body interface{}, settle4xxOK bool) (map[string]interface{}, error) {
 	var rdr io.Reader
 	if body != nil {
 		raw, err := json.Marshal(body)
@@ -75,7 +77,7 @@ func (t offPeakTickets) do(a *Account, method, path string, body interface{}, se
 		rdr = bytes.NewReader(raw)
 	}
 	urlStr := offPeakControlBase + path
-	req, err := http.NewRequest(method, urlStr, rdr)
+	req, err := http.NewRequestWithContext(ctx, method, urlStr, rdr)
 	if err != nil {
 		return nil, err
 	}
@@ -123,8 +125,8 @@ func (t offPeakTickets) do(a *Account, method, path string, body interface{}, se
 }
 
 // Availability 探队：canTake=false 时返回 nextTakeAt（unix 秒，0=未知）
-func (t offPeakTickets) Availability(a *Account) (canTake bool, nextTakeAt int64, err error) {
-	v, err := t.do(a, "GET", "/ticket/availability", nil, false)
+func (t offPeakTickets) Availability(ctx context.Context, a *Account) (canTake bool, nextTakeAt int64, err error) {
+	v, err := t.do(ctx, a, "GET", "/ticket/availability", nil, false)
 	if err != nil {
 		return false, 0, err
 	}
@@ -160,8 +162,8 @@ func offTicketFrom(m map[string]interface{}) (*offTicket, error) {
 	return tk, nil
 }
 
-func (t offPeakTickets) take(a *Account, taskID string) (*offTicket, error) {
-	v, err := t.do(a, "POST", "/ticket", map[string]interface{}{"task_id": taskID}, false)
+func (t offPeakTickets) take(ctx context.Context, a *Account, taskID string) (*offTicket, error) {
+	v, err := t.do(ctx, a, "POST", "/ticket", map[string]interface{}{"task_id": taskID}, false)
 	if err != nil {
 		return nil, err
 	}
@@ -175,8 +177,8 @@ func (t offPeakTickets) take(a *Account, taskID string) (*offTicket, error) {
 	return tk, nil
 }
 
-func (t offPeakTickets) status(a *Account, ticketID string) (*offTicket, error) {
-	v, err := t.do(a, "POST", "/ticket/status", map[string]interface{}{"ticket_ids": []string{ticketID}}, false)
+func (t offPeakTickets) status(ctx context.Context, a *Account, ticketID string) (*offTicket, error) {
+	v, err := t.do(ctx, a, "POST", "/ticket/status", map[string]interface{}{"ticket_ids": []string{ticketID}}, false)
 	if err != nil {
 		return nil, err
 	}
@@ -200,9 +202,10 @@ func (t offPeakTickets) status(a *Account, ticketID string) (*offTicket, error) 
 	return nil, fmt.Errorf("查票响应不含该票")
 }
 
-// settle 关票；4xx 已按成功处理；失败仅记日志（关票是 best-effort）
+// settle 关票；4xx 已按成功处理；失败仅记日志（关票是 best-effort）。
+// 用独立 context：断连后的补偿关票不能随请求取消。
 func (t offPeakTickets) settle(a *Account, ticketID string) {
-	if _, err := t.do(a, "POST", "/ticket/"+ticketID+"/settle", nil, true); err != nil {
+	if _, err := t.do(context.Background(), a, "POST", "/ticket/"+ticketID+"/settle", nil, true); err != nil {
 		log.Printf("[async] settle %s… failed: %v", safePrefixLog(ticketID, 8), err)
 	}
 }
@@ -289,6 +292,7 @@ type offPeakRunOpts struct {
 	keepaliveMS  int
 	maxRetries   int
 	maxWaitSec   int
+	hardDeadline time.Time // 请求级排队总预算（runOffPeak 设定一次）
 }
 
 // runOffPeak 选号并执行闲时桥接。闲时是独立免费额度桶（billing 耗尽仍可取票，
@@ -306,6 +310,11 @@ func (z *ZCodeAPI) runOffPeak(w http.ResponseWriter, r *http.Request, opts offPe
 	tried := map[int64]bool{}
 	attempts := 0
 	var reasons []string
+	streamHeaders := false // SSE 响应头只写一次：换号续流时不重复 WriteHeader
+	// 排队总时长预算整个请求一次（不随换号重置），否则最坏等待 = 每账号各等满额
+	if opts.maxWaitSec > 0 {
+		opts.hardDeadline = time.Now().Add(time.Duration(opts.maxWaitSec) * time.Second)
+	}
 	for _, a := range accounts {
 		if attempts >= maxAccountAttempts {
 			break
@@ -315,18 +324,38 @@ func (z *ZCodeAPI) runOffPeak(w http.ResponseWriter, r *http.Request, opts offPe
 		}
 		tried[a.ID] = true
 		attempts++
-		if z.offPeakBridge(w, r, a, tickets, opts) == outcomeWritten {
+		out := z.offPeakBridge(w, r, a, tickets, opts, &streamHeaders)
+		if out == outcomeWritten {
 			return
 		}
-		reasons = append(reasons, a.DisplayNameOrEmail()+": "+firstNonEmpty(a.LastError, a.Status))
+		// 客户端已断开（bridge 通过 outcomeUpstreamError 报告）：停止消耗账号与免费票
+		if out == outcomeUpstreamError || r.Context().Err() != nil {
+			return
+		}
+		st, lastErr := a.statusError()
+		reasons = append(reasons, a.DisplayNameOrEmail()+": "+firstNonEmpty(lastErr, st))
 	}
 	detail := truncate(strings.Join(dedup(reasons), "；"), 400)
+	// 如实区分"全部失败"与"达到单次尝试上限还有账号没试"
 	msg := "闲时通道暂不可用（所有账号取票失败），请稍后重试或改用 /v1/messages"
+	if attempts >= maxAccountAttempts && len(reasons) >= maxAccountAttempts {
+		msg = "闲时通道已尝试 " + strconv.Itoa(attempts) + " 个账号达到单次请求上限，其余账号本次未尝试，请稍后重试或改用 /v1/messages"
+	} else if attempts == 0 {
+		msg = "闲时通道暂无可用账号（全部禁用或无 JWT），请在后台检查账号状态"
+	}
 	if detail != "" {
 		msg += "（最近失败原因: " + detail + "）"
 	}
 	log.Printf("[async] no available account: %s", detail)
 	if opts.clientStream {
+		if !streamHeaders {
+			// 没有任何 bridge 执行过（如账号全被过滤）：先补 SSE 响应头再写错误帧，
+			// 否则客户端收到的是隐式 200 + text/plain，SDK 无法按 SSE 解析
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.Header().Set("Cache-Control", "no-cache")
+			w.WriteHeader(http.StatusOK)
+			flushWriter(w)
+		}
 		writeSSEErrorEvent(w, msg)
 		return
 	}
@@ -338,9 +367,11 @@ func (z *ZCodeAPI) runOffPeak(w http.ResponseWriter, r *http.Request, opts offPe
 // offPeakBridge 单账号闲时桥接状态机：
 // WAIT(排队，保活) → READY(带票调用上游) → EXPIRED/回收(重新取票，≤maxRetries)
 // → DONE(流结束，settle) / ABORT(客户端断开，settle)。
-// 返回 outcomeWritten 表示响应已按协议写回客户端（成功或终态错误）。
+// 返回 outcomeWritten 表示响应已按协议写回客户端（成功或终态错误）；
+// outcomeNextAccount 表示本账号不可用（未写响应），由 runOffPeak 换号重试；
+// outcomeUpstreamError 表示客户端已断开。
 func (z *ZCodeAPI) offPeakBridge(w http.ResponseWriter, r *http.Request, a *Account,
-	tickets offPeakTickets, opts offPeakRunOpts) relayOutcome {
+	tickets offPeakTickets, opts offPeakRunOpts, streamHeaders *bool) relayOutcome {
 
 	ctx := r.Context()
 	pollInterval := time.Duration(opts.pollMS) * time.Millisecond
@@ -355,16 +386,14 @@ func (z *ZCodeAPI) offPeakBridge(w http.ResponseWriter, r *http.Request, a *Acco
 	if maxRetries <= 0 {
 		maxRetries = offPeakMaxRetries
 	}
-	var hardDeadline time.Time
-	if opts.maxWaitSec > 0 {
-		hardDeadline = time.Now().Add(time.Duration(opts.maxWaitSec) * time.Second)
-	}
+	hardDeadline := opts.hardDeadline // 请求级预算，由 runOffPeak 统一设定
 
-	if opts.clientStream {
+	if opts.clientStream && !*streamHeaders {
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.Header().Set("Cache-Control", "no-cache")
 		w.WriteHeader(http.StatusOK)
 		flushWriter(w)
+		*streamHeaders = true
 	}
 
 	settled := map[string]bool{}
@@ -388,7 +417,7 @@ func (z *ZCodeAPI) offPeakBridge(w http.ResponseWriter, r *http.Request, a *Acco
 	}
 	fail := func(status int, msg string) relayOutcome {
 		settleCur()
-		a.LastError = truncate(msg, 180)
+		a.bumpFail(truncate(msg, 180))
 		log.Printf("[async] account %s bridge failed: %s", a.DisplayNameOrEmail(), msg)
 		if opts.clientStream {
 			writeSSEErrorEvent(w, msg)
@@ -399,28 +428,56 @@ func (z *ZCodeAPI) offPeakBridge(w http.ResponseWriter, r *http.Request, a *Acco
 		}
 		return outcomeWritten
 	}
-	retake := func(attempt int, why string) (*offTicket, bool) {
+	// takeFailed 取票失败：先判客户端取消（不得因此冷却健康账号），
+	// 再按错误类型标记（401/403 失效、429 短冷却、其余失败/冷却），
+	// 未写任何响应，交给 runOffPeak 换下一个账号——不得终止整个请求
+	takeFailed := func(err error) relayOutcome {
+		if ctx.Err() != nil {
+			// 客户端已断开：账号无辜，runOffPeak 收到该 outcome 会停止循环
+			return outcomeUpstreamError
+		}
+		msg := "闲时取票失败: " + truncate(err.Error(), 160)
+		s := err.Error()
+		switch {
+		case strings.Contains(s, "HTTP 401"), strings.Contains(s, "HTTP 403"):
+			z.pool.MarkInvalid(a, msg)
+		case strings.Contains(s, "HTTP 429"):
+			z.pool.MarkCooling(a, msg, 30)
+		case strings.Contains(s, "HTTP"):
+			z.pool.MarkFailed(a, msg)
+		default:
+			z.pool.MarkCooling(a, msg, 60)
+		}
+		log.Printf("[async] account %s take failed, trying next: %s", a.DisplayNameOrEmail(), msg)
+		return outcomeNextAccount
+	}
+	// retake 重新取票：返回 (nil, outcome) 表示本账号到此为止——
+	// outcome 为 outcomeNextAccount 时未写响应，由 runOffPeak 换号；
+	// outcome 为 outcomeWritten 时 fail() 已写终态错误（排队超时）。
+	retake := func(attempt int, why string) (*offTicket, relayOutcome) {
 		if attempt >= maxRetries {
-			fail(http.StatusServiceUnavailable, why+"且重试次数用尽")
-			return nil, false
+			// 本账号重试预算用尽：关掉手上可能仍活着的票（如按本地时钟误判
+			// 过 deadline 的 ready 票），标记后换号，不写终态响应
+			settleCur()
+			z.pool.MarkFailed(a, truncate(why+"且重试次数用尽", 180))
+			return nil, outcomeNextAccount
 		}
 		if !hardDeadline.IsZero() && time.Now().After(hardDeadline) {
-			fail(http.StatusServiceUnavailable, why+"；闲时排队总时长已超限")
-			return nil, false
+			return nil, fail(http.StatusServiceUnavailable, why+"；闲时排队总时长已超限")
 		}
 		settleCur() // 旧票已被回收/过期，显式关掉
-		next, err := tickets.take(a, uuid.NewString())
+		next, err := tickets.take(ctx, a, uuid.NewString())
 		if err != nil {
-			fail(http.StatusBadGateway, why+"；重新取票失败: "+err.Error())
-			return nil, false
+			return nil, takeFailed(fmt.Errorf("%s；重新取票失败: %w", why, err))
 		}
 		log.Printf("[async] account %s retake #%d: %s… (%s)", a.DisplayNameOrEmail(), attempt+1, safePrefixLog(next.ID, 8), next.State)
-		return next, true
+		return next, outcomeWritten
 	}
 
-	ticket, err = tickets.take(a, uuid.NewString())
+	// ticket/err 由下方取票赋值；必须用 = 以让 settleCur 闭包捕获同一变量
+	ticket, err = tickets.take(ctx, a, uuid.NewString())
 	if err != nil {
-		return fail(http.StatusBadGateway, "取票失败: "+err.Error())
+		return takeFailed(err)
 	}
 	log.Printf("[async] account %s took ticket %s… state=%s pos=%d", a.DisplayNameOrEmail(), safePrefixLog(ticket.ID, 8), ticket.State, ticket.Position)
 
@@ -442,7 +499,7 @@ func (z *ZCodeAPI) offPeakBridge(w http.ResponseWriter, r *http.Request, a *Acco
 				settleCur()
 				return outcomeUpstreamError
 			}
-			st, err := tickets.status(a, ticket.ID)
+			st, err := tickets.status(ctx, a, ticket.ID)
 			if err != nil {
 				log.Printf("[async] poll ticket %s…: %v", safePrefixLog(ticket.ID, 8), err)
 				continue
@@ -451,25 +508,25 @@ func (z *ZCodeAPI) offPeakBridge(w http.ResponseWriter, r *http.Request, a *Acco
 		}
 
 		if offPeakStateExpired(ticket.State) || ticket.State == "settled" {
-			next, ok := retake(attempt, fmt.Sprintf("闲时票被回收（%s）", ticket.State))
-			if !ok {
-				return outcomeWritten
+			next, out := retake(attempt, fmt.Sprintf("闲时票被回收（%s）", ticket.State))
+			if next == nil {
+				return out
 			}
 			ticket = next
 			continue
 		}
 		if ticket.ActiveDeadline > 0 && time.Now().Unix() > ticket.ActiveDeadline {
-			next, ok := retake(attempt, "闲时票已过使用截止时间")
-			if !ok {
-				return outcomeWritten
+			next, out := retake(attempt, "闲时票已过使用截止时间")
+			if next == nil {
+				return out
 			}
 			ticket = next
 			continue
 		}
 		out := z.offPeakForward(w, r, a, ticket, opts)
-		if out == outcomeWritten {
-			settleCur() // 响应已写回（含终态错误帧）；票已消费，幂等关票
-		}
+		// 票已带入 READY/ACTIVE：所有出口都关票（幂等 best-effort）。
+		// 换号/断开路径不关票会泄漏票面，占用该账号的免费队列直到 active_deadline。
+		settleCur()
 		return out
 	}
 }
@@ -547,7 +604,9 @@ func (z *ZCodeAPI) offPeakForward(w http.ResponseWriter, r *http.Request, a *Acc
 		req.Header.Set(k, v)
 	}
 	req.Header.Set("Authorization", "Bearer "+a.ZCodeJWT)
-	req.Header.Set("x-coding-plan-api-key", a.APIKey)
+	if a.APIKey != "" {
+		req.Header.Set("x-coding-plan-api-key", a.APIKey)
+	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("anthropic-version", anthropicVersionH)
 	req.Header.Set("X-ZCode-Agent", "glm")
@@ -589,6 +648,22 @@ func (z *ZCodeAPI) offPeakForward(w http.ResponseWriter, r *http.Request, a *Acc
 
 	z.pool.MarkUsed(a)
 
+	// 2xx 但非 SSE（WAF 挑战页/登录页 HTML，主转发路径同样把守）：不得把
+	// 风控页面聚合成"成功空响应"或原样灌进客户端 SSE 流
+	if ct := resp.Header.Get("Content-Type"); !strings.Contains(ct, "text/event-stream") {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		z.pool.MarkCooling(a, fmt.Sprintf("闲时通道返回非 SSE 内容（%s）", truncate(ct, 60)), 120)
+		msg := "闲时通道上游返回异常内容 HTTP " + strconv.Itoa(resp.StatusCode) + ": " + truncate(string(body), 300)
+		if opts.clientStream {
+			writeSSEErrorEvent(w, msg)
+			return outcomeWritten
+		}
+		writeJSON(w, http.StatusBadGateway, map[string]interface{}{
+			"error": map[string]string{"message": msg, "type": "api_error"},
+		})
+		return outcomeWritten
+	}
+
 	if opts.clientStream {
 		sniff := newUsageSniffReader(resp.Body)
 		flushWriter(w)
@@ -620,6 +695,7 @@ func (z *ZCodeAPI) offPeakForward(w http.ResponseWriter, r *http.Request, a *Acc
 	}
 	z.recordUsage(a, r, opts.payload, resp.StatusCode, start, 0, usage, false)
 	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(resp.StatusCode)
 	w.Write(aggregated)
 	return outcomeWritten

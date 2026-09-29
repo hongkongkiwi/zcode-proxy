@@ -315,3 +315,9 @@ td.actions-cell .btn{margin:2px 0}
 /* LLM 测试双列小表单 */
 .llm-row{display:grid;grid-template-columns:2fr 1fr;gap:12px}
 @media(max-width:640px){.llm-row{grid-template-columns:1fr}}
+
+/* 语言选择器（顶栏 + 登录页）：默认跟随系统语言，用户选择后记忆 */
+.lang-select{background:#fff;color:var(--c-text);border:1px solid var(--c-border);padding:5px 8px;border-radius:999px;cursor:pointer;font-size:12px;font-weight:600;transition:border-color var(--transition)}
+.lang-select:hover{border-color:var(--c-primary)}
+.lang-select:focus{outline:none;border-color:var(--c-primary);box-shadow:0 0 0 3px rgba(99,102,241,.12)}
+@media (max-width: 1500px){ .top-user .status-chip{display:none} }
