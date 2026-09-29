@@ -59,7 +59,7 @@ Go 单二进制实现的 **ZCode（Z.AI / GLM Coding Plan）多账号管理 + OA
 | 出口代理 | 分组绑定节点（SOCKS5/HTTP CONNECT）、默认节点、全局代理、系统代理探测、端口探测、出口 IP 测试 |
 | 本地联动 | 解密 `~/.zcode/v2/credentials.json` 导入；一键切回（备份+原子写）；加密账号包 `zcb1:` 导出/导入 |
 | LLM 测试页 | 三协议 × 流式/非流式在线测试（状态/延迟/TTFT/tokens/SSE 事件数/内容/历史） |
-| 安全 | bcrypt 口令 + 登录 IP 限速退避；`sk-` Key 常数时间比较；会话 SameSite=Strict；凭证不落日志 |
+| 安全 | 首次启动随机生成口令（`ZCODE_WEB_PASS` 可覆盖，无默认口令）+ bcrypt + 登录限速退避（按 RemoteAddr）；`sk-` Key 常数时间比较；会话 SameSite=Strict；账号包导出需管理员密码二次确认；凭证不落日志 |
 
 ## 功能详解
 
@@ -85,7 +85,7 @@ Go 单二进制实现的 **ZCode（Z.AI / GLM Coding Plan）多账号管理 + OA
 
 ### 加密账号包迁移（跨机器）
 
-- 导出：选中账号 → 设置密码 → 生成 `zcb1:` 前缀的加密串（`base64(salt16‖nonce12‖ct)`，PBKDF2-SHA256 12 万轮 + AES-256-GCM），含 JWT/Key/设备指纹/快照；
+- 导出：选中账号 → 输入管理员密码确认身份 → 设置密码 → 生成 `zcb1:` 前缀的加密串（`base64(salt16‖nonce12‖ct)`，PBKDF2-SHA256 60 万轮 + AES-256-GCM，旧 12 万轮包仍可导入），含 JWT/Key/设备指纹/快照；
 - 导入：在另一台机器粘贴加密串 + 密码解密入库；密码错误直接拒绝，不落地明文。
 
 ### OAuth 登录（新账号）
@@ -108,7 +108,7 @@ Go 单二进制实现的 **ZCode（Z.AI / GLM Coding Plan）多账号管理 + OA
 
 - 后台按 `quota_refresh_interval` 周期刷新（0=关闭）；成功后节流 30s 防惊群；
 - 账号页额度条**可点击**：弹窗展示分套餐槽位（plan_id/档位/状态/到期/进度）与逐模型明细（总额/已用/剩余/占比/周期）；
-- 额度驱动状态机：耗尽→exhausted、限流→cooling、鉴权失败→invalid（刷新鉴权通过可自动恢复）、无订阅→inactive。
+- 额度驱动状态机：耗尽→exhausted、限流→cooling、鉴权失败→invalid（后台按退避自动重试，鉴权恢复即自动复活）、无订阅→inactive。
 
 ### 2API 网关与协议转换
 
@@ -162,10 +162,10 @@ Go 单二进制实现的 **ZCode（Z.AI / GLM Coding Plan）多账号管理 + OA
 2. **规范化**：模型名大小写/前缀映射（`glm-5.3`→`GLM-5.3`、`bigmodel/x`→provider 路由）；GLM-5.3 强制注入 `thinking{type:enabled,budget}` + `reasoning_effort:max`（上游不允许禁思考）；string content 桥接为 `[{type:text}]`；body 上限 8MB。
 3. **选号**：`AccountPool.Select(provider, group, skip)` 按策略（round_robin 游标 / random / best_quota）过滤 `enabled && 状态可选 && 有凭证`；冷却中账号到期自动可选。
 4. **降级链**（每账号）：
-   - 路径1 `JWT + X-Aliyun-Captcha-Verify-Param` → `zcode.z.ai/.../anthropic/v1/messages`（验证码被拒则失效缓存重解，最多 3 次）；
+   - 路径1 `JWT + X-Aliyun-Captcha-Verify-Param` → `zcode.z.ai/.../anthropic/v1/messages`（验证码被拒则失效缓存重解，最多 3 次；无验证码参数（mode=off 或求解失败）时跳过）；
    - 路径2 `JWT 直连`（上游放宽时零延迟）；
    - 路径3 `x-api-key` → `api.z.ai/api/anthropic/v1/messages`（无需验证码）。
-5. **上游错误分类**：`401/403→invalid`；`429→请求内退避重试一次(尊重 Retry-After≤5s)，仍失败 cooling 30s`；`402/余额短语→exhausted`；`3012 unusual activity→风控，试其余路径，全败 cooling`；`3xx→cooling(WAF 挑战)`；`2xx 但非 json/sse→cooling`；其余原样回传。
+5. **上游错误分类**：`401/403→invalid`；`429→请求内退避重试一次(尊重 Retry-After≤5s)，仍失败 cooling 30s`；`402/余额短语→exhausted`；`3012 unusual activity→风控，试其余路径，全败 cooling`；`3xx→cooling(WAF 挑战)`；`2xx 但非 json/sse→cooling`；其余原样回传。挑战页（3xx / 2xx 非 JSON/SSE）返回客户端时统一为 `502`，不伪装 200。
 6. **成功**：`MarkUsed`（cooling/exhausted 复活为 active）+ 节流额度刷新（30s）+ 流式透传/转换 + SSE 嗅探写 `usage_records`（含 TTFT）。
 7. **全败**：503 `no_available_account`，若因冷却则附「约 N 秒后自动恢复」与最近失败原因链。
 
@@ -175,8 +175,8 @@ Go 单二进制实现的 **ZCode（Z.AI / GLM Coding Plan）多账号管理 + OA
 |---|---|---|
 | `pool.rotation` (mutex) | 选号游标 | round_robin 按 `group|provider` 递增 |
 | `claimLocks[id]` (per-account mutex, TryLock) | 领取/重置 | UI 手动与 cron 并发不双领/双重置 |
-| `solveSem` (cap-1 chan) | 验证码 | 全局唯一求解；后台刷新用非阻塞 TryAcquire，**无锁泄漏路径** |
-| `execLocks[planId]` (per-plan mutex, TryLock) | cron | 长计划不排队堆积，拿不到锁跳过本 tick |
+| `groupSem` (per-proxy-group cap-1 chan) | 验证码 | 按出口代理分组唯一求解，前台等待 45s 上限；后台刷新用非阻塞 TryAcquire，**无锁泄漏路径** |
+| `execLocks[planId]` (per-plan mutex, TryLock) | cron | 长计划不排队堆积，cron 拿不到锁跳过本 tick；手动运行拿不到锁报「计划正在执行中」 |
 | `clientCache` (sync.Map) | HTTP 客户端 | 键 `(proxy, 指纹, JA3, timeout, 是否zcode)`；设置变更 `CloseIdleClients()` |
 | SQLite `MaxOpenConns(1)` + WAL | 存储 | 单写串行，busy_timeout 5s |
 
@@ -235,7 +235,7 @@ Go 单二进制实现的 **ZCode（Z.AI / GLM Coding Plan）多账号管理 + OA
 - **Anthropic→Responses**：`response.created/output_item.added/content_part.added/output_text.delta/function_call_arguments.delta/output_text.done/output_item.done/response.completed`；错误/断流发 `response.failed`。
 - **OpenAI→Anthropic 请求**：system/developer→`system` 串；tool→`tool_result`；assistant.tool_calls→`tool_use`；image_url(data:)→base64 image；tool_choice auto/required/name 映射。
 - **Responses→Anthropic**：instructions→system；input[] 的 message/function_call/function_call_output 映射；reasoning.effort→reasoning_effort。
-- **健壮性**：SSE 解析缓冲上限 16MB、跨 chunk 断帧兼容 LF/CRLF；`event:error` 与 `err!=io.EOF` 均按失败处理（不伪装成功）。
+- **健壮性**：SSE 解析缓冲上限 16MB（超限按流失败处理，不静默清空）、跨 chunk 断帧兼容 LF/CRLF；命名 `event:error`、匿名 `data:` 错误帧（顶层 `error` 字段或 `type=error`）与 `err!=io.EOF` 均按失败处理（不伪装成功）。
 
 ## 7. 验证码子系统（阿里云无痕）
 
@@ -281,6 +281,8 @@ go vet .
 - OAuth 环回 redirect_uri 未被 Z.AI 注册（`Redirect URI not registered`），默认手动粘贴模式；
 - 多出口代理下验证码参数按代理分组缓存，跨组不共享；
 - `/v1/messages/count_tokens` 为保守估算（字符/4+开销）。
+- 账号包导出使用 PBKDF2 60 万轮；旧 12 万轮加密包仅支持导入（自动回退），不再生成。
+- SQLite 中账号凭证为明文存储，依赖操作系统文件权限保护 `data/` 目录（请勿多用户共享主机）。
 
 ## 仓库与数据边界
 
