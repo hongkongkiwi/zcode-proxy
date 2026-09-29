@@ -62,11 +62,7 @@ func (z *ZCodeAPI) applyQuotaResult(a *Account, ov *QuotaOverview) {
 		z.pool.MarkExhausted(a, "额度已用完")
 	default:
 		// 有剩余额度：cooling 到期 / exhausted / inactive / invalid（凭证其实有效）恢复 active
-		if a.Status == StatusExhausted || a.Status == StatusInactive || a.Status == StatusInvalid ||
-			(a.Status == StatusCooling && (a.CoolingUntil <= 0 || time.Now().Unix() >= a.CoolingUntil)) {
-			a.Status = StatusActive
-			a.CoolingUntil = 0
-			a.LastError = ""
+		if a.tryRecoverActive() {
 			z.db.SetAccountStatus(a.ID, StatusActive, "", 0)
 			log.Printf("[quota] account %s recovered -> active", a.Email)
 		}
@@ -84,13 +80,7 @@ func (z *ZCodeAPI) applyQuotaResult(a *Account, ov *QuotaOverview) {
 	if ov.Remaining != nil {
 		remaining = *ov.Remaining
 	}
-	a.QuotaJSON = string(quotaJSON)
-	a.PlanTier = ov.PlanTier
-	a.PlanExpire = ov.PlanExpire
-	a.TotalUnits = total
-	a.UsedUnits = used
-	a.Remaining = remaining
-	a.LastCheckedAt = time.Now().Unix()
+	a.setQuota(string(quotaJSON), ov.PlanTier, ov.PlanExpire, total, used, remaining)
 	if err := z.db.SetAccountQuota(a.ID, string(quotaJSON), ov.PlanTier, ov.PlanExpire, total, used, remaining); err != nil {
 		log.Printf("[quota] persist %s: %v", a.Email, err)
 	}

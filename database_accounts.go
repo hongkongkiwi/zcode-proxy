@@ -10,8 +10,8 @@ import (
 // ---- 账号 CRUD ----
 
 // UpsertAccount 按 user_id 自然键插入或更新账号。
-// device_mid / creds_raw 采用 COALESCE(NULLIF(excluded.x,''), accounts.x)：
-// 新值为空时保留旧值，避免重导入抹掉设备指纹与本地凭证快照。
+// device_mid / creds_raw 用 COALESCE 保留旧值：
+// 新值为空时不会被后续导入清空（设备指纹与本地凭证快照不被抹掉）。
 func (db *DB) UpsertAccount(a *Account) (int64, error) {
 	res, err := db.conn.Exec(`
 		INSERT INTO accounts (
@@ -82,6 +82,83 @@ func scanAccount(row interface{ Scan(...interface{}) error }) (*Account, error) 
 	}
 	a.Enabled = enabled == 1
 	return &a, nil
+}
+
+// ---- 运行时字段并发保护 ----
+// 转发请求 goroutine 与额度刷新 goroutine 会并发读写 Account 的状态/额度字段，
+// 所有内存写入必须经下列方法（内部持 a.mu）执行；DB 落库由调用方跟进。
+
+// setRuntime 写状态 / 最近错误 / 冷却截止
+func (a *Account) setRuntime(status, lastError string, coolingUntil int64) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.Status = status
+	a.LastError = lastError
+	a.CoolingUntil = coolingUntil
+}
+
+// bumpUse 记录一次成功使用；仅 cooling 恢复 active（exhausted 只能由额度刷新恢复）
+func (a *Account) bumpUse() {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.UseCount++
+	a.LastUsedAt = time.Now().Unix()
+	if a.Status == StatusCooling {
+		a.Status = StatusActive
+		a.CoolingUntil = 0
+	}
+}
+
+// bumpFail 记录一次失败
+func (a *Account) bumpFail(lastError string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.FailCount++
+	a.LastError = lastError
+}
+
+// tryRecoverActive 额度刷新成功后将可恢复状态迁移回 active
+// （exhausted / inactive / invalid / 已到期的 cooling）；返回是否发生迁移
+func (a *Account) tryRecoverActive() bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	switch {
+	case a.Status == StatusExhausted, a.Status == StatusInactive, a.Status == StatusInvalid:
+	case a.Status == StatusCooling && (a.CoolingUntil <= 0 || time.Now().Unix() >= a.CoolingUntil):
+	default:
+		return false
+	}
+	a.Status = StatusActive
+	a.CoolingUntil = 0
+	a.LastError = ""
+	return true
+}
+
+// setQuota 写额度快照字段
+func (a *Account) setQuota(quotaJSON, planTier, planExpire string, total, used, remaining float64) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.QuotaJSON = quotaJSON
+	a.PlanTier = planTier
+	a.PlanExpire = planExpire
+	a.TotalUnits = total
+	a.UsedUnits = used
+	a.Remaining = remaining
+	a.LastCheckedAt = time.Now().Unix()
+}
+
+// lastCheckedAt 读最近额度检查时间（锁保护；转发侧刷新节流判断用）
+func (a *Account) lastCheckedAt() int64 {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.LastCheckedAt
+}
+
+// statusError 读状态与最近错误（锁保护；转发侧失败提示用）
+func (a *Account) statusError() (string, string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.Status, a.LastError
 }
 
 // GetAccount 按 ID 查询
@@ -180,11 +257,11 @@ func (db *DB) SetAccountQuota(id int64, quotaJSON, planTier, planExpire string, 
 	return err
 }
 
-// TouchAccountUse 记录一次成功使用
+// TouchAccountUse 记录一次成功使用（仅 cooling 恢复 active；exhausted 等额度刷新恢复）
 func (db *DB) TouchAccountUse(id int64) error {
 	_, err := db.conn.Exec(`
 		UPDATE accounts SET use_count = use_count + 1, last_used_at = ?,
-		status = CASE WHEN status IN ('cooling','exhausted') THEN 'active' ELSE status END,
+		status = CASE WHEN status = 'cooling' THEN 'active' ELSE status END,
 		cooling_until = 0,
 		updated_at = datetime('now','localtime') WHERE id = ?`, time.Now().Unix(), id)
 	return err

@@ -452,6 +452,18 @@ func (z *ZCodeAPI) claimForAccountLocked(a *Account) *ClaimResult {
 	}
 
 	result := z.SubmitClaim(a, plan.PlanID, captchaParam, region)
+	// 3001/3007: 参数错/验证码失败 → 失效缓存重解验证码后重试一次
+	if result.Code == 3001 || result.Code == 3007 {
+		z.captcha.InvalidateFor(a)
+		if p2, r2, err := z.captcha.GetVerifyParam(a); err == nil {
+			result = z.SubmitClaim(a, plan.PlanID, p2, r2)
+		}
+	}
+	// 1003: 已领取过 → 视为幂等成功（与 detect 空跑语义一致，避免调度统计误报 failed；record.Code 保留 1003）
+	if result.Code == 1003 {
+		result.OK = true
+		result.Message = "该套餐已经领取过（幂等成功）"
+	}
 	result.PlanName = firstNonEmpty(result.PlanName, plan.Name)
 	record.Success = result.OK
 	record.Code = result.Code

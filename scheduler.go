@@ -34,11 +34,11 @@ type CronScheduler struct {
 	db   *DB
 	zapi *ZCodeAPI
 
-	stopCh  chan struct{}
+	stopCh   chan struct{}
 	stopOnce sync.Once
-	ticker  *time.Ticker
-	runMu   sync.Mutex
-	running map[int64]*PlanRunState
+	ticker   *time.Ticker
+	runMu    sync.Mutex
+	running  map[int64]*PlanRunState
 
 	execMu    sync.Mutex
 	execLocks map[int64]*sync.Mutex // per-plan 执行互斥（TryLock，拿不到跳过本 tick）
@@ -140,7 +140,8 @@ func (s *CronScheduler) checkAndRun() {
 		}
 		// 分钟级去重：本分钟已触发过则跳过（executePlan 开始时即写 last_run_at）
 		if plan.LastRunAt != "" {
-			if lastRun, err := time.Parse("2006-01-02 15:04:05", plan.LastRunAt); err == nil {
+			// last_run_at 由 datetime('now','localtime') 写入，是本地时间，必须按本地时区解析
+			if lastRun, err := time.ParseInLocation("2006-01-02 15:04:05", plan.LastRunAt, time.Local); err == nil {
 				if lastRun.Truncate(time.Minute).Equal(now.Truncate(time.Minute)) {
 					continue
 				}
@@ -150,28 +151,36 @@ func (s *CronScheduler) checkAndRun() {
 	}
 }
 
-// RunPlanNow 手动立即执行（UI 触发）；已在执行则拒绝排队
+// RunPlanNow 手动立即执行（UI 触发）；已在执行则拒绝排队。
+// 此处一次性获取计划锁并移交所有权给 goroutine，避免先放后抢的空窗被 cron tick 抢走导致静默不执行。
 func (s *CronScheduler) RunPlanNow(planID int64) error {
 	plan, err := s.db.GetClaimPlan(planID)
 	if err != nil {
 		return fmt.Errorf("计划不存在: %d", planID)
 	}
-	if !s.planLock(planID).TryLock() {
+	lock := s.planLock(planID)
+	if !lock.TryLock() {
 		return fmt.Errorf("计划正在执行中，请稍后再试")
 	}
-	s.planLock(planID).Unlock()
-	go s.executePlan(plan)
+	go func() {
+		defer lock.Unlock()
+		s.runPlan(plan)
+	}()
 	return nil
 }
 
-// executePlan 执行计划（解析目标账号集合）
+// executePlan 执行计划（cron 路径；已有执行在跑则静默跳过，不排队堆积）
 func (s *CronScheduler) executePlan(plan *ClaimPlan) {
 	lock := s.planLock(plan.ID)
 	if !lock.TryLock() {
-		return // 已有执行在跑，跳过（不排队堆积）
+		return
 	}
 	defer lock.Unlock()
+	s.runPlan(plan)
+}
 
+// runPlan 执行计划体（调用方持有计划锁并负责释放；解析目标账号集合）
+func (s *CronScheduler) runPlan(plan *ClaimPlan) {
 	// 开始即写 last_run_at，避免长计划期间被重复触发
 	s.db.UpdateClaimPlanRun(plan.ID, "running", "执行中")
 
@@ -309,11 +318,18 @@ func shouldRun(cronExpr string, now time.Time) bool {
 	if len(fields) != 5 {
 		return false
 	}
-	return matchField(fields[0], now.Minute(), 0, 59) &&
-		matchField(fields[1], now.Hour(), 0, 23) &&
-		matchField(fields[2], now.Day(), 1, 31) &&
-		matchField(fields[3], int(now.Month()), 1, 12) &&
-		matchField(fields[4], int(now.Weekday()), 0, 6)
+	if !matchField(fields[0], now.Minute(), 0, 59) ||
+		!matchField(fields[1], now.Hour(), 0, 23) ||
+		!matchField(fields[3], int(now.Month()), 1, 12) {
+		return false
+	}
+	// 标准 cron 语义：日与周均受限（非 *）时任一匹配即触发；否则按 AND
+	domOK := matchField(fields[2], now.Day(), 1, 31)
+	dowOK := matchField(fields[4], int(now.Weekday()), 0, 6)
+	if fields[2] != "*" && fields[4] != "*" {
+		return domOK || dowOK
+	}
+	return domOK && dowOK
 }
 
 func matchField(field string, value, min, max int) bool {

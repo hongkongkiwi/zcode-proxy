@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"fmt"
 	"log"
+	"sync"
 
 	_ "modernc.org/sqlite"
 )
@@ -15,6 +16,11 @@ import (
 // user_id 为自然键：重复导入同一账号时按 user_id upsert，
 // device_mid / credentials_raw 一旦写入不会被后续导入清空（COALESCE 保留）。
 type Account struct {
+	// mu 串行化下方运行时可变字段的写入：转发请求与额度刷新 goroutine 并发读写
+	// （状态/冷却/错误/额度快照/Use-Fail 计数，见 database_accounts.go 的写入方法）。
+	// Account 一律以指针传递，禁止按值复制。
+	mu sync.Mutex
+
 	ID          int64  `json:"id"`
 	UserID      string `json:"user_id"`      // 自然键（JWT user_id / user_info.id）
 	Email       string `json:"email"`        // 登录邮箱
@@ -22,20 +28,20 @@ type Account struct {
 	Provider    string `json:"provider"`     // zai | bigmodel
 	AuthType    string `json:"auth_type"`    // jwt | apikey
 
-	AccessToken  string `json:"-"` // OAuth access_token（JWT，内含 api_key claim）
-	RefreshToken string `json:"-"` // OAuth refresh_token
-	ZCodeJWT     string `json:"-"` // Coding Plan JWT（zcode.z.ai 免费通道凭证）
-	APIKey       string `json:"-"` // api.z.ai 通道密钥（{api_key}.{secret_key}）
-	UserInfo     string `json:"-"` // 原始 user_info JSON
-	DeviceMid    string `json:"device_mid"`     // X-Device-Mid（设备指纹，永不被重导入覆盖）
-	CredsRaw     string `json:"-"`              // 本地客户端 credentials.json 原始内容（供一键切回）
+	AccessToken  string `json:"-"`          // OAuth access_token（JWT，内含 api_key claim）
+	RefreshToken string `json:"-"`          // OAuth refresh_token
+	ZCodeJWT     string `json:"-"`          // Coding Plan JWT（zcode.z.ai 免费通道凭证）
+	APIKey       string `json:"-"`          // api.z.ai 通道密钥（{api_key}.{secret_key}）
+	UserInfo     string `json:"-"`          // 原始 user_info JSON
+	DeviceMid    string `json:"device_mid"` // X-Device-Mid（设备指纹，永不被重导入覆盖）
+	CredsRaw     string `json:"-"`          // 本地客户端 credentials.json 原始内容（供一键切回）
 
-	Status       string `json:"status"`        // active|exhausted|cooling|invalid|disabled|inactive
-	Enabled      bool   `json:"enabled"`       // 是否参与轮询
-	AccountGroup string `json:"group"`         // 分组（空=未分组）
-	QuotaJSON    string `json:"-"`             // 最近一次额度快照（规范化 JSON）
-	PlanTier     string `json:"plan_tier"`     // Start Plan / Lite / Pro / Max / 体验
-	PlanExpire   string `json:"plan_expire"`   // 套餐到期时间（展示用字符串）
+	Status       string  `json:"status"`      // active|exhausted|cooling|invalid|disabled|inactive
+	Enabled      bool    `json:"enabled"`     // 是否参与轮询
+	AccountGroup string  `json:"group"`       // 分组（空=未分组）
+	QuotaJSON    string  `json:"-"`           // 最近一次额度快照（规范化 JSON）
+	PlanTier     string  `json:"plan_tier"`   // Start Plan / Lite / Pro / Max / 体验
+	PlanExpire   string  `json:"plan_expire"` // 套餐到期时间（展示用字符串）
 	TotalUnits   float64 `json:"total_units"`
 	UsedUnits    float64 `json:"used_units"`
 	Remaining    float64 `json:"remaining"`
@@ -60,14 +66,14 @@ type Account struct {
 type ClaimPlan struct {
 	ID            int64  `json:"id"`
 	PlanName      string `json:"plan_name"`
-	CronExpr      string `json:"cron_expr"`      // 5 段: 分 时 日 月 周
+	CronExpr      string `json:"cron_expr"` // 5 段: 分 时 日 月 周
 	IsActive      bool   `json:"is_active"`
-	TargetType    string `json:"target_type"`    // all_accounts | single_account | group
-	AccountID     int64  `json:"account_id"`     // single_account 时有效
-	AccountGroup  string `json:"account_group"`  // group 时有效
-	TaskType      string `json:"task_type"`      // detect | claim | activate
-	AutoPick      bool   `json:"auto_pick"`      // claim 时自动选优先级最高的活动
-	DelaySeconds  int    `json:"delay_seconds"`  // 多账号间隔秒数（防风控）
+	TargetType    string `json:"target_type"`   // all_accounts | single_account | group
+	AccountID     int64  `json:"account_id"`    // single_account 时有效
+	AccountGroup  string `json:"account_group"` // group 时有效
+	TaskType      string `json:"task_type"`     // detect | claim | activate
+	AutoPick      bool   `json:"auto_pick"`     // claim 时自动选优先级最高的活动
+	DelaySeconds  int    `json:"delay_seconds"` // 多账号间隔秒数（防风控）
 	LastRunAt     string `json:"last_run_at"`
 	LastRunStatus string `json:"last_run_status"`
 	LastRunMsg    string `json:"last_run_msg"`
@@ -77,17 +83,17 @@ type ClaimPlan struct {
 
 // ClaimRecord 活动领取记录
 type ClaimRecord struct {
-	ID         int64  `json:"id"`
-	CreatedAt  string `json:"created_at"`
-	AccountID  int64  `json:"account_id"`
-	Email      string `json:"email"`
-	TaskType   string `json:"task_type"` // detect | claim | activate
-	PlanID     string `json:"plan_id"`
-	PlanName   string `json:"plan_name"`
-	Success    bool   `json:"success"`
-	Code       int    `json:"code"`
-	Message    string `json:"message"`
-	NextAt     int64  `json:"next_at"` // 1005 名额用完时的下次可领时间 epoch 毫秒
+	ID        int64  `json:"id"`
+	CreatedAt string `json:"created_at"`
+	AccountID int64  `json:"account_id"`
+	Email     string `json:"email"`
+	TaskType  string `json:"task_type"` // detect | claim | activate
+	PlanID    string `json:"plan_id"`
+	PlanName  string `json:"plan_name"`
+	Success   bool   `json:"success"`
+	Code      int    `json:"code"`
+	Message   string `json:"message"`
+	NextAt    int64  `json:"next_at"` // 1005 名额用完时的下次可领时间 epoch 毫秒
 }
 
 // UsageRecord API 使用记录

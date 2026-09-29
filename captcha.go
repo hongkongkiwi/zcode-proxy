@@ -25,17 +25,18 @@ import (
 //   4. window.__onCaptcha 回调捕获 success param（即 X-Aliyun-Captcha-Verify-Param）
 //   5. 参数按出口代理分组缓存 45s；过期后 300s 宽限期内返回旧参数并后台刷新
 //   6. 无头失败自动升级有头窗口让用户手动过，结果同样入缓存
-// 并发模型：容量 1 的信号量保证同一时刻只有一个求解（非阻塞 TryAcquire 用于后台刷新），
-// 不存在锁泄漏路径。
+// 并发模型：按出口代理分组的容量 1 信号量（组间互不阻塞），前台求解有界等待 45s、
+// 超时返回繁忙错误，后台刷新非阻塞 TryAcquire，不存在锁泄漏路径。
 
 const (
-	captchaCacheTTL     = 45 * time.Second
-	captchaStaleGrace   = 300 * time.Second
-	captchaFailCacheTTL = 60 * time.Second
-	captchaConfigTTL    = 10 * time.Minute
-	captchaSolveTimeout = 40 * time.Second
-	captchaSolveRetries = 4
-	captchaChromeUA     = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+	captchaCacheTTL       = 45 * time.Second
+	captchaStaleGrace     = 300 * time.Second
+	captchaFailCacheTTL   = 60 * time.Second
+	captchaConfigTTL      = 10 * time.Minute
+	captchaAcquireTimeout = 45 * time.Second
+	captchaSolveTimeout   = 40 * time.Second
+	captchaSolveRetries   = 4
+	captchaChromeUA       = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
 )
 
 // CaptchaConfig 验证码配置（client/configs 响应）
@@ -63,8 +64,10 @@ type CaptchaService struct {
 	failAt   map[string]time.Time
 	config   *CaptchaConfig
 	configAt time.Time
-	solveSem chan struct{} // 容量 1 信号量：全局唯一求解
-	manual   bool          // 有头手动模式（自动失败后升级）
+
+	semMu  sync.Mutex
+	sems   map[string]chan struct{} // key = 出口代理组（容量 1 信号量，组间互不阻塞）
+	manual bool                     // 有头手动模式（自动失败后升级）
 }
 
 // NewCaptchaService 创建验证码服务
@@ -75,7 +78,7 @@ func NewCaptchaService(cfg *FileConfig, db *DB, appVersion string) *CaptchaServi
 		appVersion: appVersion,
 		cache:      make(map[string]*captchaCacheEntry),
 		failAt:     make(map[string]time.Time),
-		solveSem:   make(chan struct{}, 1),
+		sems:       make(map[string]chan struct{}),
 	}
 }
 
@@ -149,29 +152,61 @@ func (s *CaptchaService) getSetting(key string) string {
 	return v
 }
 
-// tryAcquireSolve 非阻塞获取求解权（后台刷新用；拿不到说明已有求解在跑）
-func (s *CaptchaService) tryAcquireSolve() bool {
+// groupSem 返回出口代理组（代理 URL，空则 default）对应的容量 1 求解信号量
+func (s *CaptchaService) groupSem(a *Account) chan struct{} {
+	group := s.cacheKey(a)
+	if group == "" {
+		group = "default"
+	}
+	s.semMu.Lock()
+	defer s.semMu.Unlock()
+	if ch, ok := s.sems[group]; ok {
+		return ch
+	}
+	ch := make(chan struct{}, 1)
+	s.sems[group] = ch
+	return ch
+}
+
+// tryAcquireSolve 非阻塞获取求解权（后台刷新用；拿不到说明该组已有求解在跑）
+func (s *CaptchaService) tryAcquireSolve(sem chan struct{}) bool {
 	select {
-	case s.solveSem <- struct{}{}:
+	case sem <- struct{}{}:
 		return true
 	default:
 		return false
 	}
 }
 
-func (s *CaptchaService) releaseSolve() { <-s.solveSem }
+// acquireSolve 有界等待获取求解权：最长等 captchaAcquireTimeout，超时返回 false（前台同步路径用）
+func (s *CaptchaService) acquireSolve(sem chan struct{}) bool {
+	timer := time.NewTimer(captchaAcquireTimeout)
+	defer timer.Stop()
+	select {
+	case sem <- struct{}{}:
+		return true
+	case <-timer.C:
+		return false
+	}
+}
+
+func (s *CaptchaService) releaseSolve(sem chan struct{}) { <-sem }
 
 func (s *CaptchaService) refreshInBackground(a *Account) {
-	if !s.tryAcquireSolve() {
+	sem := s.groupSem(a)
+	if !s.tryAcquireSolve(sem) {
 		return
 	}
-	defer s.releaseSolve()
+	defer s.releaseSolve(sem)
 	s.doSolve(a)
 }
 
 func (s *CaptchaService) solveOnce(a *Account) (string, string, error) {
-	s.solveSem <- struct{}{} // 阻塞获取（同步路径，无泄漏：defer 必释放）
-	defer s.releaseSolve()
+	sem := s.groupSem(a)
+	if !s.acquireSolve(sem) {
+		return "", "", fmt.Errorf("验证码求解繁忙（等待 %v 超时），请稍后重试", captchaAcquireTimeout)
+	}
+	defer s.releaseSolve(sem)
 
 	key := s.cacheKey(a)
 	// 双检：等信号量期间可能已被其他请求求解成功
@@ -197,7 +232,10 @@ func (s *CaptchaService) doSolve(a *Account) (string, string, error) {
 	}
 
 	mode := s.getSetting("captcha_mode")
-	headless := mode != "manual" && !s.manual
+	s.mu.Lock()
+	manual := s.manual
+	s.mu.Unlock()
+	headless := mode != "manual" && !manual
 
 	var lastErr error
 	for attempt := 1; attempt <= captchaSolveRetries; attempt++ {

@@ -19,13 +19,13 @@ import (
 // 归一化逻辑移植 zcode-switch quota.rs（plans/balances 双结构 + 防御式字段别名）。
 
 const (
-	BillingBaseURL     = "https://zcode.z.ai/api/v1/zcode-plan"
-	SubscriptionURL    = "https://api.z.ai/api/biz/subscription/list"
-	QuotaLimitURL      = "https://api.z.ai/api/monitor/usage/quota/limit"
-	BillingPreviewURL  = "https://zcode.z.ai/api/v1/zcode-plan/billing/preview"
-	BillingClaimURL    = "https://zcode.z.ai/api/v1/zcode-plan/billing/claim"
-	EventReportURL     = "https://zcode.z.ai/api/v1/event/report"
-	ClientConfigsURL   = "https://zcode.z.ai/api/v1/client/configs"
+	BillingBaseURL    = "https://zcode.z.ai/api/v1/zcode-plan"
+	SubscriptionURL   = "https://api.z.ai/api/biz/subscription/list"
+	QuotaLimitURL     = "https://api.z.ai/api/monitor/usage/quota/limit"
+	BillingPreviewURL = "https://zcode.z.ai/api/v1/zcode-plan/billing/preview"
+	BillingClaimURL   = "https://zcode.z.ai/api/v1/zcode-plan/billing/claim"
+	EventReportURL    = "https://zcode.z.ai/api/v1/event/report"
+	ClientConfigsURL  = "https://zcode.z.ai/api/v1/client/configs"
 )
 
 // QuotaItem 单条额度切片
@@ -79,6 +79,12 @@ type apiResponse struct {
 
 // doGetJSON 带客户端身份头的 GET 请求
 func (z *ZCodeAPI) doGetJSON(a *Account, urlStr string, extraHeaders map[string]string) (*apiResponse, error) {
+	return z.doGetJSONAuth(a, urlStr, "", extraHeaders)
+}
+
+// doGetJSONAuth 同 doGetJSON，但显式指定 Bearer 凭证；
+// bearerToken 为空时回退 billingToken（zcode.z.ai 计费端点语义）。
+func (z *ZCodeAPI) doGetJSONAuth(a *Account, urlStr, bearerToken string, extraHeaders map[string]string) (*apiResponse, error) {
 	client := ClientForURL(z.egress.ProxyURLForAccount(a), urlStr, 25*time.Second)
 	req, err := http.NewRequest("GET", urlStr, nil)
 	if err != nil {
@@ -88,8 +94,10 @@ func (z *ZCodeAPI) doGetJSON(a *Account, urlStr string, extraHeaders map[string]
 	for k, v := range ZaiClientHeaders(id) {
 		req.Header.Set(k, v)
 	}
-	// 认证：JWT 优先，API Key 通道同样以 Bearer 传递（monitor/subscription 端点语义）
-	token := z.billingToken(a)
+	token := bearerToken
+	if token == "" {
+		token = z.billingToken(a)
+	}
 	if token == "" {
 		return nil, fmt.Errorf("账号缺少有效凭证")
 	}
@@ -194,26 +202,34 @@ func unwrapData(v map[string]interface{}) map[string]interface{} {
 // ---- 主入口 ----
 
 // FetchQuotaRaw 拉取并归一化账号额度（不落库、不改状态）
+// 状态约定：纯网络失败/业务失败返回 err（调用方仅记日志，下轮重试）；
+// 仅当已应答通道全部返回 401/403 时返回 AuthFailed 结果（nil err），由状态机标记 invalid。
 func (z *ZCodeAPI) FetchQuotaRaw(a *Account) (*QuotaOverview, error) {
 	if a.ZCodeJWT != "" {
 		ov, err := z.fetchZaiBilling(a)
 		if err == nil {
 			return ov, nil
 		}
-		// JWT 通道鉴权失败且账号带 API Key 时回退 monitor 通道
-		if a.APIKey != "" && (ov == nil || ov.AuthFailed || isAuthErr(err)) {
-			return z.fetchApiZaiMonitor(a)
+		// 纯网络失败（超时/连接拒绝，无 HTTP 响应）：不回退、不改状态
+		if ov == nil || !ov.AuthFailed {
+			return nil, err
 		}
-		return nil, err
+		// JWT 通道明确 401/403 且账号带 API Key 时回退 monitor 通道
+		if a.APIKey == "" {
+			return nil, err
+		}
+		ov2, err2 := z.fetchApiZaiMonitor(a)
+		if err2 != nil && (ov2 == nil || !ov2.AuthFailed) {
+			// 回退通道网络/业务失败：单通道鉴权失败不定性，不改状态
+			return nil, err2
+		}
+		// 回退成功，或双通道均 401/403（AuthFailed → 状态机标记 invalid）
+		return ov2, nil
 	}
 	if a.APIKey != "" {
 		return z.fetchApiZaiMonitor(a)
 	}
 	return nil, fmt.Errorf("账号缺少凭证")
-}
-
-func isAuthErr(err error) bool {
-	return err != nil && strings.Contains(err.Error(), "401")
 }
 
 // fetchZaiBilling JWT 通道：billing/current → billing/balance
@@ -264,8 +280,12 @@ func (z *ZCodeAPI) fetchZaiBilling(a *Account) (*QuotaOverview, error) {
 }
 
 // fetchApiZaiMonitor API Key 通道：quota/limit + subscription/list
+// api.z.ai monitor 端点以 API Key（而非 JWT）鉴权（README §5.1）
 func (z *ZCodeAPI) fetchApiZaiMonitor(a *Account) (*QuotaOverview, error) {
-	resp, err := z.doGetJSON(a, QuotaLimitURL, nil)
+	if a.APIKey == "" {
+		return nil, fmt.Errorf("账号缺少 API Key")
+	}
+	resp, err := z.doGetJSONAuth(a, QuotaLimitURL, a.APIKey, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -284,7 +304,7 @@ func (z *ZCodeAPI) fetchApiZaiMonitor(a *Account) (*QuotaOverview, error) {
 		return nil, fmt.Errorf("额度查询失败: %s", msg)
 	}
 	var sub *map[string]interface{}
-	if subResp, err := z.doGetJSON(a, SubscriptionURL, nil); err == nil && businessOK(subResp.Body) {
+	if subResp, err := z.doGetJSONAuth(a, SubscriptionURL, a.APIKey, nil); err == nil && businessOK(subResp.Body) {
 		body := subResp.Body
 		sub = &body
 	}
@@ -735,6 +755,3 @@ func SortItemsByRemaining(items []QuotaItem) {
 		return ri > rj
 	})
 }
-
-// 保证 strconv 引用（防御未来删改）
-var _ = strconv.Itoa

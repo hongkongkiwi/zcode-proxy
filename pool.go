@@ -44,6 +44,8 @@ type AccountPool struct {
 	mu       sync.Mutex
 	rotation map[string]int // "group|provider" -> round-robin 游标
 
+	invalidRetry map[int64]time.Time // invalid 账号上次重试时间（mu 保护，内存退避）
+
 	refreshFn func(a *Account) error // 由 ZCodeAPI 注入的额度刷新函数
 	stopCh    chan struct{}
 	stopOnce  sync.Once
@@ -52,11 +54,12 @@ type AccountPool struct {
 // NewAccountPool 创建账号池
 func NewAccountPool(db *DB, cfg *FileConfig, appVersion string) *AccountPool {
 	return &AccountPool{
-		db:         db,
-		cfg:        cfg,
-		appVersion: appVersion,
-		rotation:   make(map[string]int),
-		stopCh:     make(chan struct{}),
+		db:           db,
+		cfg:          cfg,
+		appVersion:   appVersion,
+		rotation:     make(map[string]int),
+		invalidRetry: make(map[int64]time.Time),
+		stopCh:       make(chan struct{}),
 	}
 }
 
@@ -88,6 +91,9 @@ func (p *AccountPool) refreshLoop() {
 		interval := p.refreshInterval()
 		if interval > 0 {
 			p.refreshAll()
+		} else {
+			// 显式 0 = 关闭刷新：固定 30s 后重读配置（设置支持 UI 热更新，避免空转打满 GetSetting）
+			interval = 30
 		}
 		select {
 		case <-p.stopCh:
@@ -112,6 +118,15 @@ func (p *AccountPool) refreshInterval() int {
 	return n // 显式 0 = 关闭后台刷新
 }
 
+// invalidBackoff invalid 账号重试退避间隔：max(refreshInterval*10, 5 分钟)
+func (p *AccountPool) invalidBackoff() time.Duration {
+	d := time.Duration(p.refreshInterval()) * 10 * time.Second
+	if d < 5*time.Minute {
+		d = 5 * time.Minute
+	}
+	return d
+}
+
 // refreshAll 刷新所有启用账号的额度（并发 4，账号间 1-3s 随机延迟防风控）
 func (p *AccountPool) refreshAll() {
 	p.mu.Lock()
@@ -125,10 +140,11 @@ func (p *AccountPool) refreshAll() {
 		log.Printf("[pool] list accounts: %v", err)
 		return
 	}
+	backoff := p.invalidBackoff()
 	sem := make(chan struct{}, 4)
 	var wg sync.WaitGroup
 	for _, a := range accounts {
-		if !a.Enabled || a.Status == StatusDisabled || a.Status == StatusInvalid {
+		if !a.Enabled || a.Status == StatusDisabled {
 			continue
 		}
 		if a.ZCodeJWT == "" && a.APIKey == "" {
@@ -137,6 +153,18 @@ func (p *AccountPool) refreshAll() {
 		// 冷却中的账号跳过刷新（到期后自然恢复）
 		if a.Status == StatusCooling && a.CoolingUntil > time.Now().Unix() {
 			continue
+		}
+		// invalid 账号按退避参与刷新（额度刷新是唯一自动恢复路径）
+		if a.Status == StatusInvalid {
+			p.mu.Lock()
+			last := p.invalidRetry[a.ID]
+			p.mu.Unlock()
+			if time.Since(last) < backoff {
+				continue
+			}
+			p.mu.Lock()
+			p.invalidRetry[a.ID] = time.Now()
+			p.mu.Unlock()
 		}
 		wg.Add(1)
 		sem <- struct{}{}
@@ -245,8 +273,7 @@ func (p *AccountPool) Select(provider, group string, skip map[int64]bool) *Accou
 
 // MarkExhausted 额度用完
 func (p *AccountPool) MarkExhausted(a *Account, reason string) {
-	a.Status = StatusExhausted
-	a.LastError = reason
+	a.setRuntime(StatusExhausted, reason, 0)
 	p.db.SetAccountStatus(a.ID, StatusExhausted, reason, 0)
 	log.Printf("[pool] account %s -> exhausted: %s", a.Email, reason)
 }
@@ -257,44 +284,34 @@ func (p *AccountPool) MarkCooling(a *Account, reason string, seconds int) {
 		seconds = 60
 	}
 	until := time.Now().Unix() + int64(seconds)
-	a.Status = StatusCooling
-	a.CoolingUntil = until
-	a.LastError = reason
+	a.setRuntime(StatusCooling, reason, until)
 	p.db.SetAccountStatus(a.ID, StatusCooling, reason, until)
 	log.Printf("[pool] account %s -> cooling %ds: %s", a.Email, seconds, reason)
 }
 
 // MarkInvalid 凭证失效
 func (p *AccountPool) MarkInvalid(a *Account, reason string) {
-	a.Status = StatusInvalid
-	a.LastError = reason
+	a.setRuntime(StatusInvalid, reason, 0)
 	p.db.SetAccountStatus(a.ID, StatusInvalid, reason, 0)
 	log.Printf("[pool] account %s -> invalid: %s", a.Email, reason)
 }
 
 // MarkInactive 套餐未激活
 func (p *AccountPool) MarkInactive(a *Account, reason string) {
-	a.Status = StatusInactive
-	a.LastError = reason
+	a.setRuntime(StatusInactive, reason, 0)
 	p.db.SetAccountStatus(a.ID, StatusInactive, reason, 0)
 	log.Printf("[pool] account %s -> inactive: %s", a.Email, reason)
 }
 
-// MarkUsed 成功使用一次（cooling/exhausted 恢复 active）
+// MarkUsed 成功使用一次（仅 cooling 恢复 active；exhausted 只能由额度刷新恢复，避免并发复活抖动）
 func (p *AccountPool) MarkUsed(a *Account) {
-	a.UseCount++
-	a.LastUsedAt = time.Now().Unix()
-	if a.Status == StatusCooling || a.Status == StatusExhausted {
-		a.Status = StatusActive
-		a.CoolingUntil = 0
-	}
+	a.bumpUse()
 	p.db.TouchAccountUse(a.ID)
 }
 
 // MarkFailed 失败计数
 func (p *AccountPool) MarkFailed(a *Account, reason string) {
-	a.FailCount++
-	a.LastError = reason
+	a.bumpFail(reason)
 	p.db.BumpAccountFail(a.ID, reason)
 }
 
