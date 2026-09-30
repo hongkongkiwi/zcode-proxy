@@ -485,6 +485,15 @@ func (z *ZCodeAPI) forwardOnce(w http.ResponseWriter, r *http.Request, a *Accoun
 				return outcomeNextAccount
 			}
 
+			// 无 CF 指纹但返回 HTML：阿里云 WAF（上游跑在阿里云，拦截页不带 CF
+			// 指纹）、其他防护或中间代理错误页。API 端点正常只回 JSON，4xx/5xx
+			// + HTML 与凭证无关，与上方 CF 分支同待遇：只冷通道，绝不判死账号，
+			// 也不当验证码被拒
+			if strings.Contains(resp.Header.Get("Content-Type"), "text/html") {
+				z.markChannelFailure(a, channel, fmt.Sprintf("上游返回 HTML 拦截/错误页 HTTP %d", resp.StatusCode), 300)
+				return outcomeNextAccount
+			}
+
 			// 验证码被拒：失效缓存 → 重解 → 带新参数重试本路径
 			if isCaptchaError(text) && (resp.StatusCode == 400 || resp.StatusCode == 401 || resp.StatusCode == 403) {
 				if verifyParam != "" && attempt+1 < retries {
