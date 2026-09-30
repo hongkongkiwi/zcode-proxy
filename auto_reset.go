@@ -22,12 +22,14 @@ import (
 //
 // ---- 临期槽位 use-it-or-lose-it ----
 // 重置机会槽位自带 expire_at，到期未用即作废。上面的阈值保留策略在"槽位先于
-// 下次耗尽到期"时会把槽位一直保留到作废——保留到作废不如到期前花掉。因此当
-// 槽位进入 auto_reset_expiry_spend_minutes（默认 60，0=关闭）临期窗口时，
-// 无论账号是否耗尽、自然恢复多近，都消耗该槽位：剩余额度在自然重置时不结转，
-// 临期消耗至少把 (100-剩余)% 的恢复价值拿到手。非耗尽账号没有 402 触发点，
-// 由 reset/status 同步路径（每账号 ≤10 分钟一次）代为评估——窗口设在到期前
-// 一小时也给失败重试留出多次机会。
+// 下次耗尽到期"时会把槽位一直保留到作废——保留到作废不如到期前花掉。临期消耗
+// 由独立开关 auto_reset_expiry_enabled 控制（默认开：到期作废的槽位花了不亏，
+// 不依赖上面默认关闭的耗尽阈值主开关），窗口为
+// auto_reset_expiry_spend_minutes（默认 60，0=关闭）：无论账号是否耗尽、自然
+// 恢复多近，都消耗临期槽位——剩余额度在自然重置时不结转，临期消耗至少把
+// (100-剩余)% 的恢复价值拿到手。非耗尽账号没有 402 触发点，由 reset/status
+// 同步路径（每账号 ≤10 分钟一次）代为评估——窗口设在到期前一小时也给失败
+// 重试留出多次机会。
 
 const autoResetAttemptInterval = 10 * time.Minute
 
@@ -37,6 +39,13 @@ const autoResetExpirySpendDefaultMin = 60
 // autoResetExpirySpendGap 同账号两次临期消耗之间的最小间隔：
 // 防上游 status 短暂滞后（use 已受理但槽位仍显示可用）导致同槽位双花
 const autoResetExpirySpendGap = 30 * time.Minute
+
+// autoResetExpiryEnabled 临期槽位自动消耗开关：未配置 = 开（与 sticky_sessions
+// 同款默认开语义），显式 0/false 关
+func autoResetExpiryEnabled(db *DB) bool {
+	v, _ := db.GetSetting("auto_reset_expiry_enabled")
+	return v != "0" && v != "false"
+}
 
 var autoResetState = struct {
 	sync.Mutex
@@ -95,10 +104,18 @@ func autoResetWait(a *Account) (int64, bool) {
 	return wait, true
 }
 
-// MaybeAutoReset 耗尽后的自动重置评估（非阻塞调用：内部自持锁，失败只记日志）。
+// MaybeAutoReset 自动重置评估（非阻塞调用：内部自持锁，失败只记日志）：
+// 耗尽阈值消耗（auto_reset_enabled 门控）+ 临期槽位消耗（expiry 开关门控）。
 // trigger 仅用于日志定位（relay / quota / manual-check）。
 func (z *ZCodeAPI) MaybeAutoReset(a *Account, trigger string) {
-	if v, _ := z.db.GetSetting("auto_reset_enabled"); v != "1" {
+	// 两路开关：auto_reset_enabled 门控耗尽阈值消耗（默认关）；
+	// auto_reset_expiry_enabled 门控临期消耗（默认开，独立于主开关）
+	expiryOn := autoResetExpiryEnabled(z.db)
+	autoOn := false
+	if v, _ := z.db.GetSetting("auto_reset_enabled"); v == "1" {
+		autoOn = true
+	}
+	if !autoOn && !expiryOn {
 		return
 	}
 	// 锁保护读：a 可能正被并发额度刷新 goroutine 改写状态
@@ -145,8 +162,12 @@ func (z *ZCodeAPI) MaybeAutoReset(a *Account, trigger string) {
 
 	wait, waitKnown := autoResetWait(a)
 	// 临期槽位压过阈值保留：阈值假设"留着以后耗尽时用更划算"，
-	// 但槽位先到期时留 = 作废，花掉才是唯一不掉价值的选项
-	windowSec := int64(settingInt(z.db, "auto_reset_expiry_spend_minutes", autoResetExpirySpendDefaultMin)) * 60
+	// 但槽位先到期时留 = 作废，花掉才是唯一不掉价值的选项。
+	// 窗口 0（开关关）时 autoResetSlotExpiringSoon 恒 false，退回纯阈值判定
+	windowSec := int64(0)
+	if expiryOn {
+		windowSec = int64(settingInt(z.db, "auto_reset_expiry_spend_minutes", autoResetExpirySpendDefaultMin)) * 60
+	}
 	var chosen []ResetSlot
 	if resetType == "FIVE_HOUR" {
 		chosen = st.AvailableFiveHourResets
@@ -154,7 +175,8 @@ func (z *ZCodeAPI) MaybeAutoReset(a *Account, trigger string) {
 		chosen = st.AvailableWeekResets
 	}
 	expireAt, expiring := autoResetSlotExpiringSoon(time.Now().Unix(), windowSec, chosen)
-	if !expiring && !autoResetShouldSpend(waitKnown, wait, thresholdSeconds) {
+	// 阈值消耗只在主开关开时生效；主开关关时仅临期槽位可触发消耗
+	if !expiring && !(autoOn && autoResetShouldSpend(waitKnown, wait, thresholdSeconds)) {
 		log.Printf("[auto-reset] %s: %s window resets naturally in %dm (< threshold), keeping reset slot",
 			a.DisplayNameOrEmail(), resetType, (wait+59)/60)
 		return
@@ -235,7 +257,8 @@ func (z *ZCodeAPI) spendExpiringResetForSync(a *Account, st *ResetStatus) {
 	if st == nil {
 		return
 	}
-	if v, _ := z.db.GetSetting("auto_reset_enabled"); v != "1" {
+	// 独立开关（默认开）：临期消耗不依赖 auto_reset_enabled 主开关
+	if !autoResetExpiryEnabled(z.db) {
 		return
 	}
 	windowSec := int64(settingInt(z.db, "auto_reset_expiry_spend_minutes", autoResetExpirySpendDefaultMin)) * 60
