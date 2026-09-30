@@ -48,10 +48,15 @@ func (ac *AutoClaimer) Start() {
 				return
 			case <-t.C:
 			}
-			if ac.enabled() {
+			iv := ac.interval()
+			if iv > 0 && ac.enabled() {
 				ac.RunOnce("cron")
 			}
-			t.Reset(ac.interval())
+			if iv == 0 {
+				// 手动模式（间隔显式 0）：循环空转，每分钟复查设置是否改回
+				iv = time.Minute
+			}
+			t.Reset(iv)
 		}
 	}()
 	log.Printf("[auto-claim] started")
@@ -62,23 +67,26 @@ func (ac *AutoClaimer) enabled() bool {
 	return v != "0" && v != "false"
 }
 
-// interval 轮询间隔（分钟）：设置非法回落默认；显式 0 = 关闭循环节奏外的
-// 额外执行（循环仍空转等待，RunOnce 可由手动 API 触发）
+// interval 轮询间隔（分钟）：>0 且 <5 提升到下限；非法/负数回落默认 30；
+// 显式 0 = 手动模式：循环不自动执行，RunOnce 留给手动触发
 func (ac *AutoClaimer) interval() time.Duration {
 	mins := autoClaimDefaultIntervalMin
 	if v, _ := ac.db.GetSetting("auto_claim_interval_minutes"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil {
+			if n == 0 {
+				return 0
+			}
 			mins = n
 		}
 	}
-	if mins <= 0 {
+	if mins < 0 {
 		mins = autoClaimDefaultIntervalMin
 	}
 	if mins < autoClaimMinIntervalMin {
 		mins = autoClaimMinIntervalMin
 	}
 	// ±20% 抖动：固定周期批量打 detect 接口本身就是可聚类特征
-	jitter := time.Duration(rand.Intn(int(float64(mins) * 0.4))) * time.Minute
+	jitter := time.Duration(rand.Intn(int(float64(mins)*0.4))) * time.Minute
 	return time.Duration(mins)*time.Minute + jitter
 }
 

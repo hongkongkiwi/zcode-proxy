@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"fmt"
 	"log"
+	"strings"
 	"sync"
 
 	_ "modernc.org/sqlite"
@@ -57,7 +58,7 @@ type Account struct {
 	// 付费通道（api.z.ai API Key，按量计费）与免费通道（JWT 套餐额度）状态分离：
 	// 免费侧耗尽/冷却记在 status/cooling_until，付费侧受限记在 paid_cooling_until，
 	// 互不牵连——免费耗尽的账号其付费通道仍可参与回退。
-	PaidFallback     bool `json:"paid_fallback"`      // 允许付费通道参与回退（双通道账号才有意义）
+	PaidFallback     bool  `json:"paid_fallback"`      // 允许付费通道参与回退（双通道账号才有意义）
 	PaidCoolingUntil int64 `json:"paid_cooling_until"` // 付费通道冷却截止 epoch 秒（含余额不足长冷却）
 
 	// usageChannel 本次请求实际使用的通道（"free"/"paid"），转发路径在上游请求前
@@ -110,23 +111,23 @@ type ClaimRecord struct {
 
 // UsageRecord API 使用记录
 type UsageRecord struct {
-	ID                 int64  `json:"id"`
-	CreatedAt          string `json:"created_at"`
-	AccountID          int64  `json:"account_id"`
-	Email              string `json:"email"`
-	Model              string `json:"model"`
-	PromptTokens       int    `json:"prompt_tokens"`
-	CompletionTokens   int    `json:"completion_tokens"`
-	TotalTokens        int    `json:"total_tokens"`
-	CacheReadTokens    int    `json:"cache_read_tokens"`
-	CacheCreationTokens int   `json:"cache_creation_tokens"`
-	Stream             bool   `json:"stream"`
-	StatusCode         int    `json:"status_code"`
-	DurationMs         int    `json:"duration_ms"`
-	TtftMs             int    `json:"ttft_ms"`
-	GatewayKeyID       int64  `json:"gateway_key_id"`
-	KeyName            string `json:"key_name"`
-	Channel            string `json:"channel"` // free（JWT 套餐）| paid（api.z.ai 按量计费）；旧记录为空按 free
+	ID                  int64  `json:"id"`
+	CreatedAt           string `json:"created_at"`
+	AccountID           int64  `json:"account_id"`
+	Email               string `json:"email"`
+	Model               string `json:"model"`
+	PromptTokens        int    `json:"prompt_tokens"`
+	CompletionTokens    int    `json:"completion_tokens"`
+	TotalTokens         int    `json:"total_tokens"`
+	CacheReadTokens     int    `json:"cache_read_tokens"`
+	CacheCreationTokens int    `json:"cache_creation_tokens"`
+	Stream              bool   `json:"stream"`
+	StatusCode          int    `json:"status_code"`
+	DurationMs          int    `json:"duration_ms"`
+	TtftMs              int    `json:"ttft_ms"`
+	GatewayKeyID        int64  `json:"gateway_key_id"`
+	KeyName             string `json:"key_name"`
+	Channel             string `json:"channel"` // free（JWT 套餐）| paid（api.z.ai 按量计费）；旧记录为空按 free
 }
 
 // ProxyNode 出口代理节点（组绑定）
@@ -206,9 +207,10 @@ func NewDB(dbPath string) (*DB, error) {
 	}
 	// 凭证加密种子解析（keyfile 生成/轮换）必须先于任何账号读写
 	ResolveVaultSeed(db, dbPath)
-	// priority 列增量迁移（旧库无此列；已存在时报错忽略）
-	if _, err := db.conn.Exec(`ALTER TABLE accounts ADD COLUMN priority INTEGER NOT NULL DEFAULT 100`); err == nil {
-		log.Printf("[db] added accounts.priority column (default 100)")
+	// priority 列增量迁移（旧库无此列）
+	if err := db.addColumnMigrate(`ALTER TABLE accounts ADD COLUMN priority INTEGER NOT NULL DEFAULT 100`); err != nil {
+		conn.Close()
+		return nil, err
 	}
 	// 免费优先 / 付费回退：付费通道独立状态 + 每账号回退开关 + 用量通道归因
 	for _, col := range []string{
@@ -216,8 +218,9 @@ func NewDB(dbPath string) (*DB, error) {
 		`ALTER TABLE accounts ADD COLUMN paid_cooling_until INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE usage_records ADD COLUMN channel TEXT NOT NULL DEFAULT ''`,
 	} {
-		if _, err := db.conn.Exec(col); err == nil {
-			log.Printf("[db] %s", col)
+		if err := db.addColumnMigrate(col); err != nil {
+			conn.Close()
+			return nil, err
 		}
 	}
 	// usage_records 增量迁移：缓存 token 计量（R3）+ 命名网关 Key 归因（R1）
@@ -229,8 +232,9 @@ func NewDB(dbPath string) (*DB, error) {
 		// 上游重置 used_at（epoch 秒）：让同步去重走精确匹配而非时区换算启发式
 		`ALTER TABLE claim_records ADD COLUMN used_at INTEGER NOT NULL DEFAULT 0`,
 	} {
-		if _, err := db.conn.Exec(col); err == nil {
-			log.Printf("[db] %s", col)
+		if err := db.addColumnMigrate(col); err != nil {
+			conn.Close()
+			return nil, err
 		}
 	}
 	// 存量明文凭证列静态加密迁移（幂等；失败不阻断启动，下轮再试）
@@ -239,6 +243,20 @@ func NewDB(dbPath string) (*DB, error) {
 	}
 	db.ProbeVaultHealth()
 	return db, nil
+}
+
+// addColumnMigrate 增量加列：仅"列已存在"视为幂等成功，其余错误如实上报——
+// 吞掉真失败（如库被外部进程占锁）会让启动看似成功、首个账号查询才撞
+// no such column，症状离病因三步远
+func (db *DB) addColumnMigrate(stmt string) error {
+	if _, err := db.conn.Exec(stmt); err != nil {
+		if strings.Contains(err.Error(), "duplicate column name") {
+			return nil
+		}
+		return fmt.Errorf("migrate %q: %w", stmt, err)
+	}
+	log.Printf("[db] %s", stmt)
+	return nil
 }
 
 // Close 关闭数据库连接
@@ -426,8 +444,8 @@ func (db *DB) initSchema() error {
 		"auto_claim_interval_minutes": "30",
 		"auto_claim_delay_seconds":    "10",
 		// 自动重置策略：默认关闭；开启后仅在"耗尽 && 自然窗口等待 > 阈值"时消耗
-		"auto_reset_enabled":           "0",
-		"auto_reset_min_wait_minutes":  "60",
+		"auto_reset_enabled":             "0",
+		"auto_reset_min_wait_minutes":    "60",
 		"auto_reset_min_wait_week_hours": "24",
 		// 免费优先 / 付费回退：免费通道（JWT 套餐额度）先用，受限（并发满/限流/耗尽）
 		// 后无缝落到付费通道（api.z.ai 按量计费）；上限 0 = 不限

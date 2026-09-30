@@ -12,6 +12,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -196,10 +197,18 @@ func main() {
 	listenAddr := cfg.GetListenAddr()
 	log.Printf("[main] zcode-proxy listening on http://%s", listenAddr)
 	log.Printf("[main] web UI: http://%s/web", listenAddr)
-	// 显式 Server：ReadHeaderTimeout 防 Slowloris；SSE 决定不设 WriteTimeout
+	// 显式 Server：ReadHeaderTimeout 防 Slowloris；SSE 决定不设 WriteTimeout。
+	// 在途请求计数：停机时先等处理器退出，再走 deferred 池停止与 db.Close()，
+	// 否则长 SSE 期间 usage/状态写库会撞上已关闭的库
+	var inFlight sync.WaitGroup
+	authed := limitBody(auth.Middleware(mux))
 	srv := &http.Server{
-		Addr:              listenAddr,
-		Handler:           limitBody(auth.Middleware(mux)),
+		Addr: listenAddr,
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			inFlight.Add(1)
+			defer inFlight.Done()
+			authed.ServeHTTP(w, r)
+		}),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
@@ -216,7 +225,20 @@ func main() {
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	if err := srv.Shutdown(shutdownCtx); err != nil {
-		log.Printf("[main] shutdown: %v", err)
+		// 排水超时（长 SSE 是常态）：强制断连，处理器在下次写响应时退出
+		log.Printf("[main] shutdown: %v; forcing close of active connections", err)
+		srv.Close()
+	}
+	// 给在途处理器一个有界退出窗口，避免 db.Close() 吃掉收尾写入
+	drained := make(chan struct{})
+	go func() {
+		inFlight.Wait()
+		close(drained)
+	}()
+	select {
+	case <-drained:
+	case <-time.After(30 * time.Second):
+		log.Printf("[main] shutdown: in-flight handlers still draining after 30s; proceeding")
 	}
 }
 

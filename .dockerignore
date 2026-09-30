@@ -5,10 +5,19 @@ config/
 *.db-shm
 *.db-wal
 *.key
+.secrets.env
+refs/
 
 # Version control and CI
 .git
 .github
+
+# Worktrees and agent workspaces — full repo copies with build artifacts
+.worktrees/
+.agents/
+
+# Local build output
+zcode-proxy
 
 # Local backups
 backups/

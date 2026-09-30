@@ -517,7 +517,10 @@ func exeDir() string {
 	return filepath.Dir(exe)
 }
 
-// RestoreLocalFromSnapshot 用导入时的快照还原本地客户端（撤销切回）
+// RestoreLocalFromSnapshot 用导入时的快照还原本地客户端（撤销切回）。
+// 与切回同一不可逆纪律：先备份现网凭证再动笔；多实例快照以实例目录推导密钥，
+// 而还原目标恒为主 home——先按主 home 密钥预检每个 enc:v1 值可解密，
+// 避免把别的实例目录加密的快照盖到主目录后客户端全体解密失败、登录态尽失。
 func (m *AccountManager) RestoreLocalFromSnapshot(accountID int64) error {
 	a, err := m.db.GetAccount(accountID)
 	if err != nil {
@@ -531,6 +534,33 @@ func (m *AccountManager) RestoreLocalFromSnapshot(accountID int64) error {
 		return fmt.Errorf("快照解析失败: %w", err)
 	}
 	f := resolveLocalClientFiles()
+	secret := DefaultCredentialSecret(f.home)
+	// 预检：全部密文快照值必须能在目标 home 密钥下解密才动笔
+	for name, content := range snapshot {
+		if content == "" || !IsEncryptedValue(content) {
+			continue
+		}
+		if _, err := DecryptCredential(content, secret); err != nil {
+			return fmt.Errorf("快照 %s 无法在本地客户端密钥下解密（可能来自多实例实例目录），拒绝还原以免登出本地客户端: %w", name, err)
+		}
+	}
+	// 备份现网凭证：还原是覆盖性写入，备份是唯一可逆手段（与切回一致）
+	backupDir := filepath.Join(exeDir(), "data", "backups")
+	if err := os.MkdirAll(backupDir, 0755); err != nil {
+		return fmt.Errorf("创建备份目录失败: %w", err)
+	}
+	stamp := time.Now().Format("20060102-150405")
+	for _, p := range []string{f.credentials, f.config} {
+		if data, err := os.ReadFile(p); err == nil {
+			bak := filepath.Join(backupDir, filepath.Base(p)+".restore."+stamp+".bak")
+			if err := os.WriteFile(bak, data, 0600); err != nil {
+				return fmt.Errorf("备份 %s 失败: %w", filepath.Base(p), err)
+			}
+			if err := os.Chmod(bak, 0600); err != nil {
+				return fmt.Errorf("收紧备份权限失败: %w", err)
+			}
+		}
+	}
 	targets := map[string]string{
 		"credentials.json": f.credentials,
 		"config.json":      f.config,

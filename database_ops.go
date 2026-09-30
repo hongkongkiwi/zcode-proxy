@@ -2,6 +2,7 @@ package main
 
 import (
 	"database/sql"
+	"fmt"
 	"strconv"
 	"strings"
 	"time"
@@ -369,6 +370,9 @@ func (db *DB) ListProxyNodes() ([]*ProxyNode, error) {
 			&n.CheckMsg, &n.CheckAt, &n.CreatedAt, &n.UpdatedAt); err != nil {
 			return nil, err
 		}
+		// 密码静态加密读回明文（vault1: 前缀才解；历史明文行原样透传，
+		// 下次保存时加密迁移）
+		n.Password = vaultDecrypt(n.Password)
 		n.IsDefault = isDef == 1
 		n.Enabled = enabled == 1
 		out = append(out, &n)
@@ -377,6 +381,12 @@ func (db *DB) ListProxyNodes() ([]*ProxyNode, error) {
 }
 
 func (db *DB) SaveProxyNode(n *ProxyNode) (int64, error) {
+	// 密码与账号凭证同一威胁模型：库文件外泄不得连带可用代理凭证
+	enc, err := vaultEncrypt(n.Password)
+	if err != nil {
+		return 0, fmt.Errorf("proxy password encrypt: %w", err)
+	}
+	n.Password = enc
 	// 清默认 + 写新默认必须同事务：清了不写会留下零默认节点，
 	// 写了不清会撞 idx_proxy_nodes_default 唯一约束
 	tx, err := db.conn.Begin()

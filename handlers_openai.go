@@ -305,8 +305,12 @@ func openaiToAnthropic(body map[string]interface{}) (map[string]interface{}, err
 				}
 				switch pm["type"] {
 				case "text":
+					// 与字符串形态同理：空 text 块会被 Anthropic schema 拒绝（"at least 1 character"），
+					// 数组形态的 text:""/null 也必须跳过而不是转发整单 400
 					t, _ := pm["text"].(string)
-					blocks = append(blocks, map[string]interface{}{"type": "text", "text": t})
+					if t != "" {
+						blocks = append(blocks, map[string]interface{}{"type": "text", "text": t})
+					}
 				case "image_url":
 					iu, _ := pm["image_url"].(map[string]interface{})
 					u, _ := iu["url"].(string)
@@ -374,13 +378,9 @@ func openaiToAnthropic(body map[string]interface{}) (map[string]interface{}, err
 			blocks = replayThinkingBlocks(blocks)
 		}
 		if len(blocks) > 0 {
-			item := map[string]interface{}{"role": role, "content": blocks}
-			if role == "assistant" {
-				if name, ok := msg["name"].(string); ok && name != "" {
-					item["name"] = name
-				}
-			}
-			messages = append(messages, item)
+			// 不转发 OpenAI 的 message.name：Anthropic messages schema 只有 role/content，
+			// 未知字段会被上游整单拒绝
+			messages = append(messages, map[string]interface{}{"role": role, "content": blocks})
 		}
 	}
 
@@ -519,10 +519,13 @@ func asBlockList(v interface{}) []map[string]interface{} {
 
 // ---- 请求体转换：OpenAI Responses → Anthropic Messages ----
 
-func responsesContentToText(content interface{}) string {
+// responsesContentToText 提取文本部分；图片 part（input_image）显式报错而非静默丢弃——
+// 否则纯图片消息整体消失（"input must contain at least one message"），多轮对话里
+// 模型看到的是缺图的对话（与 chat 路径对不支持图片形态的 fail-closed 处理一致）
+func responsesContentToText(content interface{}) (string, error) {
 	switch c := content.(type) {
 	case string:
-		return c
+		return c, nil
 	case []interface{}:
 		var parts []string
 		for _, p := range c {
@@ -530,15 +533,18 @@ func responsesContentToText(content interface{}) string {
 			if !ok {
 				continue
 			}
+			if pm["type"] == "input_image" {
+				return "", errString("input_image parts are not supported on /v1/responses by the upstream; use /v1/chat/completions with a data: base64 image_url instead")
+			}
 			for _, k := range []string{"text", "input_text", "output_text"} {
 				if s, ok := pm[k].(string); ok && s != "" {
 					parts = append(parts, s)
 				}
 			}
 		}
-		return strings.Join(parts, "\n")
+		return strings.Join(parts, "\n"), nil
 	}
-	return ""
+	return "", nil
 }
 
 func responsesToAnthropic(body map[string]interface{}) (map[string]interface{}, error) {
@@ -566,7 +572,10 @@ func responsesToAnthropic(body map[string]interface{}) (map[string]interface{}, 
 			role, _ := im["role"].(string)
 			switch {
 			case itemType == "message" || role == "user" || role == "assistant" || role == "system" || role == "developer":
-				text := responsesContentToText(im["content"])
+				text, err := responsesContentToText(im["content"])
+				if err != nil {
+					return nil, err
+				}
 				if text == "" {
 					if s, ok := im["content"].(string); ok {
 						text = s
@@ -581,7 +590,10 @@ func responsesToAnthropic(body map[string]interface{}) (map[string]interface{}, 
 				}
 			case itemType == "function_call_output":
 				callID := firstNonEmpty(jsonStr(im, "call_id"), jsonStr(im, "tool_call_id"))
-				output := responsesContentToText(im["output"])
+				output, err := responsesContentToText(im["output"])
+				if err != nil {
+					return nil, err
+				}
 				if callID != "" {
 					messages = append(messages, map[string]interface{}{
 						"role": "tool", "tool_call_id": callID, "content": output,

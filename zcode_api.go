@@ -8,6 +8,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -126,7 +127,9 @@ func (z *ZCodeAPI) applyQuotaResult(a *Account, ov *QuotaOverview) {
 	// 促销账号先于付费账号被消费。仅首次（UseCount==0 且仍为默认值）生效，
 	// 不覆盖用户在账号编辑里的手动调整。
 	if ov.PlanTier != "" && a.UseCount == 0 && accountPriority(a) == DefaultPriority && isPromoTier(ov.PlanTier) {
+		a.mu.Lock()
 		a.Priority = PromoPriority
+		a.mu.Unlock()
 		if err := z.db.UpdateAccountPriority(a.ID, PromoPriority); err != nil {
 			log.Printf("[quota] auto promo priority %s: %v", a.Email, err)
 		} else {
@@ -393,8 +396,16 @@ func (z *ZCodeAPI) HandleModelRetrieve(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, http.StatusNotFound, "not found: "+r.URL.Path)
 		return
 	}
+	// 与聊天通道同规范：百分号解码 + 别名映射 + 大小写不敏感比较
+	// （/v1/models/glm-5.3 对 /v1/chat/completions 有效，单查不该 404）
+	if un, err := url.PathUnescape(id); err == nil {
+		id = un
+	}
+	if official, ok := modelNameMap[strings.ToLower(strings.TrimSpace(id))]; ok {
+		id = official
+	}
 	for _, m := range z.effectiveModels() {
-		if m == id {
+		if strings.EqualFold(m, id) {
 			writeJSON(w, http.StatusOK, modelObject(m, time.Now().Unix()))
 			return
 		}

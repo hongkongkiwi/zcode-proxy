@@ -225,13 +225,23 @@ func (s *CronScheduler) runPlan(plan *ClaimPlan, triggered time.Time) {
 
 	var results []string
 	successCount, failCount := 0, 0
+	aborted := false
 	for i, a := range targets {
 		if i > 0 && plan.DelaySeconds > 0 {
 			// 固定延迟 + 0~50% 随机抖动，模拟人工
 			jitter := rand.Intn(plan.DelaySeconds/2 + 1)
 			sleep := plan.DelaySeconds + jitter
 			log.Printf("[scheduler] plan #%d: sleep %ds before %s", plan.ID, sleep, a.DisplayNameOrEmail())
-			time.Sleep(time.Duration(sleep) * time.Second)
+			// 停机感知：长计划横跨数分钟，Stop() 后不得继续打上游/写库
+			select {
+			case <-s.stopCh:
+				log.Printf("[scheduler] plan #%d: aborted by shutdown before %s", plan.ID, a.DisplayNameOrEmail())
+				aborted = true
+			case <-time.After(time.Duration(sleep) * time.Second):
+			}
+			if aborted {
+				break
+			}
 		}
 		s.updateRunning(plan.ID, func(st *PlanRunState) { st.CurrentAccount = a.DisplayNameOrEmail() })
 
@@ -248,6 +258,14 @@ func (s *CronScheduler) runPlan(plan *ClaimPlan, triggered time.Time) {
 			st.Success = successCount
 			st.Fail = failCount
 		})
+	}
+
+	// 服务停机中断：写终态避免计划卡在 running，且不把半程结果记成 success
+	if aborted {
+		if err := s.db.UpdateClaimPlanRunAt(plan.ID, "failed", "服务停机中断，本次未完成全部账号", runAt); err != nil {
+			log.Printf("[scheduler] plan #%d write run state: %v", plan.ID, err)
+		}
+		return
 	}
 
 	status := "success"

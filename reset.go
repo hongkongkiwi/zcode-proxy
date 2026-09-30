@@ -41,15 +41,17 @@ type ResetStatus struct {
 	HasUnreadHistory        bool        `json:"has_unread_history"`
 }
 
-// resetHeaders AC() 移植：双凭证 + 团队上下文
+// resetHeaders AC() 移植：双凭证 + 团队上下文。
+// 凭证走锁保护快照：本副本可能同时被刷新 goroutine setCredentials 改写
 func (z *ZCodeAPI) resetHeaders(a *Account) map[string]string {
+	jwt, apiKey, _ := a.credentialSnapshot()
 	h := map[string]string{
-		"Authorization": "Bearer " + a.ZCodeJWT,
+		"Authorization": "Bearer " + jwt,
 		"User-Agent":    "ZCode/" + z.appVersion,
 		"accept":        "application/json",
 	}
-	if a.APIKey != "" {
-		h["X-Bigmodel-Authorization"] = a.APIKey
+	if apiKey != "" {
+		h["X-Bigmodel-Authorization"] = apiKey
 	}
 	// 团队上下文：账号备注/分组中以 team:orgId:projId 形式声明时启用
 	if org, proj, ok := parseTeamContext(a); ok {

@@ -22,18 +22,31 @@ import (
 // 此处按账号补齐持久化身份，并按官方客户端首启顺序上报激活事件
 // （端点/事件体与 dengyie/zcode2api app/install.py、app/telemetry.py 逐字段对齐）。
 
-// SetAccountDeviceMid 回填账号设备指纹（不覆盖已有值由调用方保证：仅空值时调用）
-func (db *DB) SetAccountDeviceMid(id int64, deviceMid string) error {
-	_, err := db.conn.Exec(`UPDATE accounts SET device_mid = ?,
-		updated_at = datetime('now','localtime') WHERE id = ?`, deviceMid, id)
-	return err
+// SetAccountDeviceMid 回填账号设备指纹。比较写入：仅当库内为空才落——
+// 重导入场景 upsert 的 COALESCE 已保留原指纹，绝不能轮换既有值。
+// 返回库内生效的指纹（已有值时为原值）。
+func (db *DB) SetAccountDeviceMid(id int64, deviceMid string) (string, error) {
+	res, err := db.conn.Exec(`UPDATE accounts SET device_mid = ?,
+		updated_at = datetime('now','localtime')
+		WHERE id = ? AND (device_mid = '' OR device_mid IS NULL)`, deviceMid, id)
+	if err != nil {
+		return "", err
+	}
+	if n, _ := res.RowsAffected(); n > 0 {
+		return deviceMid, nil
+	}
+	var existing string
+	if err := db.conn.QueryRow(`SELECT device_mid FROM accounts WHERE id = ?`, id).Scan(&existing); err != nil {
+		return "", err
+	}
+	return existing, nil
 }
 
 // EnsureDeviceIdentity 返回账号设备指纹；为空时生成 UUIDv4 并落库。
 // 每个请求 goroutine 持有独立的 Account 副本（database_accounts.go），
-// a.mu 只防单副本内并发；跨副本极端情况下可能各生成一次，落库后写覆盖
-// 为良性竞争（与既有"最后写赢"字段语义一致）。落库失败时清空内存值，
-// 下次调用重试，避免内存与 DB 永久漂移。
+// a.mu 只防单副本内并发；跨副本极端情况下可能各生成一次，比较写入保证
+// 只有第一个落库者生效、后来者采纳库内值（不轮换既有指纹）。落库失败时
+// 清空内存值，下次调用重试，避免内存与 DB 永久漂移。
 func (db *DB) EnsureDeviceIdentity(a *Account) string {
 	if a == nil {
 		return ""
@@ -48,14 +61,23 @@ func (db *DB) EnsureDeviceIdentity(a *Account) string {
 	if !generated {
 		return mid
 	}
-	if err := db.SetAccountDeviceMid(a.ID, mid); err != nil {
+	effective, err := db.SetAccountDeviceMid(a.ID, mid)
+	if err != nil {
 		log.Printf("[identity] account %d persist device_mid: %v", a.ID, err)
 		a.mu.Lock()
 		a.DeviceMid = ""
 		a.mu.Unlock()
 		return ""
 	}
-	log.Printf("[identity] account %d device identity generated", a.ID)
+	if effective != mid {
+		// 库内已有指纹（重导入/并发先生成）：以库内为准
+		a.mu.Lock()
+		a.DeviceMid = effective
+		a.mu.Unlock()
+		mid = effective
+	} else {
+		log.Printf("[identity] account %d device identity generated", a.ID)
+	}
 	return mid
 }
 

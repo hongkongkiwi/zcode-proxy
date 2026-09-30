@@ -36,15 +36,20 @@ func autoResetShouldSpend(waitKnown bool, waitSeconds int64, thresholdSeconds in
 	return waitSeconds >= thresholdSeconds
 }
 
-// autoResetWait 从账号额度快照取自然窗口重置等待（秒）；未知返回 ok=false
+// autoResetWait 从账号额度快照取自然窗口重置等待（秒）；未知返回 ok=false。
+// QuotaJSON 由额度刷新 goroutine 持锁改写（setQuota），必须锁内取快照：
+// string 头两字非原子，撕裂读取会 segfault 或喂错重置决策
 func autoResetWait(a *Account) (int64, bool) {
-	if a.QuotaJSON == "" {
+	a.mu.Lock()
+	quotaJSON := a.QuotaJSON
+	a.mu.Unlock()
+	if quotaJSON == "" {
 		return 0, false
 	}
 	var ov struct {
 		NextReset int64 `json:"next_reset"`
 	}
-	if json.Unmarshal([]byte(a.QuotaJSON), &ov) != nil || ov.NextReset <= 0 {
+	if json.Unmarshal([]byte(quotaJSON), &ov) != nil || ov.NextReset <= 0 {
 		return 0, false
 	}
 	wait := ov.NextReset - time.Now().Unix()
@@ -60,7 +65,8 @@ func (z *ZCodeAPI) MaybeAutoReset(a *Account, trigger string) {
 	if v, _ := z.db.GetSetting("auto_reset_enabled"); v != "1" {
 		return
 	}
-	if a.Status != StatusExhausted {
+	// 锁保护读：a 可能正被并发额度刷新 goroutine 改写状态
+	if status, _ := a.statusError(); status != StatusExhausted {
 		return
 	}
 
@@ -105,6 +111,18 @@ func (z *ZCodeAPI) MaybeAutoReset(a *Account, trigger string) {
 	if !autoResetShouldSpend(waitKnown, wait, thresholdSeconds) {
 		log.Printf("[auto-reset] %s: %s window resets naturally in %dm (< threshold), keeping reset slot",
 			a.DisplayNameOrEmail(), resetType, (wait+59)/60)
+		return
+	}
+
+	// 动笔前以库内最新状态复核：402 触发时 relay 同时拉起配额刷新，
+	// 瞬时误报可能已被并发刷新恢复 active——此时绝不消耗重置槽位
+	fresh, ferr := z.db.GetAccount(a.ID)
+	if ferr != nil {
+		log.Printf("[auto-reset] %s re-read: %v", a.DisplayNameOrEmail(), ferr)
+		return
+	}
+	if fresh.Status != StatusExhausted {
+		log.Printf("[auto-reset] %s: no longer exhausted (concurrent refresh recovered), keeping reset slot", a.DisplayNameOrEmail())
 		return
 	}
 

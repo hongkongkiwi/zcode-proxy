@@ -219,13 +219,14 @@ func (z *ZCodeAPI) relay(w http.ResponseWriter, r *http.Request, rc *relayCtx) {
 		}
 		msg += fmt.Sprintf("；免费通道冷却中（%s），约 %d 秒后自动恢复重试", firstNonEmpty(reason, "上游限流/风控"), secs)
 	}
-	// F3：耗尽账号的上游重置时间已知时如实告知（monitor 通道 nextResetTime）
-	if until, email := z.pool.ExhaustedResetInfo(rc.provider, rc.group); until > 0 {
+	// F3：耗尽账号的上游重置时间已知时如实告知（monitor 通道 nextResetTime）。
+	// 不带账号邮箱/展示名：503 体面向命名 Key 持有方（可能发给第三方）
+	if until, _ := z.pool.ExhaustedResetInfo(rc.provider, rc.group); until > 0 {
 		mins := (until - time.Now().Unix()) / 60
 		if mins < 0 {
 			mins = 0
 		}
-		msg += fmt.Sprintf("；免费额度窗口约 %d 分钟后重置（%s）", mins, firstNonEmpty(email, "promo 账号"))
+		msg += fmt.Sprintf("；免费额度窗口约 %d 分钟后重置", mins)
 	}
 	if detail != "" {
 		msg += "（最近失败原因: " + detail + "）"
@@ -270,16 +271,20 @@ func (rc *relayCtx) sessionKey() string {
 }
 
 // tryAccount 单账号转发，按 mode 决定动用哪些通道：
-//   free     仅免费通道（JWT+验证码 → JWT 直连）；失败统一交给付费回退阶段
-//   paid     仅付费通道（API Key 回退端点）；免费侧受限的账号正是要兜底的对象
-//   balanced 传统级联：免费路径失败立刻试同账号付费通道
+//
+//	free     仅免费通道（JWT+验证码 → JWT 直连）；失败统一交给付费回退阶段
+//	paid     仅付费通道（API Key 回退端点）；免费侧受限的账号正是要兜底的对象
+//	balanced 传统级联：免费路径失败立刻试同账号付费通道
+//
 // 实测免费通道要求人机校验（验证码参数 45s 内可复用），直连仅作放宽时的快速路径。
 // 风控拦截（3012）不立即冷却：先试完本模式内其余路径，全部失败才冷却。
 func (z *ZCodeAPI) tryAccount(w http.ResponseWriter, r *http.Request, a *Account,
 	payload []byte, rc *relayCtx, reasons *[]string, start time.Time, mode string) relayOutcome {
 
 	note := func(msg string) {
-		*reasons = append(*reasons, a.DisplayNameOrEmail()+": "+msg)
+		// reasons 会拼进客户端可见的 503 明细，不含账号身份（命名 Key 可能发给
+		// 第三方）：用内部 ID 代号，真实展示名只在服务端日志
+		*reasons = append(*reasons, fmt.Sprintf("账号#%d: %s", a.ID, msg))
 	}
 
 	// 付费阶段：仅 API Key 通道
@@ -508,7 +513,12 @@ func (z *ZCodeAPI) forwardOnce(w http.ResponseWriter, r *http.Request, a *Accoun
 				if attempt+1 < retries {
 					log.Printf("[relay] account %s model %s rate-limited (HTTP %d), retrying in %ds", a.DisplayNameOrEmail(), rcModel(payload), resp.StatusCode, retryAfter)
 					resp.Body.Close()
-					time.Sleep(time.Duration(retryAfter) * time.Second)
+					// 客户端已断开就不必再占重试窗口（与账号槽位队列同理）
+					select {
+					case <-time.After(time.Duration(retryAfter) * time.Second):
+					case <-r.Context().Done():
+						return outcomeUpstreamError
+					}
 					continue
 				}
 				resp.Body.Close() // 最后一次重试也必须关 body，否则泄漏连接
