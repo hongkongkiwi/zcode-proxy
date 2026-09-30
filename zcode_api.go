@@ -12,6 +12,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode"
+	"unicode/utf8"
 )
 
 // ---- ZCode 上游 API 封装 ----
@@ -236,7 +238,9 @@ func (z *ZCodeAPI) refreshTokenRequest(refreshToken string) (map[string]interfac
 }
 
 // HandleCountTokens POST /v1/messages/count_tokens — Anthropic SDK 会探测该端点。
-// 网关不做精确 tokenize，返回保守估计（字符数/4 + 消息开销），避免 SDK 报 405。
+// 网关拿不到 GLM 分词器，按内容结构估算而非原始 JSON 长度：
+// ASCII≈4字符/令牌、CJK≈1字/令牌、其他文字≈2字符/令牌，图片按固定开销计，
+// 结果整体上浮 5% 保持偏保守（宁高勿低），避免 SDK 报 405。
 func (z *ZCodeAPI) HandleCountTokens(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeAPIError(w, http.StatusMethodNotAllowed, "method not allowed")
@@ -252,9 +256,102 @@ func (z *ZCodeAPI) HandleCountTokens(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	chars := len(body.Messages) + len(body.System) + len(body.Tools)
-	est := chars/4 + 8
+	est := estBaseTokens +
+		estimateMessagesTokens(body.Messages) +
+		estimateContentTokens(body.System) +
+		estimateTextTokens(string(body.Tools))
 	writeJSON(w, http.StatusOK, map[string]interface{}{"input_tokens": est})
+}
+
+// ---- count_tokens 估算辅助 ----
+
+const (
+	estImageTokens     = 1500 // 单个图片/文档块的保守令牌开销
+	estMessageOverhead = 4    // 每条消息的框架开销（role 等）
+	estBaseTokens      = 8    // 请求整体基础开销
+)
+
+// estimateTextTokens 按字符类别估算纯文本令牌数
+func estimateTextTokens(s string) int {
+	ascii, cjk, other := 0, 0, 0
+	for i := 0; i < len(s); {
+		r, size := utf8.DecodeRuneInString(s[i:])
+		i += size
+		switch {
+		case r < utf8.RuneSelf:
+			ascii++
+		case unicode.Is(unicode.Han, r), unicode.Is(unicode.Hiragana, r),
+			unicode.Is(unicode.Katakana, r), unicode.Is(unicode.Hangul, r):
+			cjk++
+		default:
+			other++
+		}
+	}
+	n := ascii/4 + cjk + other/2
+	return (n * 21) / 20 // +5% 保守余量
+}
+
+// estimateContentTokens 处理 content/system 字段：字符串或内容块数组
+// （text / thinking / tool_use / tool_result / image 等）。结构不识别时按原始长度折半兜底。
+func estimateContentTokens(raw json.RawMessage) int {
+	if len(raw) == 0 {
+		return 0
+	}
+	var s string
+	if json.Unmarshal(raw, &s) == nil {
+		return estimateTextTokens(s)
+	}
+	var blocks []json.RawMessage
+	if json.Unmarshal(raw, &blocks) != nil {
+		return estimateTextTokens(string(raw)) / 2
+	}
+	total := 0
+	for _, br := range blocks {
+		var b map[string]json.RawMessage
+		if json.Unmarshal(br, &b) != nil {
+			total += estimateTextTokens(string(br)) / 2
+			continue
+		}
+		total += estimateBlockTokens(b, br)
+	}
+	return total
+}
+
+func estimateBlockTokens(b map[string]json.RawMessage, raw json.RawMessage) int {
+	var ty string
+	_ = json.Unmarshal(b["type"], &ty)
+	switch ty {
+	case "text":
+		return estimateContentTokens(b["text"])
+	case "thinking":
+		return estimateContentTokens(b["thinking"])
+	case "tool_use":
+		// input 是任意 JSON 对象：按原始 JSON 文本估算（键名开销小，偏保守方向）
+		return estimateTextTokens(string(b["input"]))
+	case "tool_result":
+		return estimateContentTokens(b["content"])
+	case "image", "document":
+		return estImageTokens
+	default:
+		// 未知块类型：整块原始长度折半兜底，不 panic
+		return estimateTextTokens(string(raw)) / 2
+	}
+}
+
+// estimateMessagesTokens 遍历 messages 数组，逐条累加内容与框架开销
+func estimateMessagesTokens(raw json.RawMessage) int {
+	if len(raw) == 0 {
+		return 0
+	}
+	var msgs []map[string]json.RawMessage
+	if json.Unmarshal(raw, &msgs) != nil {
+		return estimateTextTokens(string(raw)) / 2
+	}
+	total := 0
+	for _, m := range msgs {
+		total += estMessageOverhead + estimateContentTokens(m["content"])
+	}
+	return total
 }
 
 // HandleModels GET /v1/models — 同时兼容 OpenAI 与 Anthropic 字段
