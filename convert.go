@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -431,6 +432,14 @@ func writeProtocolResponse(w http.ResponseWriter, rc *relayCtx, status int, cont
 
 // ---- 流式响应写回 ----
 
+// clientGone 中途读失败是否源于客户端主动断开：上游请求绑定 r.Context()（relay），
+// 客户端先行关闭时其 Err() 为 context.Canceled。此类中断按 499（nginx 语义的
+// "client closed request"，net/http 无该常量，用字面量）落库而非 502，避免客户端
+// 主动放弃污染上游错误率面板
+func clientGone(r *http.Request) bool {
+	return r != nil && errors.Is(r.Context().Err(), context.Canceled)
+}
+
 // streamProtocolResponse 流式透传/转换 + usage 嗅探 + 用量落库
 func streamProtocolResponse(w http.ResponseWriter, rc *relayCtx, resp *http.Response,
 	a *Account, r *http.Request, payload []byte, z *ZCodeAPI, start time.Time) {
@@ -496,8 +505,14 @@ func streamProtocolResponse(w http.ResponseWriter, rc *relayCtx, resp *http.Resp
 			recStatus = 502
 			log.Printf("[relay] upstream stream error event (passthrough): %s", usage.StreamError)
 		} else if readErr != nil && readErr != io.EOF {
-			recStatus = 502
-			log.Printf("[relay] upstream stream interrupted (passthrough): %v", readErr)
+			if clientGone(r) {
+				// 客户端主动断开：499 落库，不计入上游错误
+				recStatus = 499
+				log.Printf("[relay] client closed request mid-stream (passthrough)")
+			} else {
+				recStatus = 502
+				log.Printf("[relay] upstream stream interrupted (passthrough): %v", readErr)
+			}
 		}
 		z.recordUsage(a, r, payload, recStatus, start, ttft, &usage, rc.clientStream)
 
@@ -603,6 +618,7 @@ func (z *ZCodeAPI) streamOpenAI(w http.ResponseWriter, flusher http.Flusher, res
 	var activeTool map[string]interface{}
 	var texts, thinks []string
 	first := true
+	sawStart := false // 见过 message_start（与聚合路径 sawStart 同义，零事件判定用）
 	toolIndices := map[int]int{}
 	toolArgsSeen := map[int]bool{}    // 该工具块是否已收到过 input_json_delta
 	toolStartArgs := map[int]string{} // content_block_start 自带的完整 input（无 delta 时补发用）
@@ -628,6 +644,9 @@ func (z *ZCodeAPI) streamOpenAI(w http.ResponseWriter, flusher http.Flusher, res
 	handle := func(ev sseEvent) {
 		if ttft == 0 {
 			ttft = int(time.Since(start).Milliseconds())
+		}
+		if ev.Event == "message_start" {
+			sawStart = true
 		}
 		applyEventToUsage(ev, &usage, &activeTool, &texts, &thinks)
 		switch ev.Event {
@@ -735,11 +754,17 @@ func (z *ZCodeAPI) streamOpenAI(w http.ResponseWriter, flusher http.Flusher, res
 	finalizeToolCalls(&usage)
 	cacheThinkingForOutput(strings.Join(texts, ""), &usage)
 
-	// 上游流内错误或中途断流：发 OpenAI 错误 chunk 而非伪装成功
-	if usage.StreamError != "" || (readErr != nil && readErr != io.EOF) {
+	// 上游流内错误、中途断流或零事件干净 EOF：发 OpenAI 错误 chunk 而非伪装成功
+	//（零事件判定与聚合路径同规：不得合成 200 空助手回合）
+	interrupted := readErr != nil && readErr != io.EOF
+	zeroEvents := !sawStart && len(texts) == 0 && len(usage.ToolCalls) == 0
+	if usage.StreamError != "" || interrupted || zeroEvents {
 		msg := usage.StreamError
-		if msg == "" {
+		if msg == "" && interrupted {
 			msg = fmt.Sprintf("upstream stream interrupted: %v", readErr)
+		}
+		if msg == "" {
+			msg = "upstream stream ended without any events"
 		}
 		ep, _ := json.Marshal(map[string]interface{}{
 			"error": map[string]interface{}{"message": msg, "type": "api_error", "code": "stream_error"},
@@ -749,7 +774,11 @@ func (z *ZCodeAPI) streamOpenAI(w http.ResponseWriter, flusher http.Flusher, res
 		if flusher != nil {
 			flusher.Flush()
 		}
-		z.recordUsage(a, r, payload, 502, start, ttft, &usage, true)
+		recStatus := 502
+		if interrupted && usage.StreamError == "" && clientGone(r) {
+			recStatus = 499
+		}
+		z.recordUsage(a, r, payload, recStatus, start, ttft, &usage, true)
 		return
 	}
 
@@ -811,6 +840,7 @@ func (z *ZCodeAPI) streamResponses(w http.ResponseWriter, flusher http.Flusher, 
 	var usage StreamUsage
 	var activeTool map[string]interface{}
 	var texts, thinks []string
+	sawStart := false // 见过 message_start（与聚合路径 sawStart 同义，零事件判定用）
 	sequence := 0
 	nextOutputIndex := 0
 	ttft := 0
@@ -1000,6 +1030,9 @@ func (z *ZCodeAPI) streamResponses(w http.ResponseWriter, flusher http.Flusher, 
 		}
 		switch ev.Event {
 		case "message_start", "message_delta", "error":
+			if ev.Event == "message_start" {
+				sawStart = true
+			}
 			applyEventToUsage(ev, &usage, &activeTool, &texts, &thinks)
 			return
 		}
@@ -1164,11 +1197,17 @@ func (z *ZCodeAPI) streamResponses(w http.ResponseWriter, flusher http.Flusher, 
 		}
 	}
 
-	// 上游流内错误或中途断流：发 response.failed 而非伪装 completed
-	if usage.StreamError != "" || (readErr != nil && readErr != io.EOF) {
+	// 上游流内错误、中途断流或零事件干净 EOF：发 response.failed 而非伪装 completed
+	//（零事件判定与聚合路径同规：不得合成空 message 项 + completed）
+	interrupted := readErr != nil && readErr != io.EOF
+	zeroEvents := !sawStart && len(texts) == 0 && len(usage.ToolCalls) == 0
+	if usage.StreamError != "" || interrupted || zeroEvents {
 		msg := usage.StreamError
-		if msg == "" {
+		if msg == "" && interrupted {
 			msg = fmt.Sprintf("upstream stream interrupted: %v", readErr)
+		}
+		if msg == "" {
+			msg = "upstream stream ended without any events"
 		}
 		writeEvent("response.failed", map[string]interface{}{
 			"response": map[string]interface{}{
@@ -1180,7 +1219,11 @@ func (z *ZCodeAPI) streamResponses(w http.ResponseWriter, flusher http.Flusher, 
 			flusher.Flush()
 		}
 		finalizeToolCalls(&usage)
-		z.recordUsage(a, r, payload, 502, start, ttft, &usage, true)
+		recStatus := 502
+		if interrupted && usage.StreamError == "" && clientGone(r) {
+			recStatus = 499
+		}
+		z.recordUsage(a, r, payload, recStatus, start, ttft, &usage, true)
 		return
 	}
 
@@ -1380,6 +1423,7 @@ func (z *ZCodeAPI) streamCompletions(w http.ResponseWriter, flusher http.Flusher
 	var usage StreamUsage
 	var activeTool map[string]interface{}
 	var texts, thinks []string
+	sawStart := false // 见过 message_start（与聚合路径 sawStart 同义，零事件判定用）
 	ttft := 0
 	echoPending := echo
 
@@ -1404,6 +1448,9 @@ func (z *ZCodeAPI) streamCompletions(w http.ResponseWriter, flusher http.Flusher
 	handle := func(ev sseEvent) {
 		if ttft == 0 {
 			ttft = int(time.Since(start).Milliseconds())
+		}
+		if ev.Event == "message_start" {
+			sawStart = true
 		}
 		applyEventToUsage(ev, &usage, &activeTool, &texts, &thinks)
 		if ev.Event != "content_block_delta" {
@@ -1443,11 +1490,17 @@ func (z *ZCodeAPI) streamCompletions(w http.ResponseWriter, flusher http.Flusher
 	finalizeToolCalls(&usage)
 	cacheThinkingForOutput(strings.Join(texts, ""), &usage)
 
-	// 上游流内错误或中途断流：发 OpenAI 错误 chunk 而非伪装成功
-	if usage.StreamError != "" || (readErr != nil && readErr != io.EOF) {
+	// 上游流内错误、中途断流或零事件干净 EOF：发 OpenAI 错误 chunk 而非伪装成功
+	//（零事件判定与聚合路径同规：不得合成 200 空助手回合）
+	interrupted := readErr != nil && readErr != io.EOF
+	zeroEvents := !sawStart && len(texts) == 0 && len(usage.ToolCalls) == 0
+	if usage.StreamError != "" || interrupted || zeroEvents {
 		msg := usage.StreamError
-		if msg == "" {
+		if msg == "" && interrupted {
 			msg = fmt.Sprintf("upstream stream interrupted: %v", readErr)
+		}
+		if msg == "" {
+			msg = "upstream stream ended without any events"
 		}
 		ep, _ := json.Marshal(map[string]interface{}{
 			"error": map[string]interface{}{"message": msg, "type": "api_error", "code": "stream_error"},
@@ -1457,7 +1510,11 @@ func (z *ZCodeAPI) streamCompletions(w http.ResponseWriter, flusher http.Flusher
 		if flusher != nil {
 			flusher.Flush()
 		}
-		z.recordUsage(a, r, payload, 502, start, ttft, &usage, true)
+		recStatus := 502
+		if interrupted && usage.StreamError == "" && clientGone(r) {
+			recStatus = 499
+		}
+		z.recordUsage(a, r, payload, recStatus, start, ttft, &usage, true)
 		return
 	}
 
