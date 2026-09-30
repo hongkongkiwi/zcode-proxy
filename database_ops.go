@@ -95,12 +95,17 @@ func (db *DB) UpdateClaimPlanRunAt(id int64, status, msg, runAt string) error {
 func (db *DB) HasResetRecordNear(accountID int64, usedAtSec int64, kind string) (bool, error) {
 	_, offset := time.Now().Zone()
 	var n int
+	// used_at 三分支：精确（同为上游时钟的同步行）、±15min 邻近（本地执行行
+	// 的 used_at 是本地时钟、同步行是上游时钟，两级延迟下秒级相等是赌博）、
+	// =0 走 created_at 墙钟回退（仅遗留行）
 	err := db.conn.QueryRow(
 		`SELECT COUNT(1) FROM claim_records
 		 WHERE account_id=? AND task_type='reset' AND success=1
 		   AND plan_name LIKE ?
-		   AND (used_at = ? OR (used_at = 0 AND ABS(strftime('%s',created_at)-?-?)<900))`,
-		accountID, "%("+kind+")%", usedAtSec, offset, usedAtSec).Scan(&n)
+		   AND (used_at = ?
+		        OR (used_at > 0 AND ABS(used_at - ?) < 900)
+		        OR (used_at = 0 AND ABS(strftime('%s',created_at)-?-?)<900))`,
+		accountID, "%("+kind+")%", usedAtSec, usedAtSec, offset, usedAtSec).Scan(&n)
 	return n > 0, err
 }
 

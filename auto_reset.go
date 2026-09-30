@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -198,10 +199,23 @@ func (z *ZCodeAPI) MaybeAutoReset(a *Account, trigger string) {
 		return
 	}
 
-	// 配额刷新仍在单飞中：等下一轮 debounce 再评估。刷新可能恰好把账号恢复
-	// active——此刻烧重置就是白烧一个稀缺槽位（fresh 重读只覆盖已落库的恢复）
+	// 配额刷新仍在单飞中：排空它再复核。裸返回 = 本次评估永久丢失——
+	// 耗尽账号不会再被选中、不会再产生 402 触发，唯一出路是主动重试
+	// （复核清掉 debounce 印记，两次上限：刷新单飞有超时，不会无限排队）
 	if _, busy := z.quotaRefreshInflight.Load(a.ID); busy {
-		log.Printf("[auto-reset] %s: quota refresh in flight, deferring", a.DisplayNameOrEmail())
+		if strings.HasSuffix(trigger, "-retry") {
+			log.Printf("[auto-reset] %s: refresh still in flight after retry, giving up this episode", a.DisplayNameOrEmail())
+			return
+		}
+		autoResetState.Lock()
+		delete(autoResetState.lastAttempt, a.ID)
+		autoResetState.Unlock()
+		log.Printf("[auto-reset] %s: quota refresh in flight, retrying in 5s", a.DisplayNameOrEmail())
+		retry := trigger + "-retry"
+		z.goBackground("auto-reset-retry", func() {
+			time.Sleep(5 * time.Second)
+			z.MaybeAutoReset(a, retry)
+		})
 		return
 	}
 

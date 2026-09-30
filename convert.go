@@ -1369,7 +1369,7 @@ func (z *ZCodeAPI) streamCompletions(w http.ResponseWriter, flusher http.Flusher
 
 	writeChunk := func(text string, finish interface{}, chunkUsage interface{}) {
 		p := map[string]interface{}{
-			"id": cid, "object": "text_completion.chunk", "created": now, "model": model,
+			"id": cid, "object": "text_completion", "created": now, "model": model,
 			"choices": []map[string]interface{}{{
 				"index": 0, "text": text, "logprobs": nil, "finish_reason": finish,
 			}},
@@ -1457,7 +1457,7 @@ func (z *ZCodeAPI) streamCompletions(w http.ResponseWriter, flusher http.Flusher
 			"total_tokens":      usage.InputTokens + usage.OutputTokens,
 		}
 		p, _ := json.Marshal(map[string]interface{}{
-			"id": cid, "object": "text_completion.chunk", "created": now, "model": model,
+			"id": cid, "object": "text_completion", "created": now, "model": model,
 			"choices": []interface{}{}, "usage": finalUsage,
 		})
 		fmt.Fprintf(w, "data: %s\n\n", p)

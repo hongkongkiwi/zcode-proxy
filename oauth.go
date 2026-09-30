@@ -398,10 +398,11 @@ func (m *OAuthManager) exchangeToken(code, state, redirectURI string) (map[strin
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	var v map[string]interface{}
 	json.Unmarshal(body, &v)
-	// 3xx 空 JSON 多为 WAF/挑战页重定向（与 pollOnce 同判）：照实说明，
-	// 否则落到"返回数据中不含 Coding Plan JWT"误导用户反复重试手动粘贴
-	if len(v) == 0 && resp.StatusCode >= 300 && resp.StatusCode < 400 {
-		return nil, fmt.Errorf("HTTP %d: 疑似 WAF/挑战页重定向（非 JSON 响应），请稍后重试或更换出口代理", resp.StatusCode)
+	// 状态码先于响应体判类（与 pollOnce 同判）：客户端不跟随重定向，3xx 一律
+	// 按 WAF/挑战页处理——带 JSON 壳的挑战页否则会落进"不含 Coding Plan JWT"
+	// 的误导提示，让用户对着一堵墙反复重试手动粘贴
+	if resp.StatusCode >= 300 && resp.StatusCode < 400 {
+		return nil, fmt.Errorf("HTTP %d: 疑似 WAF/挑战页重定向（%s），请稍后重试或更换出口代理", resp.StatusCode, truncate(strings.TrimSpace(string(body)), 120))
 	}
 	if len(v) == 0 && resp.StatusCode >= 400 {
 		return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, truncate(string(body), 200))

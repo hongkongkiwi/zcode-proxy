@@ -78,6 +78,14 @@ func (s *CronScheduler) planLock(id int64) *sync.Mutex {
 // Start 启动调度器（每分钟检查）
 func (s *CronScheduler) Start() {
 	s.ticker = time.NewTicker(1 * time.Minute)
+	// 启动清障：硬杀遗留的 running 状态一次性落为 failed（功能自愈靠下个
+	// 匹配 tick 重跑，但 UI 不该显示幽灵"执行中"最长一周）
+	if n, err := s.db.conn.Exec(`UPDATE claim_plans SET last_run_status='failed',
+		last_run_msg='进程重启中断' WHERE last_run_status='running'`); err == nil {
+		if ra, _ := n.RowsAffected(); ra > 0 {
+			log.Printf("[scheduler] cleared %d plan(s) stuck in running by the previous process", ra)
+		}
+	}
 	go func() {
 		defer close(s.tickDone)
 		log.Printf("[scheduler] started, checking every 1 minute")

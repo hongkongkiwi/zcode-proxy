@@ -311,6 +311,11 @@ func (m *AccountManager) ImportPasted(provider, name, secret, group string) (*Ac
 	if isJWT {
 		if claims, err := DecodeJWTPayload(secret); err == nil {
 			userID = firstNonEmpty(jsonStr(claims, "user_id"), jsonStr(claims, "sub"))
+			// 过期 JWT 照常导入（管理员可能手上有刷新材料），但导入时如实告警
+			if exp, ok := claims["exp"].(float64); ok && exp > 0 && time.Now().Unix() >= int64(exp) {
+				log.Printf("[import] WARNING: pasted JWT already expired at %s — first relay request will 401 until refreshed",
+					time.Unix(int64(exp), 0).Format("2006-01-02 15:04"))
+			}
 		}
 	}
 	if userID == "" {

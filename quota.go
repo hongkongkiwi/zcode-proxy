@@ -365,7 +365,9 @@ func (z *ZCodeAPI) fetchApiZaiMonitor(a *Account) (*QuotaOverview, error) {
 					continue
 				}
 				if n, ok := lm["nextResetTime"].(float64); ok && n > 0 {
-					if s := int64(n / 1000); ov.NextReset == 0 || s < ov.NextReset {
+					// 与 balance 通道同规：过去的脏时间戳不参与 min——否则
+					// wait 恒 0，auto-reset 阈值策略永远判"等自然恢复"
+					if s := int64(n / 1000); s > time.Now().Unix() && (ov.NextReset == 0 || s < ov.NextReset) {
 						ov.NextReset = s
 					}
 				}

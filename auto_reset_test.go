@@ -9,11 +9,11 @@ import (
 // R: 自动重置阈值策略——"还剩 5/20 分钟自然恢复时绝不动用重置"
 func TestAutoResetShouldSpend(t *testing.T) {
 	cases := []struct {
-		name       string
-		waitKnown  bool
-		waitSecs   int64
-		threshold  int64
-		wantSpend  bool
+		name      string
+		waitKnown bool
+		waitSecs  int64
+		threshold int64
+		wantSpend bool
 	}{
 		{"unknown wait spends", false, 0, 3600, true},
 		{"5min left < 60min threshold waits", true, 5 * 60, 60 * 60, false},

@@ -14,7 +14,9 @@ package main
 
 import (
 	"crypto/rand"
+	"database/sql"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -319,11 +321,16 @@ func (db *DB) scanVaultCiphertext(seed string) (total, broken int, err error) {
 		}
 		rows.Close()
 	}
-	// 设置表机密项同样纳入盘点（轮换/合并决策必须看到全部密文）
+	// 设置表机密项同样纳入盘点（轮换/合并决策必须看到全部密文）。
+	// 仅 ErrNoRows 视为未设置；其余读错误必须上抛——"扫不到"当"没有"
+	// 会基于错误前提换钥匙，把密文永久留在旧钥匙下
 	for _, key := range vaultSecretSettings {
 		var val string
 		if err := db.conn.QueryRow(`SELECT value FROM settings WHERE key = ?`, key).Scan(&val); err != nil {
-			continue // 键未设置
+			if errors.Is(err, sql.ErrNoRows) {
+				continue // 键未设置
+			}
+			return total, broken, fmt.Errorf("scan setting %s: %w", key, err)
 		}
 		if !strings.HasPrefix(val, vaultPrefix) {
 			continue
@@ -423,11 +430,14 @@ func (db *DB) consolidateMixedVaultRows(keySeed, legacySeed string) (int, int, e
 		}
 		moved += len(updates)
 	}
-	// 设置表机密项并入 keySeed（与盘点/轮换范围一致）
+	// 设置表机密项并入 keySeed（与盘点/轮换范围一致；读错误上抛，理由同盘点）
 	for _, key := range vaultSecretSettings {
 		var val string
 		if err := tx.QueryRow(`SELECT value FROM settings WHERE key = ?`, key).Scan(&val); err != nil {
-			continue // 键未设置
+			if errors.Is(err, sql.ErrNoRows) {
+				continue // 键未设置
+			}
+			return moved, stuck, fmt.Errorf("consolidate read setting %s: %w", key, err)
 		}
 		if !strings.HasPrefix(val, vaultPrefix) {
 			continue
@@ -551,11 +561,15 @@ func (db *DB) reencryptVaultColumns(oldSeed, newSeed string) (int, error) {
 		}
 		moved += len(updates)
 	}
-	// 设置表机密项一并轮换（与 scanVaultCiphertext 的盘点范围保持一致）
+	// 设置表机密项一并轮换（与 scanVaultCiphertext 的盘点范围保持一致；
+	// 读错误上抛——轮换中途漏读同样留下混钥匙状态）
 	for _, key := range vaultSecretSettings {
 		var val string
 		if err := tx.QueryRow(`SELECT value FROM settings WHERE key = ?`, key).Scan(&val); err != nil {
-			continue // 键未设置
+			if errors.Is(err, sql.ErrNoRows) {
+				continue // 键未设置
+			}
+			return 0, fmt.Errorf("reencrypt read setting %s: %w", key, err)
 		}
 		if !strings.HasPrefix(val, vaultPrefix) {
 			continue
