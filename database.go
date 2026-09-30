@@ -54,6 +54,16 @@ type Account struct {
 	CoolingUntil  int64  `json:"cooling_until"`   // 冷却截止 epoch 秒
 	LastError     string `json:"last_error"`
 
+	// 付费通道（api.z.ai API Key，按量计费）与免费通道（JWT 套餐额度）状态分离：
+	// 免费侧耗尽/冷却记在 status/cooling_until，付费侧受限记在 paid_cooling_until，
+	// 互不牵连——免费耗尽的账号其付费通道仍可参与回退。
+	PaidFallback     bool `json:"paid_fallback"`      // 允许付费通道参与回退（双通道账号才有意义）
+	PaidCoolingUntil int64 `json:"paid_cooling_until"` // 付费通道冷却截止 epoch 秒（含余额不足长冷却）
+
+	// usageChannel 本次请求实际使用的通道（"free"/"paid"），转发路径在上游请求前
+	// 设置、recordUsage 读取；每个请求持有独立 Account 副本，写读同 goroutine。
+	usageChannel string
+
 	LastClaimAt   string `json:"last_claim_at"`   // 最近活动领取时间
 	LastClaimPlan string `json:"last_claim_plan"` // 最近领取的活动名
 	LastClaimMsg  string `json:"last_claim_msg"`  // 最近领取结果
@@ -88,13 +98,14 @@ type ClaimRecord struct {
 	CreatedAt string `json:"created_at"`
 	AccountID int64  `json:"account_id"`
 	Email     string `json:"email"`
-	TaskType  string `json:"task_type"` // detect | claim | activate
+	TaskType  string `json:"task_type"` // detect | claim | activate | reset
 	PlanID    string `json:"plan_id"`
 	PlanName  string `json:"plan_name"`
 	Success   bool   `json:"success"`
 	Code      int    `json:"code"`
 	Message   string `json:"message"`
 	NextAt    int64  `json:"next_at"` // 1005 名额用完时的下次可领时间 epoch 毫秒
+	UsedAt    int64  `json:"used_at"` // 上游重置 used_at（epoch 秒；本地执行的重置为 0）
 }
 
 // UsageRecord API 使用记录
@@ -115,6 +126,7 @@ type UsageRecord struct {
 	TtftMs             int    `json:"ttft_ms"`
 	GatewayKeyID       int64  `json:"gateway_key_id"`
 	KeyName            string `json:"key_name"`
+	Channel            string `json:"channel"` // free（JWT 套餐）| paid（api.z.ai 按量计费）；旧记录为空按 free
 }
 
 // ProxyNode 出口代理节点（组绑定）
@@ -198,12 +210,24 @@ func NewDB(dbPath string) (*DB, error) {
 	if _, err := db.conn.Exec(`ALTER TABLE accounts ADD COLUMN priority INTEGER NOT NULL DEFAULT 100`); err == nil {
 		log.Printf("[db] added accounts.priority column (default 100)")
 	}
+	// 免费优先 / 付费回退：付费通道独立状态 + 每账号回退开关 + 用量通道归因
+	for _, col := range []string{
+		`ALTER TABLE accounts ADD COLUMN paid_fallback INTEGER NOT NULL DEFAULT 1`,
+		`ALTER TABLE accounts ADD COLUMN paid_cooling_until INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE usage_records ADD COLUMN channel TEXT NOT NULL DEFAULT ''`,
+	} {
+		if _, err := db.conn.Exec(col); err == nil {
+			log.Printf("[db] %s", col)
+		}
+	}
 	// usage_records 增量迁移：缓存 token 计量（R3）+ 命名网关 Key 归因（R1）
 	for _, col := range []string{
 		`ALTER TABLE usage_records ADD COLUMN cache_read_tokens INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE usage_records ADD COLUMN cache_creation_tokens INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE usage_records ADD COLUMN gateway_key_id INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE usage_records ADD COLUMN key_name TEXT NOT NULL DEFAULT ''`,
+		// 上游重置 used_at（epoch 秒）：让同步去重走精确匹配而非时区换算启发式
+		`ALTER TABLE claim_records ADD COLUMN used_at INTEGER NOT NULL DEFAULT 0`,
 	} {
 		if _, err := db.conn.Exec(col); err == nil {
 			log.Printf("[db] %s", col)
@@ -405,6 +429,10 @@ func (db *DB) initSchema() error {
 		"auto_reset_enabled":           "0",
 		"auto_reset_min_wait_minutes":  "60",
 		"auto_reset_min_wait_week_hours": "24",
+		// 免费优先 / 付费回退：免费通道（JWT 套餐额度）先用，受限（并发满/限流/耗尽）
+		// 后无缝落到付费通道（api.z.ai 按量计费）；上限 0 = 不限
+		"paid_fallback_mode":   "free_first",
+		"paid_daily_token_cap": "0",
 	}
 	for k, v := range defaults {
 		if _, err := db.conn.Exec(

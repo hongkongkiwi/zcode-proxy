@@ -191,6 +191,8 @@ func accountPublicView(a *Account) map[string]interface{} {
 		"last_checked_at": a.LastCheckedAt,
 		"cooling_until":   a.CoolingUntil,
 		"last_error":      a.LastError,
+		"paid_fallback":     a.PaidFallback,
+		"paid_cooling_until": a.PaidCoolingUntil,
 		"last_claim_at":   a.LastClaimAt, "last_claim_plan": a.LastClaimPlan, "last_claim_msg": a.LastClaimMsg,
 		"created_at": a.CreatedAt, "updated_at": a.UpdatedAt,
 	}
@@ -532,10 +534,11 @@ func (s *APIServer) handleUpdateAccount(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	var body struct {
-		Group    *string `json:"group"`
-		Remark   *string `json:"remark"`
-		Enabled  *bool   `json:"enabled"`
-		Priority *int64  `json:"priority"`
+		Group        *string `json:"group"`
+		Remark       *string `json:"remark"`
+		Enabled      *bool   `json:"enabled"`
+		Priority     *int64  `json:"priority"`
+		PaidFallback *bool   `json:"paid_fallback"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeAPIError(w, http.StatusBadRequest, "invalid request body")
@@ -546,7 +549,7 @@ func (s *APIServer) handleUpdateAccount(w http.ResponseWriter, r *http.Request) 
 		writeAPIError(w, http.StatusNotFound, err.Error())
 		return
 	}
-	group, remark, enabled := a.AccountGroup, a.Remark, a.Enabled
+	group, remark, enabled, paidFallback := a.AccountGroup, a.Remark, a.Enabled, a.PaidFallback
 	if body.Group != nil {
 		group = *body.Group
 	}
@@ -556,7 +559,10 @@ func (s *APIServer) handleUpdateAccount(w http.ResponseWriter, r *http.Request) 
 	if body.Enabled != nil {
 		enabled = *body.Enabled
 	}
-	if err := s.db.UpdateAccountFields(id, group, remark, enabled); err != nil {
+	if body.PaidFallback != nil {
+		paidFallback = *body.PaidFallback
+	}
+	if err := s.db.UpdateAccountFields(id, group, remark, enabled, paidFallback); err != nil {
 		writeAPIError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -803,6 +809,10 @@ func (s *APIServer) handleStats(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	// 当日付费通道 token 消耗（免费优先/付费回退策略的观测口径）
+	if paid, err := s.db.PaidTokensToday(); err == nil {
+		stats["paid_tokens_today"] = paid
+	}
 	writeJSON(w, http.StatusOK, stats)
 }
 
@@ -818,6 +828,8 @@ var settingsWhitelist = map[string]bool{
 	"auto_claim_promos":       true, "auto_claim_interval_minutes": true, "auto_claim_delay_seconds": true,
 	"auto_reset_enabled": true, "auto_reset_min_wait_minutes": true, "auto_reset_min_wait_week_hours": true,
 	"max_concurrent_per_account": true,
+	// 免费优先 / 付费回退策略
+	"paid_fallback_mode":   true, "paid_daily_token_cap": true,
 	// 闲时免费通道（off-peak ticket queue）
 	"async_enabled": true, "async_poll_interval_ms": true,
 	"async_keepalive_ms": true, "async_max_retries": true, "async_max_wait_sec": true,
@@ -866,6 +878,21 @@ func (s *APIServer) handlePutSettings(w http.ResponseWriter, r *http.Request) {
 		if k == "quota_refresh_interval" {
 			if n, err := strconv.Atoi(v); err != nil || n < 0 || n > 86400 {
 				writeAPIError(w, http.StatusBadRequest, "无效刷新间隔")
+				return
+			}
+		}
+		// 付费回退策略：白名单取值；token 上限非负整数（0=不限）
+		if k == "paid_fallback_mode" {
+			switch v {
+			case PaidModeFreeFirst, PaidModeBalanced, PaidModeNever:
+			default:
+				writeAPIError(w, http.StatusBadRequest, "无效付费回退策略: "+v)
+				return
+			}
+		}
+		if k == "paid_daily_token_cap" {
+			if n, err := strconv.ParseInt(strings.TrimSpace(v), 10, 64); err != nil || n < 0 {
+				writeAPIError(w, http.StatusBadRequest, "无效付费 token 上限（非负整数，0=不限）")
 				return
 			}
 		}

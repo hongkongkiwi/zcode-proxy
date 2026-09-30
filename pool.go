@@ -38,6 +38,24 @@ const (
 	StrategyPriority   = "priority"
 )
 
+// 通道（免费优先 / 付费回退）
+//   free: zcode.z.ai JWT 通道（Coding Plan / Start Plan 套餐额度，无按量成本）
+//   paid: api.z.ai API Key 通道（按量计费，真实扣费）
+const (
+	ChannelFree = "free"
+	ChannelPaid = "paid"
+)
+
+// 付费回退策略（设置 paid_fallback_mode）
+const (
+	PaidModeFreeFirst = "free_first" // 免费通道先用，全部受限后才落付费（默认）
+	PaidModeBalanced  = "balanced"   // 传统级联：同账号免费路径失败立刻试其付费通道
+	PaidModeNever     = "never"      // 不使用付费通道（纯 API Key 账号除外——那是它唯一通道）
+)
+
+// 付费通道长冷却：余额/额度不足（402）后隔 6h 放一次探测流量，给充值后自愈留路径
+const paidExhaustedCooldownSec = int64(6 * 3600)
+
 // AccountPool 账号池
 type AccountPool struct {
 	db         *DB
@@ -52,13 +70,23 @@ type AccountPool struct {
 	sticky       map[string]stickyEntry // 会话粘滞：sessionKey -> 账号（mu 保护，TTL 淘汰）
 	stickyPruned time.Time              // 上次粘滞表清理时间
 
-	slots map[int64]*accountSlots // 每账号并发闸门（mu 保护；1302 并发限流的根治手段）
+	slots map[slotKey]*accountSlots // 每（账号×通道）并发闸门（mu 保护；1302 并发限流的根治手段）
 
 	riskStrikes map[int64][]time.Time // 24h 滑动窗口内的风控拦截次数（mu 保护，R4 阶梯冷却）
+
+	paidRateLast    map[int64]int         // 付费通道限流冷却升级记忆（mu 保护：30→120→300s）
+	paidRiskStrikes map[int64][]time.Time // 付费通道风控 24h 窗口计次（mu 保护，复用 riskLadder）
 
 	refreshFn func(a *Account) error // 由 ZCodeAPI 注入的额度刷新函数
 	stopCh    chan struct{}
 	stopOnce  sync.Once
+}
+
+// slotKey 并发闸门键：账号×通道。免费与付费是两条上游链路，各自有独立并发上限；
+// 共用一个闸门会让免费侧打满时付费回退也被堵死
+type slotKey struct {
+	id      int64
+	channel string
 }
 
 // stickyEntry 会话粘滞表项
@@ -79,15 +107,17 @@ const (
 // NewAccountPool 创建账号池
 func NewAccountPool(db *DB, cfg *FileConfig, appVersion string) *AccountPool {
 	return &AccountPool{
-		db:           db,
-		cfg:          cfg,
-		appVersion:   appVersion,
-		rotation:     make(map[string]int),
-		invalidRetry: make(map[int64]time.Time),
-		sticky:       make(map[string]stickyEntry),
-		slots:        make(map[int64]*accountSlots),
-		riskStrikes:  make(map[int64][]time.Time),
-		stopCh:       make(chan struct{}),
+		db:              db,
+		cfg:             cfg,
+		appVersion:      appVersion,
+		rotation:        make(map[string]int),
+		invalidRetry:    make(map[int64]time.Time),
+		sticky:          make(map[string]stickyEntry),
+		slots:           make(map[slotKey]*accountSlots),
+		riskStrikes:     make(map[int64][]time.Time),
+		paidRateLast:    make(map[int64]int),
+		paidRiskStrikes: make(map[int64][]time.Time),
+		stopCh:          make(chan struct{}),
 	}
 }
 
@@ -240,6 +270,44 @@ func accountSelectable(a *Account, now int64) bool {
 	return true
 }
 
+// paidChannelAvailable 付费通道（api.z.ai API Key）可选性。
+// 双通道账号：免费侧 status（exhausted/cooling/invalid）不牵连付费通道——
+// 免费额度耗尽或免费通道被限流时，付费通道照常参与回退；
+// 纯 API Key 账号：status 描述的就是它唯一通道，沿用账号级判定。
+func paidChannelAvailable(a *Account, now int64) bool {
+	if !a.Enabled || a.Status == StatusDisabled || a.APIKey == "" || !a.PaidFallback {
+		return false
+	}
+	if now < a.PaidCoolingUntil {
+		return false
+	}
+	if a.ZCodeJWT == "" {
+		return accountSelectable(a, now)
+	}
+	return true
+}
+
+// selectableForFreePhase 免费优先阶段的候选判定：
+// 有 JWT 的账号走账号级判定（免费通道语义）；纯 API Key 账号没有免费通道，
+// 但付费是它唯一通道——不放进候选会让它在本阶段永远选不上（含 never 策略）。
+func selectableForFreePhase(a *Account, now int64) bool {
+	if a.ZCodeJWT != "" {
+		return accountSelectable(a, now)
+	}
+	return paidChannelAvailable(a, now)
+}
+
+// channelSelectable 按通道判定可选性（"" = 任意通道，账号级判定）
+func channelSelectable(a *Account, channel string, now int64) bool {
+	switch channel {
+	case ChannelFree:
+		return selectableForFreePhase(a, now)
+	case ChannelPaid:
+		return paidChannelAvailable(a, now)
+	}
+	return accountSelectable(a, now)
+}
+
 // EffectiveStatus 考虑冷却到期的实时状态（cooling_until<=0 视为已到期，
 // 与 accountSelectable 同一规则，避免"仪表盘显示冷却、转发却照选"的分裂）
 func EffectiveStatus(a *Account) string {
@@ -262,8 +330,24 @@ func matchAccountGroup(a *Account, group string) bool {
 
 // ---- 账号选择 ----
 
-// Select 按策略选择账号。group 为空 = 不限组；skip 为已尝试过的账号 ID。
+// Select 按策略选择账号（不限通道）。group 为空 = 不限组；skip 为已尝试过的账号 ID。
 func (p *AccountPool) Select(provider, group string, skip map[int64]bool) *Account {
+	return p.SelectChannel(provider, group, skip, "")
+}
+
+// channelHasCreds 通道凭证要求：候选账号必须持有该通道的凭证
+func channelHasCreds(a *Account, channel string) bool {
+	switch channel {
+	case ChannelFree:
+		return a.ZCodeJWT != ""
+	case ChannelPaid:
+		return a.APIKey != ""
+	}
+	return a.ZCodeJWT != "" || a.APIKey != ""
+}
+
+// SelectChannel 按策略在指定通道的候选里选账号；channel 为空 = 不限通道
+func (p *AccountPool) SelectChannel(provider, group string, skip map[int64]bool, channel string) *Account {
 	accounts, err := p.db.ListAccounts("")
 	if err != nil {
 		log.Printf("[pool] select list: %v", err)
@@ -281,11 +365,10 @@ func (p *AccountPool) Select(provider, group string, skip map[int64]bool) *Accou
 		if skip[a.ID] {
 			continue
 		}
-		if !accountSelectable(a, now) {
+		if !channelSelectable(a, channel, now) {
 			continue
 		}
-		// 必须有可用凭证
-		if a.ZCodeJWT == "" && a.APIKey == "" {
+		if !channelHasCreds(a, channel) {
 			continue
 		}
 		pool = append(pool, a)
@@ -293,7 +376,11 @@ func (p *AccountPool) Select(provider, group string, skip map[int64]bool) *Accou
 	if len(pool) == 0 {
 		return nil
 	}
+	return p.pickByStrategy(pool, group, provider)
+}
 
+// pickByStrategy 策略应用：priority 级联 + random / best_quota / round_robin
+func (p *AccountPool) pickByStrategy(pool []*Account, group, provider string) *Account {
 	strategy, _ := p.db.GetSetting("selection_strategy")
 	if strategy == StrategyPriority {
 		// 级联：只保留最高优先级（数值最小）层，层内 round_robin 公平轮转。
@@ -342,29 +429,36 @@ func (p *AccountPool) stickyEnabled() bool {
 	return v != "0" && v != "false"
 }
 
-// SelectSticky 粘滞优先选择：sessionKey 命中且账号仍可选 → 复用；
+// SelectSticky 粘滞优先选择（不限通道）：sessionKey 命中且账号仍可选 → 复用；
 // 否则按策略选择并记录。skip（已尝试失败）的账号不粘滞。
 func (p *AccountPool) SelectSticky(provider, group, sessionKey string, skip map[int64]bool) *Account {
+	return p.SelectStickyChannel(provider, group, sessionKey, skip, "")
+}
+
+// SelectStickyChannel 粘滞优先选择（通道感知）：粘滞命中时按通道可选性复验，
+// 免费侧受限的粘滞账号在付费阶段仍可粘滞复用（prompt 缓存跨通道失效，
+// 但账号一致性对排查与配额归因仍有价值）。
+func (p *AccountPool) SelectStickyChannel(provider, group, sessionKey string, skip map[int64]bool, channel string) *Account {
 	if sessionKey != "" && p.stickyEnabled() {
 		now := time.Now().Unix()
 		p.mu.Lock()
 		e, ok := p.sticky[sessionKey]
 		p.mu.Unlock()
 		if ok && now-e.seenAt < int64(stickyTTL.Seconds()) && !skip[e.accountID] {
-			if a := p.selectableByID(e.accountID, provider, group, skip); a != nil {
+			if a := p.selectableByIDChannel(e.accountID, provider, group, skip, channel); a != nil {
 				p.rememberSticky(sessionKey, a.ID)
 				return a
 			}
 		}
 	}
-	a := p.Select(provider, group, skip)
+	a := p.SelectChannel(provider, group, skip, channel)
 	if a != nil && sessionKey != "" && p.stickyEnabled() {
 		p.rememberSticky(sessionKey, a.ID)
 	}
 	return a
 }
 
-func (p *AccountPool) selectableByID(id int64, provider, group string, skip map[int64]bool) *Account {
+func (p *AccountPool) selectableByIDChannel(id int64, provider, group string, skip map[int64]bool, channel string) *Account {
 	a, err := p.db.GetAccount(id)
 	if err != nil || a == nil {
 		return nil
@@ -375,10 +469,10 @@ func (p *AccountPool) selectableByID(id int64, provider, group string, skip map[
 	if group != "" && !matchAccountGroup(a, group) {
 		return nil
 	}
-	if !accountSelectable(a, time.Now().Unix()) {
+	if !channelSelectable(a, channel, time.Now().Unix()) {
 		return nil
 	}
-	if a.ZCodeJWT == "" && a.APIKey == "" {
+	if !channelHasCreds(a, channel) {
 		return nil
 	}
 	return a
@@ -427,14 +521,16 @@ func (p *AccountPool) accountSlotCap() int {
 }
 
 // AcquireAccountSlot 占用一个在途名额（阻塞至 timeout）；false = 排队超时。
+// 闸门按（账号×通道）隔离：免费与付费是两条上游链路，免费侧打满不得堵死付费回退。
 // 上限设置变更时重建闸门（旧名额 token 作废由 Release 的幂等保护兜底）。
-func (p *AccountPool) AcquireAccountSlot(a *Account, timeout time.Duration) bool {
+func (p *AccountPool) AcquireAccountSlot(a *Account, channel string, timeout time.Duration) bool {
 	capNow := p.accountSlotCap()
+	key := slotKey{id: a.ID, channel: channel}
 	p.mu.Lock()
-	as := p.slots[a.ID]
+	as := p.slots[key]
 	if as == nil || as.cap != capNow {
 		as = &accountSlots{cap: capNow, ch: make(chan struct{}, capNow)}
-		p.slots[a.ID] = as
+		p.slots[key] = as
 	}
 	ch := as.ch
 	p.mu.Unlock()
@@ -458,9 +554,9 @@ func (p *AccountPool) AcquireAccountSlot(a *Account, timeout time.Duration) bool
 }
 
 // ReleaseAccountSlot 释放在途名额（幂等：多余释放忽略）
-func (p *AccountPool) ReleaseAccountSlot(a *Account) {
+func (p *AccountPool) ReleaseAccountSlot(a *Account, channel string) {
 	p.mu.Lock()
-	as := p.slots[a.ID]
+	as := p.slots[slotKey{id: a.ID, channel: channel}]
 	p.mu.Unlock()
 	if as == nil {
 		return
@@ -601,6 +697,16 @@ func (p *AccountPool) riskStrikeCount(id int64) int {
 
 // MarkInvalid 凭证失效
 func (p *AccountPool) MarkInvalid(a *Account, reason string) {
+	// TOCTOU 守卫：并发刷新可能刚换掉库中凭证——库中 JWT 与本副本不同时，
+	// 本副本的 401 判定已过时，不得把刚修好的账号标 invalid（残余的双语句
+	// 交错窗口由 invalid 退避刷新自愈）
+	if a.ID != 0 && a.ZCodeJWT != "" {
+		if fresh, err := p.db.GetAccount(a.ID); err == nil && fresh != nil &&
+			fresh.ZCodeJWT != "" && fresh.ZCodeJWT != a.ZCodeJWT {
+			log.Printf("[pool] account %s credentials rotated concurrently; skipping invalid (%s)", a.Email, truncate(reason, 120))
+			return
+		}
+	}
 	a.setRuntime(StatusInvalid, reason, 0)
 	p.db.SetAccountStatus(a.ID, StatusInvalid, reason, 0)
 	log.Printf("[pool] account %s -> invalid: %s", a.Email, reason)
@@ -611,6 +717,101 @@ func (p *AccountPool) MarkInactive(a *Account, reason string) {
 	a.setRuntime(StatusInactive, reason, 0)
 	p.db.SetAccountStatus(a.ID, StatusInactive, reason, 0)
 	log.Printf("[pool] account %s -> inactive: %s", a.Email, reason)
+}
+
+// ---- 付费通道状态（与免费侧 status/cooling_until 分离，见 Account 字段注释）----
+
+// PaidFallbackPolicy 读付费回退策略；非法/未配置回落 free_first
+func (p *AccountPool) PaidFallbackPolicy() string {
+	v, _ := p.db.GetSetting("paid_fallback_mode")
+	switch v {
+	case PaidModeFreeFirst, PaidModeBalanced, PaidModeNever:
+		return v
+	}
+	return PaidModeFreeFirst
+}
+
+// paidDailyTokenCap 付费通道每日 token 上限（0 = 不限）
+func (p *AccountPool) paidDailyTokenCap() int64 {
+	v, _ := p.db.GetSetting("paid_daily_token_cap")
+	n, err := strconv.ParseInt(strings.TrimSpace(v), 10, 64)
+	if err != nil || n < 0 {
+		return 0
+	}
+	return n
+}
+
+// nextPaidCooldown 付费通道限流冷却升级：30s → 120s → 300s（内存记忆，成功即清零）
+func (p *AccountPool) nextPaidCooldown(a *Account) int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	switch p.paidRateLast[a.ID] {
+	case 0:
+		return 30
+	case 30:
+		return 120
+	default:
+		return 300
+	}
+}
+
+// MarkPaidCooling 付费通道冷却（限流/并发/鉴权失败等）；不触碰免费侧状态列
+func (p *AccountPool) MarkPaidCooling(a *Account, reason string, seconds int) {
+	if seconds <= 0 {
+		seconds = 60
+	}
+	until := time.Now().Unix() + int64(seconds)
+	a.setPaidRuntime(reason, until)
+	p.db.SetAccountPaidStatus(a.ID, reason, until)
+	p.mu.Lock()
+	p.paidRateLast[a.ID] = seconds
+	p.mu.Unlock()
+	log.Printf("[pool] account %s paid-channel cooling %ds: %s", a.Email, seconds, reason)
+}
+
+// MarkPaidExhausted 付费通道余额/额度不足：长冷却，隔窗口放探测流量自愈
+func (p *AccountPool) MarkPaidExhausted(a *Account, reason string) {
+	until := time.Now().Unix() + paidExhaustedCooldownSec
+	a.setPaidRuntime(reason, until)
+	p.db.SetAccountPaidStatus(a.ID, reason, until)
+	log.Printf("[pool] account %s paid-channel exhausted, cooldown %dh: %s",
+		a.Email, paidExhaustedCooldownSec/3600, reason)
+}
+
+// MarkPaidRiskCooling 付费通道风控拦截：阶梯冷却（与免费侧共用 riskLadder 计次独立）
+func (p *AccountPool) MarkPaidRiskCooling(a *Account, reason string) {
+	now := time.Now()
+	p.mu.Lock()
+	cutoff := now.Add(-riskStrikeWindow)
+	live := p.paidRiskStrikes[a.ID][:0]
+	for _, ts := range p.paidRiskStrikes[a.ID] {
+		if ts.After(cutoff) {
+			live = append(live, ts)
+		}
+	}
+	p.paidRiskStrikes[a.ID] = append(live, now)
+	strikes := len(p.paidRiskStrikes[a.ID])
+	p.mu.Unlock()
+
+	idx := strikes - 1
+	if idx >= len(riskLadder) {
+		idx = len(riskLadder) - 1
+	}
+	seconds := int(riskLadder[idx] / time.Second)
+	until := now.Unix() + int64(seconds)
+	a.setPaidRuntime(reason, until)
+	p.db.SetAccountPaidStatus(a.ID, reason, until)
+	log.Printf("[pool] account %s paid-channel risk-cooling %s (strike %d in 24h): %s",
+		a.Email, riskLadder[idx], strikes, reason)
+}
+
+// MarkPaidUsed 付费通道成功使用一次：只清付费冷却与升级记忆，免费侧状态不动
+func (p *AccountPool) MarkPaidUsed(a *Account) {
+	a.bumpUsePaid()
+	p.db.TouchAccountPaidUse(a.ID)
+	p.mu.Lock()
+	delete(p.paidRateLast, a.ID)
+	p.mu.Unlock()
 }
 
 // MarkUsed 成功使用一次（仅 cooling 恢复 active；exhausted 只能由额度刷新恢复，避免并发复活抖动）

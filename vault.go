@@ -319,6 +319,20 @@ func (db *DB) scanVaultCiphertext(seed string) (total, broken int, err error) {
 		}
 		rows.Close()
 	}
+	// 设置表机密项同样纳入盘点（轮换/合并决策必须看到全部密文）
+	for _, key := range vaultSecretSettings {
+		var val string
+		if err := db.conn.QueryRow(`SELECT value FROM settings WHERE key = ?`, key).Scan(&val); err != nil {
+			continue // 键未设置
+		}
+		if !strings.HasPrefix(val, vaultPrefix) {
+			continue
+		}
+		total++
+		if _, err := DecryptCredential(encPrefix+strings.TrimPrefix(val, vaultPrefix), seed); err != nil {
+			broken++
+		}
+	}
 	return total, broken, nil
 }
 
@@ -382,6 +396,33 @@ func (db *DB) consolidateMixedVaultRows(keySeed, legacySeed string) (int, int, e
 		}
 		moved += len(updates)
 	}
+	// 设置表机密项并入 keySeed（与盘点/轮换范围一致）
+	for _, key := range vaultSecretSettings {
+		var val string
+		if err := tx.QueryRow(`SELECT value FROM settings WHERE key = ?`, key).Scan(&val); err != nil {
+			continue // 键未设置
+		}
+		if !strings.HasPrefix(val, vaultPrefix) {
+			continue
+		}
+		body := encPrefix + strings.TrimPrefix(val, vaultPrefix)
+		if _, kerr := DecryptCredential(body, keySeed); kerr == nil {
+			continue // 已在 keyfile 种子下
+		}
+		plain, lerr := DecryptCredential(body, legacySeed)
+		if lerr != nil {
+			stuck++ // 两种种子都解不开：保持原样等钥匙恢复
+			continue
+		}
+		enc, err := EncryptCredential(plain, keySeed)
+		if err != nil {
+			return moved, stuck, fmt.Errorf("consolidate encrypt setting %s: %w", key, err)
+		}
+		if _, err := tx.Exec(`UPDATE settings SET value = ? WHERE key = ?`, vaultPrefix+strings.TrimPrefix(enc, encPrefix), key); err != nil {
+			return moved, stuck, fmt.Errorf("consolidate update setting %s: %w", key, err)
+		}
+		moved++
+	}
 	return moved, stuck, tx.Commit()
 }
 
@@ -436,6 +477,28 @@ func (db *DB) reencryptVaultColumns(oldSeed, newSeed string) (int, error) {
 			}
 		}
 		moved += len(updates)
+	}
+	// 设置表机密项一并轮换（与 scanVaultCiphertext 的盘点范围保持一致）
+	for _, key := range vaultSecretSettings {
+		var val string
+		if err := tx.QueryRow(`SELECT value FROM settings WHERE key = ?`, key).Scan(&val); err != nil {
+			continue // 键未设置
+		}
+		if !strings.HasPrefix(val, vaultPrefix) {
+			continue
+		}
+		plain, err := DecryptCredential(encPrefix+strings.TrimPrefix(val, vaultPrefix), oldSeed)
+		if err != nil {
+			return 0, fmt.Errorf("reencrypt decrypt setting %s: %w", key, err)
+		}
+		enc, err := EncryptCredential(plain, newSeed)
+		if err != nil {
+			return 0, fmt.Errorf("reencrypt encrypt setting %s: %w", key, err)
+		}
+		if _, err := tx.Exec(`UPDATE settings SET value = ? WHERE key = ?`, vaultPrefix+strings.TrimPrefix(enc, encPrefix), key); err != nil {
+			return 0, fmt.Errorf("reencrypt update setting %s: %w", key, err)
+		}
+		moved++
 	}
 	return moved, tx.Commit()
 }

@@ -357,6 +357,7 @@ func (z *ZCodeAPI) SyncResetHistoryFromUpstream(a *Account) (int, error) {
 				PlanName:  "配额重置(" + e.kind + ")",
 				Success:   true,
 				Message:   "上游重置记录（非本网关执行）",
+				UsedAt:    e.used / 1000, // 精确去重锚点（epoch 秒）
 			}); err != nil {
 				// 入库失败不推进锚点：下轮同步重试，否则该记录永久丢失
 				log.Printf("[reset] insert upstream reset record %s account=%s: %v", e.kind, a.Email, err)

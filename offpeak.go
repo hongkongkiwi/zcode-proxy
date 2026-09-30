@@ -238,35 +238,41 @@ type offPeakCreds struct {
 // settleSnapshot 同 settle，但使用凭证快照（在 spawn 前取好）
 func (t offPeakTickets) settleSnapshot(cred offPeakCreds, ticketID string) {
 	id := NewClientIdentity(cred.z.appVersion, cred.deviceMid)
-	ctx := context.Background()
 	settleURL := offPeakControlBase + "/ticket/" + url.QueryEscape(ticketID) + "/settle"
-	req, err := http.NewRequestWithContext(ctx, "POST", settleURL, nil)
-	if err != nil {
-		log.Printf("[async] settle %s… failed: %v", safePrefixLog(ticketID, 8), err)
-		return
-	}
-	for k, v := range ZaiClientHeaders(id) {
-		req.Header.Set(k, v)
-	}
-	req.Header.Set("Authorization", "Bearer "+cred.jwt)
-	if cred.apiKey != "" {
-		req.Header.Set("x-coding-plan-api-key", cred.apiKey)
-	}
-	client := ClientForURL(cred.proxyURL, settleURL, offPeakControlTo)
-	resp, err := client.Do(req)
-	if err != nil {
-		log.Printf("[async] settle %s… failed: %v", safePrefixLog(ticketID, 8), err)
-		return
-	}
-	defer resp.Body.Close()
-	io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))
-	if resp.StatusCode >= 400 {
-		if resp.StatusCode >= 500 {
-			// 5xx 是瞬时失败：票大概率仍有效但被本端放弃，会占用账号免费取票
-			// 配额直到上游过期。至少要留痕，否则泄漏不可见。
-			log.Printf("[async] settle %s… got HTTP %d (transient; ticket may linger until upstream expiry)", safePrefixLog(ticketID, 8), resp.StatusCode)
+	// 关票是补偿性操作：5xx/网络抖动重试一次，避免仍有效的票占住账号免费取票
+	// 配额直到上游过期（4xx = 服务端已清理，不重试）
+	for attempt := 0; attempt < 2; attempt++ {
+		if attempt > 0 {
+			time.Sleep(3 * time.Second)
 		}
-		return // 4xx 视为服务端已清理
+		ctx := context.Background()
+		req, err := http.NewRequestWithContext(ctx, "POST", settleURL, nil)
+		if err != nil {
+			log.Printf("[async] settle %s… failed: %v", safePrefixLog(ticketID, 8), err)
+			return
+		}
+		for k, v := range ZaiClientHeaders(id) {
+			req.Header.Set(k, v)
+		}
+		req.Header.Set("Authorization", "Bearer "+cred.jwt)
+		if cred.apiKey != "" {
+			req.Header.Set("x-coding-plan-api-key", cred.apiKey)
+		}
+		client := ClientForURL(cred.proxyURL, settleURL, offPeakControlTo)
+		resp, err := client.Do(req)
+		if err != nil {
+			log.Printf("[async] settle %s… failed: %v", safePrefixLog(ticketID, 8), err)
+			continue
+		}
+		io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))
+		resp.Body.Close()
+		if resp.StatusCode < 400 {
+			return
+		}
+		if resp.StatusCode < 500 {
+			return // 4xx 视为服务端已清理
+		}
+		log.Printf("[async] settle %s… got HTTP %d (transient; ticket may linger until upstream expiry)", safePrefixLog(ticketID, 8), resp.StatusCode)
 	}
 }
 
@@ -302,6 +308,16 @@ func (z *ZCodeAPI) HandleAsyncMessages(w http.ResponseWriter, r *http.Request) {
 	// 闲时端点按小写模型名校验（桌面/网关常规通道大小写不敏感，此处敏感）
 	if m, ok := body["model"].(string); ok {
 		body["model"] = strings.ToLower(m)
+	}
+	// 命名网关 Key：闲时通道与常规通道同规范拦截（模型白名单 / token 配额），
+	// 否则受限 Key 换走 /async 入口即可绕过白名单与配额
+	if gk := gatewayKeyFromCtx(r.Context()); gk != nil {
+		model, _ := body["model"].(string)
+		mrc := &relayCtx{body: body, clientModel: model}
+		if errResp := checkGatewayKeyRequest(gk, relayModelName(mrc)); errResp != nil {
+			errResp.Write(w)
+			return
+		}
 	}
 	// 桌面端 transform 语义：最后一条非 system 消息的最后一个 block 打 ephemeral 缓存标
 	if msgs, ok := body["messages"].([]interface{}); ok {
@@ -378,7 +394,7 @@ func (z *ZCodeAPI) runOffPeak(w http.ResponseWriter, r *http.Request, opts offPe
 			}
 		}
 	}
-		tried := map[int64]bool{}
+	tried := map[int64]bool{}
 	attempts := 0
 	var reasons []string
 	streamHeaders := false // SSE 响应头只写一次：换号续流时不重复 WriteHeader
@@ -896,13 +912,13 @@ func (z *ZCodeAPI) offPeakForward(w http.ResponseWriter, r *http.Request, a *Acc
 
 // anthropicAgg 将上游 Anthropic SSE 流聚合为一条完整 message JSON
 type anthropicAgg struct {
-	id, model   string
-	blocks      []map[string]interface{}
-	stopReason  string
-	streamError string // 上游内联错误帧（独立于 stop_reason，不被后续 delta 掩盖）
-	in, out     int
+	id, model                string
+	blocks                   []map[string]interface{}
+	stopReason               string
+	streamError              string // 上游内联错误帧（独立于 stop_reason，不被后续 delta 掩盖）
+	in, out                  int
 	cacheRead, cacheCreation int
-	toolJSON    map[int]*strings.Builder
+	toolJSON                 map[int]*strings.Builder
 }
 
 func aggregateAnthropicStream(r io.Reader) ([]byte, *StreamUsage, error) {

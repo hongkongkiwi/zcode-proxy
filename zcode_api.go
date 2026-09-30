@@ -19,6 +19,9 @@ import (
 // ---- ZCode 上游 API 封装 ----
 // 持有账号池 / 验证码服务 / 出口代理，提供额度刷新、活动领取、聊天转发。
 
+// refreshMinInterval 同一账号两次令牌刷新尝试之间的最小间隔（按尝试计时）
+const refreshMinInterval = 90 * time.Second
+
 type ZCodeAPI struct {
 	cfg        *FileConfig
 	db         *DB
@@ -33,6 +36,9 @@ type ZCodeAPI struct {
 
 	resetSyncMu sync.Mutex
 	resetSyncAt map[int64]time.Time // 上游重置历史同步节流（每账号）
+
+	refreshAtMu sync.Mutex
+	refreshAt   map[int64]time.Time // 上次刷新令牌尝试时间（每账号频率退避）
 
 	quotaRefreshInflight sync.Map // 账号ID → 刷新中（单飞，防并发请求对 billing 形成风暴）
 
@@ -53,6 +59,7 @@ func NewZCodeAPI(cfg *FileConfig, db *DB, pool *AccountPool, captcha *CaptchaSer
 		appVersion:  appVersion,
 		claimLocks:  make(map[int64]*sync.Mutex),
 		resetSyncAt: make(map[int64]time.Time),
+		refreshAt:   make(map[int64]time.Time),
 	}
 	pool.SetQuotaFetcher(func(a *Account) error {
 		err := z.RefreshAccountQuota(a)
@@ -159,6 +166,16 @@ func (z *ZCodeAPI) tryRefreshAccount(a *Account) (ok, inflight bool) {
 		return false, true
 	}
 	defer z.tokenRefreshInflight.Delete(a.ID)
+
+	// 频率退避：若刷新端点签发的 JWT 仍被业务端拒绝，每次 401 都会触发一次
+	// 刷新——设最小间隔（按尝试计时，成功与否都计）避免对 OAuth 端点无界连发
+	z.refreshAtMu.Lock()
+	if last, ok := z.refreshAt[a.ID]; ok && time.Since(last) < refreshMinInterval {
+		z.refreshAtMu.Unlock()
+		return false, false
+	}
+	z.refreshAt[a.ID] = time.Now()
+	z.refreshAtMu.Unlock()
 
 	data, err := z.refreshTokenRequest(a.RefreshToken)
 	if err != nil {

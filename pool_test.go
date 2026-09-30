@@ -79,7 +79,7 @@ func TestStickySessions(t *testing.T) {
 		}
 	}
 	// 粘滞账号停用 → 自动让位（且新粘滞落到另一账号）
-	if err := db.UpdateAccountFields(first.ID, "", "", false); err != nil {
+	if err := db.UpdateAccountFields(first.ID, "", "", false, false); err != nil {
 		t.Fatal(err)
 	}
 	other := p.SelectSticky("zai", "", "sess-x", nil)
@@ -87,7 +87,7 @@ func TestStickySessions(t *testing.T) {
 		t.Fatalf("expected fallback after disable, got %+v", other)
 	}
 	// skip 中的账号不参与粘滞：重新启用 s1，跳过 s2 → 应选中 s1
-	if err := db.UpdateAccountFields(first.ID, "", "", true); err != nil {
+	if err := db.UpdateAccountFields(first.ID, "", "", true, false); err != nil {
 		t.Fatal(err)
 	}
 	third := p.SelectSticky("zai", "", "sess-y", map[int64]bool{other.ID: true})
@@ -137,25 +137,25 @@ func TestAccountSlotGate(t *testing.T) {
 	a.ID = id
 	db.SetSetting("max_concurrent_per_account", "2")
 
-	if !p.AcquireAccountSlot(a, 50*time.Millisecond) {
+	if !p.AcquireAccountSlot(a, "free", 50*time.Millisecond) {
 		t.Fatal("first acquire should succeed")
 	}
-	if !p.AcquireAccountSlot(a, 50*time.Millisecond) {
+	if !p.AcquireAccountSlot(a, "free", 50*time.Millisecond) {
 		t.Fatal("second acquire should succeed")
 	}
-	if p.AcquireAccountSlot(a, 50*time.Millisecond) {
+	if p.AcquireAccountSlot(a, "free", 50*time.Millisecond) {
 		t.Fatal("third acquire over cap should time out")
 	}
-	p.ReleaseAccountSlot(a)
-	if !p.AcquireAccountSlot(a, 50*time.Millisecond) {
+	p.ReleaseAccountSlot(a, "free")
+	if !p.AcquireAccountSlot(a, "free", 50*time.Millisecond) {
 		t.Fatal("acquire after release should succeed")
 	}
-	p.ReleaseAccountSlot(a)
-	p.ReleaseAccountSlot(a) // 幂等：多余释放不 panic 不负计数
-	if !p.AcquireAccountSlot(a, 50*time.Millisecond) {
+	p.ReleaseAccountSlot(a, "free")
+	p.ReleaseAccountSlot(a, "free") // 幂等：多余释放不 panic 不负计数
+	if !p.AcquireAccountSlot(a, "free", 50*time.Millisecond) {
 		t.Fatal("idempotent double-release should not corrupt the gate")
 	}
-	p.ReleaseAccountSlot(a)
+	p.ReleaseAccountSlot(a, "free")
 }
 
 func TestIsRateLimitBody(t *testing.T) {

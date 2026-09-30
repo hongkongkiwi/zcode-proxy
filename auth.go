@@ -10,6 +10,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -133,6 +134,13 @@ func legacyHash(pwd string) string {
 	return hex.EncodeToString(h[:])
 }
 
+// cookieSecureOverride ZCODE_COOKIE_SECURE=1/true/on/yes 时强制会话 cookie Secure 位
+// （TLS 由反向代理终止时 r.TLS 恒为 nil，启发式探测不到）
+func cookieSecureOverride() bool {
+	v := strings.ToLower(strings.TrimSpace(os.Getenv("ZCODE_COOKIE_SECURE")))
+	return v == "1" || v == "true" || v == "yes" || v == "on"
+}
+
 // verifyPassword 校验口令；旧 SHA-256 哈希命中后透明升级为 bcrypt
 func (am *AuthManager) verifyPassword(pwd string) bool {
 	stored := ""
@@ -143,7 +151,8 @@ func (am *AuthManager) verifyPassword(pwd string) bool {
 		if strings.HasPrefix(stored, "$2") {
 			return bcrypt.CompareHashAndPassword([]byte(stored), []byte(pwd)) == nil
 		}
-		if legacyHash(pwd) == stored {
+		// 常数时间比对：旧哈希为无盐 SHA-256，短路比较会泄露前缀匹配长度
+		if subtle.ConstantTimeCompare([]byte(legacyHash(pwd)), []byte(stored)) == 1 {
 			// 透明升级为 bcrypt；超长口令无法哈希时保持旧哈希（下次登录再试），
 			// 登录本身仍以 legacy 比对结果为准
 			if hash, err := hashPassword(pwd); err == nil {
@@ -437,7 +446,9 @@ func (am *AuthManager) HandleLogin(w http.ResponseWriter, r *http.Request) {
 		HttpOnly: true,
 		MaxAge:   int(sessionExpiry.Seconds()),
 		SameSite: http.SameSiteStrictMode,
-		Secure:   r.TLS != nil, // TLS 部署下防降级泄露；纯 http 本机部署保持可用
+		// TLS 终止在反代（r.TLS == nil）时启发式失效：ZCODE_COOKIE_SECURE=1
+		// 显式强制 Secure，防管理会话 cookie 经明文 http 请求外泄
+		Secure: r.TLS != nil || cookieSecureOverride(),
 	})
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"success":             true,
