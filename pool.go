@@ -83,6 +83,8 @@ type AccountPool struct {
 	paidRateLast    map[int64]int         // 付费通道限流冷却升级记忆（mu 保护：30→120→300s）
 	paidRiskStrikes map[int64][]time.Time // 付费通道风控 24h 窗口计次（mu 保护，复用 riskLadder）
 
+	intervalClampLogged string // 已告警过的 quota_refresh_interval 原始值（mu 保护：钳制告警去重，不刷屏）
+
 	refreshFn func(a *Account) error // 由 ZCodeAPI 注入的额度刷新函数
 	stopCh    chan struct{}
 	stopOnce  sync.Once
@@ -109,6 +111,13 @@ const (
 
 	slotDefaultCap = 3
 	slotMaxCap     = 32
+
+	// quota_refresh_interval 读取侧钳制边界（0=关闭除外）：
+	// 上限防 time.Duration(n)*time.Second 溢出为负 → time.After(负值) 立即
+	// 触发 → 刷新热循环；下限挡亚分钟轮询（高频刷新由成功请求后的
+	// RefreshAccountQuotaThrottled 即时刷新覆盖）
+	refreshIntervalMinSec = 30
+	refreshIntervalMaxSec = 86400
 )
 
 // NewAccountPool 创建账号池
@@ -190,7 +199,28 @@ func (p *AccountPool) refreshInterval() int {
 	if n < 0 {
 		return 60
 	}
-	return n // 显式 0 = 关闭后台刷新
+	if n == 0 {
+		return 0 // 显式 0 = 关闭后台刷新
+	}
+	// 钳制 [30, 86400]（与 accountSlotCap 同式；API 写入侧已限 0-86400，
+	// 这里兜住直写库/旧版本落库的越界值）：超大 n 经 time.Duration 溢出为负
+	clamped := n
+	if clamped < refreshIntervalMinSec {
+		clamped = refreshIntervalMinSec
+	} else if clamped > refreshIntervalMaxSec {
+		clamped = refreshIntervalMaxSec
+	}
+	if clamped != n {
+		// 被钳制：同一原始值只告警一次（refreshLoop/invalidBackoff 每轮都会读）
+		p.mu.Lock()
+		first := p.intervalClampLogged != v
+		p.intervalClampLogged = v
+		p.mu.Unlock()
+		if first {
+			log.Printf("[pool] quota_refresh_interval=%s 超出 [%d,%d]s，钳制为 %ds", v, refreshIntervalMinSec, refreshIntervalMaxSec, clamped)
+		}
+	}
+	return clamped
 }
 
 // invalidBackoff invalid 账号重试退避间隔：max(refreshInterval*10, 5 分钟)
@@ -826,7 +856,14 @@ func (p *AccountPool) MarkPaidCooling(a *Account, reason string, seconds int) {
 	a.setPaidRuntime(reason, until)
 	p.db.SetAccountPaidStatus(a.ID, reason, until)
 	p.mu.Lock()
-	p.paidRateLast[a.ID] = seconds
+	// 升级记忆只认真实阶梯档 {30,120,300}：slot 满（10s）、鉴权失败（3600s）、
+	// 连接失败（60s）等外来冷却若原样入库，nextPaidCooldown 的 default 分支会把
+	// 下一次真实 429 直接顶到 300s——阶梯被无关失败污染（成功清零见 MarkPaidUsed）
+	if seconds == 30 || seconds == 120 || seconds == 300 {
+		p.paidRateLast[a.ID] = seconds
+	} else {
+		p.paidRateLast[a.ID] = 0
+	}
 	p.mu.Unlock()
 	log.Printf("[pool] account %s paid-channel cooling %ds: %s", a.Email, seconds, reason)
 }

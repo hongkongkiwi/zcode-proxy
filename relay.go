@@ -434,6 +434,12 @@ func (z *ZCodeAPI) forwardOnce(w http.ResponseWriter, r *http.Request, a *Accoun
 	// release 绑定获取时的闸门对象：设置变更重建闸门后旧持有者不会错放新闸门
 	release, ok := z.pool.AcquireAccountSlot(r.Context(), a, channel, 45*time.Second)
 	if !ok {
+		// 客户端已断开（ctx 取消/超时）：与下方 client.Do 的取消处理同规——
+		// 不动账号状态直接终止。否则一次断连会给排队中的健康账号泼一轮假
+		// “并发已满”10s 冷却（逐个污染候选账号，最多 ~10 个/断连）
+		if r.Context().Err() != nil {
+			return outcomeUpstreamError
+		}
 		if channel == ChannelPaid {
 			z.pool.MarkPaidCooling(a, "付费通道并发已满（在途请求达到上限），短暂冷却", 10)
 		} else {
@@ -1169,12 +1175,14 @@ func validateMessagesBody(body map[string]interface{}) error {
 						return fmt.Errorf("messages[%d].content[%d]: tool_result references unknown tool_use_id %q (dropped assistant turn?)", i, j, tid)
 					}
 				case "image":
-					if src, ok := bm["source"].(map[string]interface{}); ok {
-						if st, _ := src["type"].(string); st != "url" {
-							if data, _ := src["data"].(string); data == "" {
-								return fmt.Errorf("messages[%d].content[%d]: image block must contain base64 data (url sources are not accepted by the upstream)", i, j)
-							}
-						}
+					// 上游只接受 base64 source：url 形态与缺失/null/非对象 source
+					// 一律本地拒绝（此前 url 形态放行 → 上游 400，健康账号白计一次
+					// MarkFailed）。与 handlers_openai.go 的 image_url fail-closed 同规
+					src, _ := bm["source"].(map[string]interface{})
+					st, _ := src["type"].(string)
+					data, _ := src["data"].(string)
+					if st == "url" || src == nil || data == "" {
+						return fmt.Errorf("messages[%d].content[%d]: image block must contain base64 data (url sources are not accepted by the upstream)", i, j)
 					}
 				}
 			}
