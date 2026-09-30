@@ -992,6 +992,31 @@ func validateMessagesBody(body map[string]interface{}) error {
 	if len(msgs) > 1000 {
 		return fmt.Errorf("messages contains too many items")
 	}
+	// tool_use/tool_result 配对预检：孤儿 tool_result 上游必 400，且会把
+	// 健康账号计一次 MarkFailed——本地拒绝并给出准确原因
+	declaredToolUses := map[string]bool{}
+	for _, m := range msgs {
+		mm, _ := m.(map[string]interface{})
+		if mm == nil {
+			continue
+		}
+		if role, _ := mm["role"].(string); role != "assistant" {
+			continue
+		}
+		if blocks, ok := mm["content"].([]interface{}); ok {
+			for _, b := range blocks {
+				bm, ok := b.(map[string]interface{})
+				if !ok {
+					continue
+				}
+				if t, _ := bm["type"].(string); t == "tool_use" {
+					if id, _ := bm["id"].(string); id != "" {
+						declaredToolUses[id] = true
+					}
+				}
+			}
+		}
+	}
 	for i, m := range msgs {
 		mm, ok := m.(map[string]interface{})
 		if !ok {
@@ -1017,13 +1042,48 @@ func validateMessagesBody(body map[string]interface{}) error {
 			if rv.Len() > 2_000_000 {
 				return fmt.Errorf("messages[%d].content is too long", i)
 			}
+			if rv.Len() == 0 {
+				return fmt.Errorf("messages[%d].content must not be empty", i)
+			}
 			for j := 0; j < rv.Len(); j++ {
 				bm, ok := rv.Index(j).Interface().(map[string]interface{})
 				if !ok {
 					return fmt.Errorf("messages[%d].content[%d] must be an object", i, j)
 				}
-				if _, ok := bm["type"].(string); !ok {
+				btype, _ := bm["type"].(string)
+				if btype == "" {
 					return fmt.Errorf("messages[%d].content[%d] must have a type", i, j)
+				}
+				// 上游 schema 逐类校验：这些形状本地放行只会换来上游 400 +
+				// 账号无谓计一次失败
+				switch btype {
+				case "text":
+					if t, _ := bm["text"].(string); t == "" {
+						return fmt.Errorf("messages[%d].content[%d]: text block must contain non-empty text", i, j)
+					}
+				case "tool_use":
+					if id, _ := bm["id"].(string); id == "" {
+						return fmt.Errorf("messages[%d].content[%d]: tool_use block must have an id", i, j)
+					} else {
+						declaredToolUses[id] = true
+					}
+					if name, _ := bm["name"].(string); name == "" {
+						return fmt.Errorf("messages[%d].content[%d]: tool_use block must have a name", i, j)
+					}
+				case "tool_result":
+					tid, _ := bm["tool_use_id"].(string)
+					if tid == "" {
+						return fmt.Errorf("messages[%d].content[%d]: tool_result block must have a tool_use_id", i, j)
+					}
+					if !declaredToolUses[tid] {
+						return fmt.Errorf("messages[%d].content[%d]: tool_result references unknown tool_use_id %q (dropped assistant turn?)", i, j, tid)
+					}
+				case "image":
+					if src, ok := bm["source"].(map[string]interface{}); ok {
+						if data, _ := src["data"].(string); data == "" {
+							return fmt.Errorf("messages[%d].content[%d]: image block must contain base64 data", i, j)
+						}
+					}
 				}
 			}
 		}
@@ -1031,8 +1091,9 @@ func validateMessagesBody(body map[string]interface{}) error {
 	if mt, ok := body["max_tokens"]; ok {
 		switch v := mt.(type) {
 		case float64:
-			if v < 1 || v > 1_000_000 {
-				return fmt.Errorf("max_tokens must be between 1 and 1000000")
+			// 分数 token 数上游会拒绝（非整数 JSON）：按无效请求处理
+			if v != float64(int64(v)) || v < 1 || v > 1_000_000 {
+				return fmt.Errorf("max_tokens must be an integer between 1 and 1000000")
 			}
 		default:
 			return fmt.Errorf("max_tokens must be a number")

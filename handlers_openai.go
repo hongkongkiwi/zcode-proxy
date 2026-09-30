@@ -333,6 +333,11 @@ func openaiToAnthropic(body map[string]interface{}) (map[string]interface{}, err
 						// 与客户端发送的不一致
 						return nil, errString("image_url must be an object with a data: base64 URL; other image forms are not supported by the upstream")
 					}
+					// 未知 part 类型同样显式报错（与 image_url fail-closed 同理）：
+					// 静默跳过 = 纯该类消息整体消失，多轮对话模型看到缺块对话
+					if pt, ok := pm["type"].(string); ok && pt != "text" && pt != "image_url" {
+						return nil, errString("unsupported content part type: " + pt + "; the upstream supports only text and image_url parts")
+					}
 				}
 			}
 		}
@@ -391,11 +396,12 @@ func openaiToAnthropic(body map[string]interface{}) (map[string]interface{}, err
 	if len(systemParts) > 0 {
 		out["system"] = strings.Join(systemParts, "\n\n")
 	}
-	if mt, ok := body["max_tokens"]; ok && mt != nil {
-		out["max_tokens"] = mt
-	} else if mct, ok := body["max_completion_tokens"]; ok && mct != nil {
+	if mct, ok := body["max_completion_tokens"]; ok && mct != nil {
+		// 新字段优先（OpenAI 语义）：请求模板残留的旧 max_tokens 不得覆盖调用方显式设置
 		out["max_tokens"] = mct
-	} else if mt == nil && mct == nil {
+	} else if mt, ok := body["max_tokens"]; ok && mt != nil {
+		out["max_tokens"] = mt
+	} else if mct == nil && mt == nil {
 		// 显式 null 等同未提供：交给 normalizeBody 补默认值，而不是 400
 		out["max_tokens"] = float64(4096)
 	}

@@ -26,19 +26,30 @@ type AutoClaimer struct {
 
 	stopCh   chan struct{}
 	stopOnce sync.Once
+	loopDone chan struct{} // 循环 goroutine 退出标记（Stop 有界等待）
 }
 
 func NewAutoClaimer(db *DB, zapi *ZCodeAPI) *AutoClaimer {
-	return &AutoClaimer{db: db, zapi: zapi, stopCh: make(chan struct{})}
+	return &AutoClaimer{db: db, zapi: zapi, stopCh: make(chan struct{}), loopDone: make(chan struct{})}
 }
 
+// Stop 停止自动领取（幂等）：关停信号 + 有界等循环退出——claim 成功后的
+// 账本写库必须先于 main 的 db.Close，否则领了活动却丢记录
 func (ac *AutoClaimer) Stop() {
 	ac.stopOnce.Do(func() { close(ac.stopCh) })
+	if ac.loopDone != nil {
+		select {
+		case <-ac.loopDone:
+		case <-time.After(30 * time.Second):
+			log.Printf("[auto-claim] stop: round still running after 30s")
+		}
+	}
 }
 
 // Start 启动自动领取循环
 func (ac *AutoClaimer) Start() {
 	go func() {
+		defer close(ac.loopDone)
 		// 首轮延迟 90s：等服务与额度刷新稳定，避免启动风暴与上游调用叠加
 		t := time.NewTimer(90 * time.Second)
 		defer t.Stop()
@@ -124,6 +135,13 @@ func (ac *AutoClaimer) RunOnce(trigger string) {
 				return
 			case <-time.After(time.Duration(delay+jitter) * time.Second):
 			}
+		}
+		// 停机感知：claim 的上游消耗不可撤销，账本写库依赖库仍开着
+		select {
+		case <-ac.stopCh:
+			log.Printf("[auto-claim] (%s) aborted by shutdown before %s", trigger, a.DisplayNameOrEmail())
+			return
+		default:
 		}
 		result := ac.zapi.ClaimForAccount(a)
 		switch {

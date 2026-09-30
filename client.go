@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"golang.org/x/net/proxy"
+	"log"
 	"net"
 	"net/http"
 	"net/url"
@@ -316,11 +317,15 @@ func ProxyURLForNode(n *ProxyNode) string {
 // 等非 ESA WAF 保护的端点（实测 api.z.ai 协商 h2）。
 func NewUpstreamHTTPClient(proxyURL string, timeout time.Duration) *http.Client {
 	transport := &http.Transport{
-		TLSClientConfig:      &tls.Config{MinVersion: tls.VersionTLS12},
-		ForceAttemptHTTP2:    true,
-		MaxIdleConns:         32,
-		MaxIdleConnsPerHost:  16, // Go 默认 2：并发下多余连接被关闭，每请求重握手直拉高 TTFB
-		IdleConnTimeout:      90 * time.Second,
+		// 拨号/响应头都有界：流式客户端 Timeout=0 时没有它们，黑洞路由
+		// 会占住账号并发闸门直到下游断开（SSE 只受 time-to-first-header 约束，不受影响）
+		DialContext:           (&net.Dialer{Timeout: 30 * time.Second}).DialContext,
+		ResponseHeaderTimeout: 60 * time.Second,
+		TLSClientConfig:       &tls.Config{MinVersion: tls.VersionTLS12},
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          32,
+		MaxIdleConnsPerHost:   16, // Go 默认 2：并发下多余连接被关闭，每请求重握手直拉高 TTFB
+		IdleConnTimeout:       90 * time.Second,
 	}
 	applyProxy(transport, proxyURL)
 	return &http.Client{
@@ -352,12 +357,12 @@ func NewFingerprintHTTPClient(proxyURL string, timeout time.Duration) *http.Clie
 	}
 
 	transport := &http.Transport{
-		DialContext:          dialer.DialContext,
-		DialTLSContext:       dialTLS,
-		TLSNextProto:         map[string]func(string, *tls.Conn) http.RoundTripper{}, // 禁 h2
-		MaxIdleConns:         32,
-		MaxIdleConnsPerHost:  16, // utls 握手成本高，保活连接直接决定 TTFB 稳定性
-		IdleConnTimeout:      90 * time.Second,
+		DialContext:         dialer.DialContext,
+		DialTLSContext:      dialTLS,
+		TLSNextProto:        map[string]func(string, *tls.Conn) http.RoundTripper{}, // 禁 h2
+		MaxIdleConns:        32,
+		MaxIdleConnsPerHost: 16, // utls 握手成本高，保活连接直接决定 TTFB 稳定性
+		IdleConnTimeout:     90 * time.Second,
 	}
 	return &http.Client{
 		Transport: transport,
@@ -402,17 +407,22 @@ func applyProxy(transport *http.Transport, proxyURL string) {
 	if proxyURL == "" {
 		return
 	}
-	if u, err := url.Parse(proxyURL); err == nil {
-		switch u.Scheme {
-		case "socks5", "socks5h":
-			if dialer, derr := Socks5Dialer(u); derr == nil {
-				transport.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
-					return dialer.(proxyContextDialer).DialContext(ctx, network, addr)
-				}
+	u, err := url.Parse(proxyURL)
+	if err != nil {
+		// 解析失败退直连是出口隐私 fail-open：老版本/手改库的坏值必须大声报，
+		// 否则 UI 显示有代理而流量全走本机 IP
+		log.Printf("[egress] malformed proxy URL %q: %v; falling back to DIRECT", proxyURL, err)
+		return
+	}
+	switch u.Scheme {
+	case "socks5", "socks5h":
+		if dialer, derr := Socks5Dialer(u); derr == nil {
+			transport.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+				return dialer.(proxyContextDialer).DialContext(ctx, network, addr)
 			}
-		default:
-			transport.Proxy = http.ProxyURL(u)
 		}
+	default:
+		transport.Proxy = http.ProxyURL(u)
 	}
 }
 
@@ -441,6 +451,21 @@ func dialRaw(ctx context.Context, dialer *net.Dialer, proxyURL, network, addr st
 		conn, err := dialer.DialContext(ctx, "tcp", u.Host)
 		if err != nil {
 			return nil, err
+		}
+		// https 代理 = 先对代理端口做 TLS，再在其上发 CONNECT（与 stdlib
+		// http.ProxyURL 对 https 代理的语义一致）：明文 CONNECT 打 TLS 端口
+		// 会被代理拒绝，整条指纹通道全灭而健康检查（走 stdlib）却显示正常
+		if u.Scheme == "https" {
+			tconn := tls.Client(conn, &tls.Config{
+				ServerName:         u.Hostname(),
+				MinVersion:         tls.VersionTLS12,
+				InsecureSkipVerify: true, // 代理端证书常为自签；与上游 TLS 校验无关
+			})
+			if err := tconn.HandshakeContext(ctx); err != nil {
+				conn.Close()
+				return nil, fmt.Errorf("proxy TLS handshake: %w", err)
+			}
+			conn = tconn
 		}
 		if err := httpConnectTunnel(ctx, conn, addr, u); err != nil {
 			conn.Close()

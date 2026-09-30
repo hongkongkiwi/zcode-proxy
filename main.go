@@ -240,8 +240,16 @@ func main() {
 	case <-time.After(30 * time.Second):
 		log.Printf("[main] shutdown: in-flight handlers still draining after 30s; proceeding")
 	}
+	// 先停掉后台任务派生者并等它们收尾（调度器计划、自动领取、额度刷新轮），
+	// 再等 relay 派生的后台任务——顺序是 WaitGroup 契约要求：bgw.Wait 与
+	// 计划 goroutine 里新 spawn 的 goBackground（Add）不得并发，否则计数归零
+	// 后的 Add 会撞上 Wait（-race 直接致命，且任务逃过等待撞上 db.Close）。
+	// 三者的 Stop 都幂等（stopOnce + 有界 join），末尾 defer 再调一次是空操作
+	scheduler.Stop()
+	autoClaim.Stop()
+	pool.Stop()
 	// relay 派生的后台任务（额度刷新/自动重置）会在 handler 返回后继续跑：
-	// 等它们收尾再做 deferred 池停止与 db.Close，否则终态写库（重置成功的
+	// 等它们收尾再做 deferred db.Close，否则终态写库（重置成功的
 	// claim record 等）撞上已关闭的库被静默吞掉——稀缺重置槽就白烧了
 	bgDone := make(chan struct{})
 	go func() {

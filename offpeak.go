@@ -600,6 +600,7 @@ func (z *ZCodeAPI) offPeakBridge(w http.ResponseWriter, r *http.Request, a *Acco
 	log.Printf("[async] account %s took ticket %s… state=%s pos=%d", a.DisplayNameOrEmail(), safePrefixLog(ticket.ID, 8), ticket.State, ticket.Position)
 
 	pollFailures := 0
+	nextKeepalive := time.Time{} // 跨轮询迭代持有：保活到期不因每次调用重派而失效
 	for attempt := 0; ; attempt++ {
 		// WAIT：票未就绪时轮询 + 保活
 		for !offPeakStateReady(ticket.State) && !offPeakStateTerminal(ticket.State) {
@@ -614,7 +615,7 @@ func (z *ZCodeAPI) offPeakBridge(w http.ResponseWriter, r *http.Request, a *Acco
 			if ticket.NextPollSec > 0 {
 				sleep = time.Duration(ticket.NextPollSec) * time.Second
 			}
-			if !offPeakWait(ctx, sleep, keepalive, func() { fmt.Fprint(w, ": keepalive\n\n"); flushWriter(w) }, opts.clientStream) {
+			if !offPeakWait(ctx, sleep, keepalive, func() { fmt.Fprint(w, ": keepalive\n\n"); flushWriter(w) }, opts.clientStream, &nextKeepalive) {
 				settleCur()
 				return outcomeUpstreamError
 			}
@@ -681,10 +682,14 @@ func (z *ZCodeAPI) offPeakBridge(w http.ResponseWriter, r *http.Request, a *Acco
 }
 
 // offPeakWait 等待 min(sleep) 或保活周期；emitKeepalive 在保活到期时被调用。
+// nextKeepalive 由调用方跨调用持有（零值 = 首次，按 keepalive 初始化）——
+// 在函数内重派会让秒级轮询下保活永不触发，中间设备空闲超时掐断连接
 // 返回 false 表示客户端已断开。
-func offPeakWait(ctx context.Context, sleep, keepalive time.Duration, emitKeepalive func(), stream bool) bool {
+func offPeakWait(ctx context.Context, sleep, keepalive time.Duration, emitKeepalive func(), stream bool, nextKeepalive *time.Time) bool {
 	deadline := time.Now().Add(sleep)
-	nextKeepalive := time.Now().Add(keepalive)
+	if nextKeepalive != nil && nextKeepalive.IsZero() {
+		*nextKeepalive = time.Now().Add(keepalive)
+	}
 	if !stream {
 		timer := time.NewTimer(time.Until(deadline))
 		defer timer.Stop()
@@ -710,9 +715,9 @@ func offPeakWait(ctx context.Context, sleep, keepalive time.Duration, emitKeepal
 		timer := time.NewTimer(wait)
 		select {
 		case <-timer.C:
-			if !time.Now().Before(nextKeepalive) && time.Now().Before(deadline) {
+			if !time.Now().Before(*nextKeepalive) && time.Now().Before(deadline) {
 				emitKeepalive()
-				nextKeepalive = time.Now().Add(keepalive)
+				*nextKeepalive = time.Now().Add(keepalive)
 			}
 			timer.Stop()
 		case <-ctx.Done():
@@ -807,12 +812,13 @@ func (z *ZCodeAPI) offPeakForward(w http.ResponseWriter, r *http.Request, a *Acc
 				}
 			}
 			log.Printf("[async] 429/3105 upstream saturation; same-ticket retry in %s", wait)
+			nextKA := time.Time{}
 			if !offPeakWait(r.Context(), wait, 15*time.Second, func() {
 				if opts.clientStream {
 					fmt.Fprint(w, ": keepalive\n\n")
 					flushWriter(w)
 				}
-			}, opts.clientStream) {
+			}, opts.clientStream, &nextKA) {
 				return outcomeUpstreamError
 			}
 			return outcomeTicketRetry

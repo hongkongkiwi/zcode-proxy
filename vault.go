@@ -618,7 +618,8 @@ func (db *DB) reencryptVaultColumns(oldSeed, newSeed string) (int, error) {
 	return moved, tx.Commit()
 }
 
-// ProbeVaultHealth 启动收尾的健康检查：统计当前种子解不开的密文数量并大声告警
+// ProbeVaultHealth 启动收尾的健康检查：统计当前种子解不开的密文数量并大声告警。
+// 覆盖面 = scanVaultCiphertext（账号凭证列 + 设置机密项 + 代理节点密码），全量
 func (db *DB) ProbeVaultHealth() {
 	_, broken, err := db.scanVaultCiphertext(currentVaultSeed())
 	if err != nil {
@@ -628,17 +629,6 @@ func (db *DB) ProbeVaultHealth() {
 	if broken > 0 {
 		log.Printf("[vault] WARNING: %d credential values cannot be decrypted with the active key "+
 			"(set ZCODE_PROXY_VAULT_SECRET or restore data/vault.key); affected accounts will fail auth until fixed", broken)
-	}
-	// 设置表机密项（网关 sk- 密钥、口令哈希）不在 scanVaultCiphertext 覆盖内，单独体检
-	for _, key := range vaultSecretSettings {
-		var val string
-		if err := db.conn.QueryRow(`SELECT value FROM settings WHERE key = ?`, key).Scan(&val); err != nil || val == "" || !strings.HasPrefix(val, vaultPrefix) {
-			continue
-		}
-		if _, err := DecryptCredential(encPrefix+strings.TrimPrefix(val, vaultPrefix), currentVaultSeed()); err != nil {
-			log.Printf("[vault] WARNING: setting %s cannot be decrypted with the active key "+
-				"(wrong ZCODE_PROXY_VAULT_SECRET or mismatched vault.key); gateway auth and admin login may fail", key)
-		}
 	}
 }
 

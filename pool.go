@@ -85,6 +85,7 @@ type AccountPool struct {
 	refreshFn func(a *Account) error // 由 ZCodeAPI 注入的额度刷新函数
 	stopCh    chan struct{}
 	stopOnce  sync.Once
+	loopDone  chan struct{} // refreshLoop 退出标记（Stop 有界等待）
 }
 
 // slotKey 并发闸门键：账号×通道。免费与付费是两条上游链路，各自有独立并发上限；
@@ -123,6 +124,7 @@ func NewAccountPool(db *DB, cfg *FileConfig, appVersion string) *AccountPool {
 		paidRateLast:    make(map[int64]int),
 		paidRiskStrikes: make(map[int64][]time.Time),
 		stopCh:          make(chan struct{}),
+		loopDone:        make(chan struct{}),
 	}
 }
 
@@ -138,12 +140,21 @@ func (p *AccountPool) Start() {
 	go p.refreshLoop()
 }
 
-// Stop 停止后台循环
+// Stop 停止后台循环（幂等）：关停信号 + 有界等当前刷新轮收尾——
+// 额度快照/状态写库必须先于 main 的 db.Close（错过写自愈，但没必要错过）
 func (p *AccountPool) Stop() {
 	p.stopOnce.Do(func() { close(p.stopCh) })
+	if p.loopDone != nil {
+		select {
+		case <-p.loopDone:
+		case <-time.After(20 * time.Second):
+			log.Printf("[pool] stop: refresh round still running after 20s")
+		}
+	}
 }
 
 func (p *AccountPool) refreshLoop() {
+	defer close(p.loopDone)
 	// 启动后先等 5 秒（让 HTTP 服务先起来）
 	select {
 	case <-p.stopCh:
@@ -547,12 +558,16 @@ func (p *AccountPool) AcquireAccountSlot(a *Account, channel string, timeout tim
 	ch := as.ch
 	p.mu.Unlock()
 
-	// 幂等释放：多余释放忽略
+	// 释放恰好一次：多余的调用不偷走其他持有者的 token（匿名 token 下
+	// 双重释放会永久压缩闸门有效容量——恰是 1302 条件）
+	var once sync.Once
 	release := func() {
-		select {
-		case <-ch:
-		default:
-		}
+		once.Do(func() {
+			select {
+			case <-ch:
+			default:
+			}
+		})
 	}
 	if timeout <= 0 {
 		select {
