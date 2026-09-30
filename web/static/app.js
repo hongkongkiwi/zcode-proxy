@@ -1703,8 +1703,10 @@ function initLlmPlaceholders() {
   };
   apply(document.getElementById('llmContent'), t('（尚未运行）'));
   const h = document.getElementById('llmHistory');
-  if (h && !llmHistory.length && h.dataset.placeholderLang !== undefined) {
-    h.innerHTML = t('（无）');
+  // undefined = 首次加载的空白元素：与 apply() 同路径写占位（原条件恒 false，
+  // 历史面板首次打开一直空白）
+  if (h && !llmHistory.length && h.dataset.placeholderLang === undefined) {
+    h.textContent = t('（无）');
     h.dataset.placeholderLang = CURRENT_LANG;
   }
 }

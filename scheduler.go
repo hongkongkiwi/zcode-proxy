@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -43,6 +44,9 @@ type CronScheduler struct {
 	running  map[int64]*PlanRunState
 	runWG    sync.WaitGroup // 在途 runPlan goroutine（Stop 有界等待）
 
+	tickDone chan struct{} // tick 循环退出标记（先于 runWG 等待）
+	stopped  atomic.Bool   // 停机后 goPlan 不再派生
+
 	execMu    sync.Mutex
 	execLocks map[int64]*sync.Mutex // per-plan 执行互斥（TryLock，拿不到跳过本 tick）
 }
@@ -53,6 +57,7 @@ func NewCronScheduler(db *DB, zapi *ZCodeAPI) *CronScheduler {
 		db:        db,
 		zapi:      zapi,
 		stopCh:    make(chan struct{}),
+		tickDone:  make(chan struct{}),
 		running:   make(map[int64]*PlanRunState),
 		execLocks: make(map[int64]*sync.Mutex),
 	}
@@ -74,6 +79,7 @@ func (s *CronScheduler) planLock(id int64) *sync.Mutex {
 func (s *CronScheduler) Start() {
 	s.ticker = time.NewTicker(1 * time.Minute)
 	go func() {
+		defer close(s.tickDone)
 		log.Printf("[scheduler] started, checking every 1 minute")
 		for {
 			select {
@@ -88,8 +94,12 @@ func (s *CronScheduler) Start() {
 }
 
 // goPlan 计划执行入口：入 WaitGroup，Stop 时有界等待——停机中断路径的
-// 终态写库必须先于 main 的 db.Close，否则计划行永远卡在 running
+// 终态写库必须先于 main 的 db.Close，否则计划行永远卡在 running。
+// 停机后不再派生（RunPlanNow 迟到触发 / 尾 tick 的新计划）
 func (s *CronScheduler) goPlan(spawn func()) {
+	if s.stopped.Load() {
+		return
+	}
 	s.runWG.Add(1)
 	go func() {
 		defer s.runWG.Done()
@@ -97,14 +107,24 @@ func (s *CronScheduler) goPlan(spawn func()) {
 	}()
 }
 
-// Stop 停止调度器（幂等）：关停信号 + 有界等待在途 runPlan 收尾
+// Stop 停止调度器（幂等）：关停信号 + 有界等待 tick 与在途 runPlan 收尾。
+// 先等 tick 退出再等 runWG：否则 tick 的 goPlan（Add）可能撞上已归零的
+// Wait（WaitGroup 契约），且逃逸的计划 goroutine 会无人等待地写已关闭的库
 func (s *CronScheduler) Stop() {
+	s.stopped.Store(true)
 	s.stopOnce.Do(func() {
 		if s.ticker != nil {
 			s.ticker.Stop()
 		}
 		close(s.stopCh)
 	})
+	if s.tickDone != nil {
+		select {
+		case <-s.tickDone:
+		case <-time.After(5 * time.Second):
+			log.Printf("[scheduler] stop: tick still running after 5s")
+		}
+	}
 	done := make(chan struct{})
 	go func() {
 		s.runWG.Wait()
@@ -177,6 +197,9 @@ func (s *CronScheduler) checkAndRun() {
 // RunPlanNow 手动立即执行（UI 触发）；已在执行则拒绝排队。
 // 此处一次性获取计划锁并移交所有权给 goroutine，避免先放后抢的空窗被 cron tick 抢走导致静默不执行。
 func (s *CronScheduler) RunPlanNow(planID int64) error {
+	if s.stopped.Load() {
+		return fmt.Errorf("服务停机中，无法执行计划")
+	}
 	plan, err := s.db.GetClaimPlan(planID)
 	if err != nil {
 		// 仅"真不存在"报不存在；DB 故障（锁/I/O）如实上抛，避免误导成 404
@@ -302,7 +325,7 @@ func (s *CronScheduler) runPlan(plan *ClaimPlan, triggered time.Time) {
 	}
 	if err := s.db.InsertPlanRunRecord(&PlanRunRecord{
 		PlanID: plan.ID, PlanName: plan.PlanName, TaskType: taskType,
-		TargetType: plan.TargetType, Status: status, Message: summary,
+		TargetType: plan.TargetType, RunAt: runAt, Status: status, Message: summary,
 		Total: len(targets), SuccessCount: successCount, FailCount: failCount,
 		DurationMs: duration,
 	}); err != nil {

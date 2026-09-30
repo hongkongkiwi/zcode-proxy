@@ -25,6 +25,7 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -1086,6 +1087,29 @@ func aggregateAnthropicStream(r io.Reader) ([]byte, *StreamUsage, error) {
 		}
 	}
 	p.flush(onEvent)
+	// 干净 EOF 但缺 content_block_stop（上游违例）：冲刷残留的工具参数缓冲，
+	// 否则完整 JSON 被丢弃、合成出 input:{} 的 tool_use（客户端空参执行工具）
+	if len(agg.toolJSON) > 0 {
+		idxs := make([]int, 0, len(agg.toolJSON))
+		for idx := range agg.toolJSON {
+			idxs = append(idxs, idx)
+		}
+		sort.Ints(idxs)
+		for _, idx := range idxs {
+			if b, ok := agg.toolJSON[idx]; ok {
+				if idx >= len(agg.blocks) || agg.blocks[idx] == nil {
+					delete(agg.toolJSON, idx)
+					continue
+				}
+				var parsed interface{}
+				if err := json.Unmarshal([]byte(b.String()), &parsed); err != nil || parsed == nil {
+					parsed = map[string]interface{}{}
+				}
+				agg.blocks[idx]["input"] = parsed
+				delete(agg.toolJSON, idx)
+			}
+		}
+	}
 	content := make([]interface{}, 0, len(agg.blocks))
 	for _, b := range agg.blocks {
 		if b != nil {
@@ -1202,6 +1226,12 @@ func (u *usageSniffReader) sniffLine(line string) {
 			u.acc.StopReason = "ERR:" + m
 		} else if u.acc.StopReason == "" || !strings.HasPrefix(u.acc.StopReason, "ERR:") {
 			u.acc.StopReason = "ERR:upstream stream error"
+		}
+	default:
+		// 无 type 但带 error 键的帧（网关封套形状不一，与 isErrorEnvelope
+		// 同理）：同样记 ERR 标记，失败流不得被记成干净的 200 成功
+		if v.Type == "" && v.Error.Message != "" {
+			u.acc.StopReason = "ERR:" + v.Error.Message
 		}
 	case "message_start":
 		if v.Message.Usage.InputTokens > u.acc.InputTokens {

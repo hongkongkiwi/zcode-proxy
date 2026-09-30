@@ -96,7 +96,7 @@ func (ac *AutoClaimer) interval() time.Duration {
 	if mins < autoClaimMinIntervalMin {
 		mins = autoClaimMinIntervalMin
 	}
-	// ±20% 抖动：固定周期批量打 detect 接口本身就是可聚类特征
+	// +0~40% 抖动（只延长不缩短，风控保守方向）：固定周期批量打 detect 接口本身就是可聚类特征
 	jitter := time.Duration(rand.Intn(int(float64(mins)*0.4))) * time.Minute
 	return time.Duration(mins)*time.Minute + jitter
 }

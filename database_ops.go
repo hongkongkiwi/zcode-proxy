@@ -170,7 +170,7 @@ func (db *DB) ListUsageRecords(limit int) ([]*UsageRecord, error) {
 	rows, err := db.conn.Query(`
 		SELECT id, created_at, account_id, email, model, prompt_tokens, completion_tokens,
 		       total_tokens, cache_read_tokens, cache_creation_tokens, stream, status_code,
-		       duration_ms, ttft_ms, gateway_key_id, key_name
+		       duration_ms, ttft_ms, gateway_key_id, key_name, channel
 		FROM usage_records ORDER BY id DESC LIMIT ?`, limit)
 	if err != nil {
 		return nil, err
@@ -183,7 +183,7 @@ func (db *DB) ListUsageRecords(limit int) ([]*UsageRecord, error) {
 		if err := rows.Scan(&r.ID, &r.CreatedAt, &r.AccountID, &r.Email, &r.Model,
 			&r.PromptTokens, &r.CompletionTokens, &r.TotalTokens,
 			&r.CacheReadTokens, &r.CacheCreationTokens, &stream,
-			&r.StatusCode, &r.DurationMs, &r.TtftMs, &r.GatewayKeyID, &r.KeyName); err != nil {
+			&r.StatusCode, &r.DurationMs, &r.TtftMs, &r.GatewayKeyID, &r.KeyName, &r.Channel); err != nil {
 			return nil, err
 		}
 		r.Stream = stream == 1
@@ -400,6 +400,19 @@ func (db *DB) SaveProxyNode(n *ProxyNode) (int64, error) {
 		}
 	}
 	if n.ID > 0 {
+		// 空密码 = 保持原值（面板"留空不改"语义）：不触碰密码列——经解密
+		// 读回再回写，会在钥匙缺失期把解不开的密文冲成 '' 永久销毁
+		if n.Password == "" {
+			_, err := tx.Exec(`
+				UPDATE proxy_nodes SET name=?, type=?, host=?, port=?, username=?,
+				is_default=?, group_name=?, enabled=?, updated_at=datetime('now','localtime') WHERE id=?`,
+				n.Name, n.Type, n.Host, n.Port, n.Username,
+				boolInt(n.IsDefault), n.GroupName, boolInt(n.Enabled), n.ID)
+			if err != nil {
+				return 0, err
+			}
+			return n.ID, tx.Commit()
+		}
 		_, err := tx.Exec(`
 			UPDATE proxy_nodes SET name=?, type=?, host=?, port=?, username=?, password=?,
 			is_default=?, group_name=?, enabled=?, updated_at=datetime('now','localtime') WHERE id=?`,
@@ -466,12 +479,17 @@ func (db *DB) ProxyNodeForGroup(group string) (*ProxyNode, error) {
 // ---- 计划运行记录 ----
 
 func (db *DB) InsertPlanRunRecord(r *PlanRunRecord) error {
+	if r.RunAt == "" {
+		// 触发分钟 ≠ 完成时间：调用方没带时回填空串不如取计划行上的
+		// last_run_at——但最起码不用完成时刻冒充触发时刻
+		r.RunAt = time.Now().Format("2006-01-02 15:04:05")
+	}
 	_, err := db.conn.Exec(`
 		INSERT INTO plan_run_records (plan_id, plan_name, task_type, target_type, account_id,
-			status, message, total, success_count, fail_count, duration_ms)
-		VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
+			run_at, status, message, total, success_count, fail_count, duration_ms)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
 		r.PlanID, r.PlanName, r.TaskType, r.TargetType, r.AccountID,
-		r.Status, r.Message, r.Total, r.SuccessCount, r.FailCount, r.DurationMs)
+		r.RunAt, r.Status, r.Message, r.Total, r.SuccessCount, r.FailCount, r.DurationMs)
 	return err
 }
 

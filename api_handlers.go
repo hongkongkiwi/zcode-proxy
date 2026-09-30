@@ -574,9 +574,10 @@ func (s *APIServer) handleUpdateAccount(w http.ResponseWriter, r *http.Request) 
 		paidFallback = *body.PaidFallback
 	}
 	// 全部入参先校验再动笔：否则 priority 非法时 400，但 group/remark/enabled
-	// 已落库——面板以为保存失败，重试时静默保留了上一次"失败"的修改
-	if body.Priority != nil && (*body.Priority < 0 || *body.Priority > 9999) {
-		writeAPIError(w, http.StatusBadRequest, "priority 取值范围 0-9999")
+	// 已落库——面板以为保存失败，重试时静默保留了上一次"失败"的修改。
+	// 0 不是有效值（accountPriority 会把 0 归一化回默认值，API 却显示保存成功）
+	if body.Priority != nil && (*body.Priority < 1 || *body.Priority > 9999) {
+		writeAPIError(w, http.StatusBadRequest, "priority 取值范围 1-9999")
 		return
 	}
 	if err := s.db.UpdateAccountFields(id, group, remark, enabled, paidFallback); err != nil {
@@ -1027,17 +1028,8 @@ func (s *APIServer) handleSaveProxy(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	// 编辑时密码留空 = 保持原密码
-	if n.ID > 0 && n.Password == "" {
-		if old, err := s.db.ListProxyNodes(); err == nil {
-			for _, o := range old {
-				if o.ID == n.ID {
-					n.Password = o.Password
-					break
-				}
-			}
-		}
-	}
+	// 空密码 = 保持原密码：由 SaveProxyNode 直接跳过密码列实现（读回明文
+	// 再回写会在钥匙缺失期把解不开的密文冲成 ''，永久销毁）
 	id, err := s.db.SaveProxyNode(&n)
 	if err != nil {
 		writeAPIError(w, http.StatusInternalServerError, err.Error())

@@ -134,7 +134,9 @@ func (z *ZCodeAPI) MaybeAutoReset(a *Account, trigger string) {
 	}
 
 	used, _, msg, err := z.UseReset(a, resetType)
-	record := &ClaimRecord{AccountID: a.ID, Email: a.Email, TaskType: "reset"}
+	// UsedAt 精确落本地执行时刻：同步去重优先精确匹配，免去 localtime
+	// 墙钟换算（DST 切换时窗口会漂移出重复行）
+	record := &ClaimRecord{AccountID: a.ID, Email: a.Email, TaskType: "reset", UsedAt: time.Now().Unix()}
 	if err != nil || !used {
 		record.Message = fmt.Sprintf("自动重置执行失败(%s): %v %s", resetType, err, msg)
 		z.db.InsertClaimRecord(record)

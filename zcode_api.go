@@ -438,6 +438,12 @@ func (z *ZCodeAPI) HandleModelRetrieve(w http.ResponseWriter, r *http.Request) {
 	if official, ok := modelNameMap[strings.ToLower(strings.TrimSpace(id))]; ok {
 		id = official
 	}
+	// 命名 Key 的白名单同样作用于单查：不允许调用的模型按不存在处理
+	// （与列表过滤同语义，否则受限 Key 可借单查探测模型目录）
+	if gk := gatewayKeyFromCtx(r.Context()); gk != nil && !gk.modelAllowed(strings.ToLower(strings.TrimSpace(id))) {
+		writeAPIError(w, http.StatusNotFound, "model not found: "+id)
+		return
+	}
 	for _, m := range z.effectiveModels() {
 		if strings.EqualFold(m, id) {
 			writeJSON(w, http.StatusOK, modelObject(m, time.Now().Unix()))

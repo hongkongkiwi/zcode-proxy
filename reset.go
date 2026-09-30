@@ -168,6 +168,7 @@ func (z *ZCodeAPI) ResetForAccount(a *Account) *ClaimResult {
 }
 
 func (z *ZCodeAPI) resetForAccountLocked(a *Account) *ClaimResult {
+	// UsedAt 在成功时精确落执行时刻（见下方成功分支），供同步去重精确匹配
 	record := &ClaimRecord{AccountID: a.ID, Email: a.Email, TaskType: "reset"}
 	st, _, bizMsg, err := z.FetchResetStatus(a)
 	if err != nil {
@@ -207,6 +208,7 @@ func (z *ZCodeAPI) resetForAccountLocked(a *Account) *ClaimResult {
 	record.Success = true
 	record.PlanName = "配额重置(" + resetType + ")"
 	record.Message = "重置成功，配额已恢复"
+	record.UsedAt = time.Now().Unix() // 同步去重走精确匹配（localtime 墙钟回退在 DST 期会漂移）
 	z.db.InsertClaimRecord(record)
 	z.db.SetAccountClaimResult(a.ID, record.PlanName, record.Message)
 	log.Printf("[reset] account %s quota reset via %s", a.Email, resetType)

@@ -69,10 +69,19 @@ var errSSEOverflow = errors.New("sse buffer overflow")
 
 // sseParser 增量 SSE 帧解析器（处理跨 chunk 断帧，兼容 LF/CRLF）
 type sseParser struct {
-	buf strings.Builder
+	buf     strings.Builder
+	bomDone bool
 }
 
 func (p *sseParser) feed(chunk []byte, fn func(sseEvent)) error {
+	if !p.bomDone {
+		p.bomDone = true
+		// 首帧 BOM 不剥离会让 "data:" 前缀匹配失败，丢掉携带 usage 的
+		// message_start（该流用量全记 0）
+		if len(chunk) >= 3 && chunk[0] == 0xEF && chunk[1] == 0xBB && chunk[2] == 0xBF {
+			chunk = chunk[3:]
+		}
+	}
 	p.buf.Write(chunk)
 	p.drain(fn)
 	// 缓冲上限：上游持续不发空行分隔时防止无界增长（OOM 面），按流失败处理
@@ -730,6 +739,28 @@ func (z *ZCodeAPI) streamOpenAI(w http.ResponseWriter, flusher http.Flusher, res
 
 	if first {
 		writeChunk(map[string]interface{}{"role": "assistant", "content": ""}, nil, nil)
+	}
+	// 干净 EOF 但缺 content_block_stop（上游违例）：补发 start 自带的完整参数，
+	// 否则客户端拿到 arguments:"" 且 finish_reason:tool_calls，json.loads 直接炸
+	pending := make([]int, 0, len(toolIndices))
+	for srcIdx := range toolIndices {
+		if !toolArgsSeen[srcIdx] {
+			pending = append(pending, srcIdx)
+		}
+	}
+	sort.Ints(pending)
+	for _, srcIdx := range pending {
+		toolArgsSeen[srcIdx] = true
+		args := toolStartArgs[srcIdx]
+		if args == "" {
+			args = "{}"
+		}
+		writeChunk(map[string]interface{}{
+			"tool_calls": []map[string]interface{}{{
+				"index":    toolIndices[srcIdx],
+				"function": map[string]interface{}{"arguments": args},
+			}},
+		}, nil, nil)
 	}
 	writeChunk(map[string]interface{}{}, openaiFinish(usage.StopReason), nil)
 	if includeUsage {

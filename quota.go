@@ -449,6 +449,14 @@ func normalizeBalanceResponse(raw map[string]interface{}, source string) *QuotaO
 				Unit:      firstNonEmpty(jsonStr(bm, "unit_type"), jsonStr(bm, "meter")),
 				PeriodEnd: ExtractExpire(bm),
 			}
+			// 聚合最早自然重置（unix 秒）：没有它，耗尽账号的 quota_json 恒无
+			// next_reset，auto-reset 的"等待超阈值才花重置"阈值策略对 JWT 账号
+			// 完全失明（永远按"未知=花"处理，阈值设置形同虚设）
+			if t, perr := time.ParseInLocation("2006-01-02 15:04", item.PeriodEnd, time.Local); perr == nil && t.After(time.Now()) {
+				if s := t.Unix(); ov.NextReset == 0 || s < ov.NextReset {
+					ov.NextReset = s
+				}
+			}
 			if item.Name == "" {
 				item.Name = "额度"
 			}
