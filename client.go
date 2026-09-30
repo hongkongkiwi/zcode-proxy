@@ -357,12 +357,15 @@ func NewFingerprintHTTPClient(proxyURL string, timeout time.Duration) *http.Clie
 	}
 
 	transport := &http.Transport{
-		DialContext:         dialer.DialContext,
-		DialTLSContext:      dialTLS,
-		TLSNextProto:        map[string]func(string, *tls.Conn) http.RoundTripper{}, // 禁 h2
-		MaxIdleConns:        32,
-		MaxIdleConnsPerHost: 16, // utls 握手成本高，保活连接直接决定 TTFB 稳定性
-		IdleConnTimeout:     90 * time.Second,
+		DialContext:    dialer.DialContext,
+		DialTLSContext: dialTLS,
+		// 黑洞路由（代理/TCP 通了但对端永不回包）在 Timeout=0 的流式请求上
+		// 只受此约束——缺失时一次挂起就占死账号并发闸门直到下游断开
+		ResponseHeaderTimeout: 60 * time.Second,
+		TLSNextProto:          map[string]func(string, *tls.Conn) http.RoundTripper{}, // 禁 h2
+		MaxIdleConns:          32,
+		MaxIdleConnsPerHost:   16, // utls 握手成本高，保活连接直接决定 TTFB 稳定性
+		IdleConnTimeout:       90 * time.Second,
 	}
 	return &http.Client{
 		Transport: transport,
@@ -433,6 +436,9 @@ func dialRaw(ctx context.Context, dialer *net.Dialer, proxyURL, network, addr st
 	}
 	u, err := url.Parse(proxyURL)
 	if err != nil {
+		// 与 applyProxy 同理：解析失败退直连是出口隐私 fail-open，必须大声报
+		// （此处是 zcode.z.ai 主转发的指纹通道，静默绕行零痕迹）
+		log.Printf("[egress] malformed proxy URL %q: %v; falling back to DIRECT", proxyURL, err)
 		return dialer.DialContext(ctx, network, addr)
 	}
 	switch u.Scheme {

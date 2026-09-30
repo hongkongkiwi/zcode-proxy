@@ -499,6 +499,18 @@ func (p *AccountPool) selectableByIDChannel(id int64, provider, group string, sk
 	return a
 }
 
+// ForgetSticky 会话粘滞失效：账号持续上游报错时解绑——粘滞命中会无条件刷新
+// TTL，不解绑就把整个会话域钉死在不健康账号上直到 1h TTL（系统提示词派生
+// 键会把爆炸半径放大到同一 agent 配置的全部会话）
+func (p *AccountPool) ForgetSticky(sessionKey string) {
+	if sessionKey == "" {
+		return
+	}
+	p.mu.Lock()
+	delete(p.sticky, sessionKey)
+	p.mu.Unlock()
+}
+
 func (p *AccountPool) rememberSticky(sessionKey string, accountID int64) {
 	p.mu.Lock()
 	defer p.mu.Unlock()

@@ -557,7 +557,9 @@ func (z *ZCodeAPI) offPeakBridge(w http.ResponseWriter, r *http.Request, a *Acco
 			}
 			z.pool.MarkInvalid(a, msg)
 		case strings.Contains(s, "HTTP 429"):
-			z.pool.MarkCooling(a, msg, 30)
+			// 取票 429 = 队列饱和（与转发路径 3105 同性质），不是账号健康问题：
+			// 全局冷却会把 /async 的拥塞传染给主 /v1 免费通道（账号物理健康）
+			log.Printf("[async] account %s take rate-limited (queue saturation), no cooldown: %s", a.DisplayNameOrEmail(), truncate(msg, 120))
 		case strings.Contains(s, "HTTP"):
 			z.pool.MarkFailed(a, msg)
 		default:
@@ -615,6 +617,17 @@ func (z *ZCodeAPI) offPeakBridge(w http.ResponseWriter, r *http.Request, a *Acco
 			sleep := pollInterval
 			if ticket.NextPollSec > 0 {
 				sleep = time.Duration(ticket.NextPollSec) * time.Second
+			}
+			// 服务端建议的轮询间隔是变量（官方客户端钳制 5s~5min）：
+			// 不设上界时一条 next_poll_after=3600 能把 30min 预算顶穿 2 倍，
+			// max_wait_sec=0 时更完全不设限；且 sleep 须让位于硬截止
+			if sleep > 5*time.Minute {
+				sleep = 5 * time.Minute
+			}
+			if !hardDeadline.IsZero() {
+				if d := time.Until(hardDeadline); d < sleep {
+					sleep = d
+				}
 			}
 			if !offPeakWait(ctx, sleep, keepalive, func() { fmt.Fprint(w, ": keepalive\n\n"); flushWriter(w) }, opts.clientStream, &nextKeepalive) {
 				settleCur()
@@ -1024,13 +1037,17 @@ func aggregateAnthropicStream(r io.Reader) ([]byte, *StreamUsage, error) {
 		case "content_block_stop":
 			idx := toInt(ev.Data["index"])
 			if b, ok := agg.toolJSON[idx]; ok {
-				var parsed interface{}
-				if err := json.Unmarshal([]byte(b.String()), &parsed); err != nil || parsed == nil {
-					// 解析失败或字面量 "null"（Unmarshal 成功但得 nil）：一律空对象，
-					// 客户端工具执行器期待 input 为对象
-					parsed = map[string]interface{}{}
+				// 仅在有增量缓冲时覆盖：上游常在 start 帧自带完整 input（已落盘
+				// 兜底），空缓冲解不出东西，覆盖会把合法 input 冲成 {}
+				if raw := b.String(); raw != "" {
+					var parsed interface{}
+					if err := json.Unmarshal([]byte(raw), &parsed); err != nil || parsed == nil {
+						// 解析失败或字面量 "null"（Unmarshal 成功但得 nil）：一律空对象，
+						// 客户端工具执行器期待 input 为对象
+						parsed = map[string]interface{}{}
+					}
+					agg.blocks[idx]["input"] = parsed
 				}
-				agg.blocks[idx]["input"] = parsed
 				delete(agg.toolJSON, idx)
 			}
 		case "message_delta":
@@ -1101,11 +1118,14 @@ func aggregateAnthropicStream(r io.Reader) ([]byte, *StreamUsage, error) {
 					delete(agg.toolJSON, idx)
 					continue
 				}
-				var parsed interface{}
-				if err := json.Unmarshal([]byte(b.String()), &parsed); err != nil || parsed == nil {
-					parsed = map[string]interface{}{}
+				// 同 content_block_stop：空缓冲不覆盖 start 帧自带的合法 input
+				if raw := b.String(); raw != "" {
+					var parsed interface{}
+					if err := json.Unmarshal([]byte(raw), &parsed); err != nil || parsed == nil {
+						parsed = map[string]interface{}{}
+					}
+					agg.blocks[idx]["input"] = parsed
 				}
-				agg.blocks[idx]["input"] = parsed
 				delete(agg.toolJSON, idx)
 			}
 		}
@@ -1118,6 +1138,11 @@ func aggregateAnthropicStream(r io.Reader) ([]byte, *StreamUsage, error) {
 	}
 	if agg.streamError != "" {
 		return nil, partialUsage(agg), fmt.Errorf("%s", agg.streamError)
+	}
+	// 零事件的干净 EOF（裸注释帧后直接关闭）：聚合成 200 空 message 同样是
+	// "把死流伪装成成功"——不满足 message_start 必至的一律按失败处理
+	if agg.id == "" && len(agg.blocks) == 0 {
+		return nil, partialUsage(agg), fmt.Errorf("upstream stream ended without any events")
 	}
 	sr := agg.stopReason
 	if sr == "" {

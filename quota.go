@@ -389,6 +389,55 @@ func extractErrMsg(v map[string]interface{}) string {
 
 // ---- 归一化：billing/current & billing/balance（zcode.z.ai）----
 
+// upstreamLoc 上游墙钟时区：Z.ai 面向中国区，固定 UTC+8 无 DST。
+// 无时区字符串按此时区解释而非部署机本地时区——容器多为 UTC，差 8 小时会
+// 把"自然重置临近"误判成"远"，反向误烧稀缺重置槽
+var upstreamLoc = time.FixedZone("UTC+8", 8*3600)
+
+// resetAggFromItem 从额度项提取最早自然重置（unix 秒）。只认重置类键
+// （period_end/nextResetTime），不走 ExtractExpire 的优先级——那会把数月外的
+// 套餐/权益到期当成"下一次重置"，让阈值策略永远判"远"→ 永远花重置
+func resetAggFromItem(bm map[string]interface{}) int64 {
+	for _, k := range []string{"period_end", "nextResetTime", "next_reset_time"} {
+		v, ok := bm[k]
+		if !ok || v == nil {
+			continue
+		}
+		switch x := v.(type) {
+		case float64:
+			if x > 1e12 {
+				return int64(x / 1000)
+			}
+			if x > 1e9 {
+				return int64(x)
+			}
+		case string:
+			t := strings.TrimSpace(x)
+			if t == "" {
+				continue
+			}
+			if n, err := strconv.ParseFloat(t, 64); err == nil {
+				if n > 1e12 {
+					return int64(n / 1000)
+				}
+				if n > 1e9 {
+					return int64(n)
+				}
+			}
+			if ts, err := time.Parse(time.RFC3339, t); err == nil {
+				return ts.Unix()
+			}
+			t = strings.Replace(t, "T", " ", 1)
+			if len(t) >= 16 && t[4] == '-' && t[7] == '-' {
+				if ts, err := time.ParseInLocation("2006-01-02 15:04", t[:16], upstreamLoc); err == nil {
+					return ts.Unix()
+				}
+			}
+		}
+	}
+	return 0
+}
+
 func normalizeBalanceResponse(raw map[string]interface{}, source string) *QuotaOverview {
 	data := unwrapData(raw)
 	ov := &QuotaOverview{Source: source}
@@ -452,8 +501,8 @@ func normalizeBalanceResponse(raw map[string]interface{}, source string) *QuotaO
 			// 聚合最早自然重置（unix 秒）：没有它，耗尽账号的 quota_json 恒无
 			// next_reset，auto-reset 的"等待超阈值才花重置"阈值策略对 JWT 账号
 			// 完全失明（永远按"未知=花"处理，阈值设置形同虚设）
-			if t, perr := time.ParseInLocation("2006-01-02 15:04", item.PeriodEnd, time.Local); perr == nil && t.After(time.Now()) {
-				if s := t.Unix(); ov.NextReset == 0 || s < ov.NextReset {
+			if s := resetAggFromItem(bm); s > 0 && s > time.Now().Unix() {
+				if ov.NextReset == 0 || s < ov.NextReset {
 					ov.NextReset = s
 				}
 			}

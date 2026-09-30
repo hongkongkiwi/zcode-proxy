@@ -95,16 +95,24 @@ func (s *CronScheduler) Start() {
 
 // goPlan 计划执行入口：入 WaitGroup，Stop 时有界等待——停机中断路径的
 // 终态写库必须先于 main 的 db.Close，否则计划行永远卡在 running。
-// 停机后不再派生（RunPlanNow 迟到触发 / 尾 tick 的新计划）
-func (s *CronScheduler) goPlan(spawn func()) {
-	if s.stopped.Load() {
-		return
-	}
+// Add 先于 stopped 复核（与 Stop 的 Store→Wait 序配对）：复核失败即退出并
+// 返回 false，消灭 check-then-Add 的 Add-after-Wait 竞态窗口
+func (s *CronScheduler) goPlan(spawn func()) bool {
 	s.runWG.Add(1)
+	if s.stopped.Load() {
+		s.runWG.Done()
+		return false
+	}
 	go func() {
 		defer s.runWG.Done()
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("[scheduler] plan goroutine panic: %v", r)
+			}
+		}()
 		spawn()
 	}()
+	return true
 }
 
 // Stop 停止调度器（幂等）：关停信号 + 有界等待 tick 与在途 runPlan 收尾。
@@ -212,10 +220,14 @@ func (s *CronScheduler) RunPlanNow(planID int64) error {
 	if !lock.TryLock() {
 		return fmt.Errorf("计划正在执行中，请稍后再试")
 	}
-	s.goPlan(func() {
+	if !s.goPlan(func() {
 		defer lock.Unlock()
 		s.runPlan(plan, time.Now())
-	})
+	}) {
+		// 派生被拒（停机）：锁必须归还，否则该计划此后永久"执行中"
+		lock.Unlock()
+		return fmt.Errorf("服务停机中，无法执行计划")
+	}
 	return nil
 }
 

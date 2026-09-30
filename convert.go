@@ -762,7 +762,7 @@ func (z *ZCodeAPI) streamOpenAI(w http.ResponseWriter, flusher http.Flusher, res
 			}},
 		}, nil, nil)
 	}
-	writeChunk(map[string]interface{}{}, openaiFinish(usage.StopReason), nil)
+	writeChunk(map[string]interface{}{}, openaiFinish(usage.StopReason, len(usage.ToolCalls) > 0), nil)
 	if includeUsage {
 		finalUsage := map[string]interface{}{
 			"prompt_tokens":     usage.InputTokens,
@@ -1190,11 +1190,19 @@ func (z *ZCodeAPI) streamResponses(w http.ResponseWriter, flusher http.Flusher, 
 
 // ---- OpenAI 响应构造 ----
 
-func openaiFinish(stopReason string) string {
+// openaiFinish stop_reason → OpenAI finish_reason。空 reason 但携带工具调用
+// 时按 tool_calls 收尾（上游缺 message_delta 的违例流）：Agents 类客户端以
+// finish_reason 驱动工具循环，错报 "stop" 会让会话无错卡死
+func openaiFinish(stopReason string, hasToolCalls bool) string {
 	switch stopReason {
 	case "max_tokens":
 		return "length"
+	case "refusal":
+		return "content_filter"
 	case "tool_use":
+		return "tool_calls"
+	}
+	if hasToolCalls {
 		return "tool_calls"
 	}
 	return "stop"
@@ -1226,8 +1234,10 @@ func openaiResponse(model, text, thinking string, usage *StreamUsage) map[string
 	}
 	in, out := 0, 0
 	stop := ""
+	hasTools := false
 	if usage != nil {
 		in, out, stop = usage.InputTokens, usage.OutputTokens, usage.StopReason
+		hasTools = len(usage.ToolCalls) > 0
 	}
 	return map[string]interface{}{
 		"id":      "chatcmpl-" + randomHex(12),
@@ -1235,7 +1245,7 @@ func openaiResponse(model, text, thinking string, usage *StreamUsage) map[string
 		"created": time.Now().Unix(),
 		"model":   model,
 		"choices": []map[string]interface{}{{
-			"index": 0, "message": message, "finish_reason": openaiFinish(stop),
+			"index": 0, "message": message, "finish_reason": openaiFinish(stop, hasTools),
 		}},
 		"usage": map[string]interface{}{
 			"prompt_tokens": in, "completion_tokens": out, "total_tokens": in + out,

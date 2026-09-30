@@ -333,11 +333,11 @@ func openaiToAnthropic(body map[string]interface{}) (map[string]interface{}, err
 						// 与客户端发送的不一致
 						return nil, errString("image_url must be an object with a data: base64 URL; other image forms are not supported by the upstream")
 					}
-					// 未知 part 类型同样显式报错（与 image_url fail-closed 同理）：
+				default:
+					// 未知 part 类型显式报错（与 image_url fail-closed 同理）：
 					// 静默跳过 = 纯该类消息整体消失，多轮对话模型看到缺块对话
-					if pt, ok := pm["type"].(string); ok && pt != "text" && pt != "image_url" {
-						return nil, errString("unsupported content part type: " + pt + "; the upstream supports only text and image_url parts")
-					}
+					pt, _ := pm["type"].(string)
+					return nil, errString("unsupported content part type: " + pt + "; the upstream supports only text and image_url parts")
 				}
 			}
 		}

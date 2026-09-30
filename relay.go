@@ -569,6 +569,9 @@ func (z *ZCodeAPI) forwardOnce(w http.ResponseWriter, r *http.Request, a *Accoun
 			z.pool.MarkFailed(a, fmt.Sprintf("上游错误 HTTP %d", resp.StatusCode))
 			z.recordUsage(a, r, payload, resp.StatusCode, start, 0, nil, rc.clientStream)
 			writeUpstreamErrorForProto(w, resp, text, rc.proto)
+			// 终态失败解绑粘滞：否则粘滞命中+TTL 刷新会把会话域钉死在
+			// 持续报错的账号上，failover 永远轮不到
+			z.pool.ForgetSticky(rc.sessionKey())
 			return outcomeUpstreamError
 		}
 
@@ -1003,7 +1006,10 @@ func validateMessagesBody(body map[string]interface{}) error {
 		if role, _ := mm["role"].(string); role != "assistant" {
 			continue
 		}
-		if blocks, ok := mm["content"].([]interface{}); ok {
+		// asIfaceSlice 兜底 []map[string]interface{}：OpenAI 转换路径产出的
+		// 就是该具体类型，纯 []interface{} 断言会漏扫（第二遍主循环有兜底，
+		// 预扫描没有——两处必须同构）
+		if blocks := asIfaceSlice(mm["content"]); blocks != nil {
 			for _, b := range blocks {
 				bm, ok := b.(map[string]interface{})
 				if !ok {
@@ -1043,7 +1049,11 @@ func validateMessagesBody(body map[string]interface{}) error {
 				return fmt.Errorf("messages[%d].content is too long", i)
 			}
 			if rv.Len() == 0 {
-				return fmt.Errorf("messages[%d].content must not be empty", i)
+				// Anthropic 契约：唯一允许空 content 的是"最后一条 assistant 消息"
+				//（从零 prefill 的标准形状），其余一律拒绝
+				if !(i == len(msgs)-1 && role == "assistant") {
+					return fmt.Errorf("messages[%d].content must not be empty", i)
+				}
 			}
 			for j := 0; j < rv.Len(); j++ {
 				bm, ok := rv.Index(j).Interface().(map[string]interface{})
@@ -1055,11 +1065,13 @@ func validateMessagesBody(body map[string]interface{}) error {
 					return fmt.Errorf("messages[%d].content[%d] must have a type", i, j)
 				}
 				// 上游 schema 逐类校验：这些形状本地放行只会换来上游 400 +
-				// 账号无谓计一次失败
+				// 账号无谓计一次失败（空 text 例外同上：仅末条 assistant 放行）
 				switch btype {
 				case "text":
 					if t, _ := bm["text"].(string); t == "" {
-						return fmt.Errorf("messages[%d].content[%d]: text block must contain non-empty text", i, j)
+						if !(i == len(msgs)-1 && role == "assistant") {
+							return fmt.Errorf("messages[%d].content[%d]: text block must contain non-empty text", i, j)
+						}
 					}
 				case "tool_use":
 					if id, _ := bm["id"].(string); id == "" {
@@ -1080,8 +1092,10 @@ func validateMessagesBody(body map[string]interface{}) error {
 					}
 				case "image":
 					if src, ok := bm["source"].(map[string]interface{}); ok {
-						if data, _ := src["data"].(string); data == "" {
-							return fmt.Errorf("messages[%d].content[%d]: image block must contain base64 data", i, j)
+						if st, _ := src["type"].(string); st != "url" {
+							if data, _ := src["data"].(string); data == "" {
+								return fmt.Errorf("messages[%d].content[%d]: image block must contain base64 data (url sources are not accepted by the upstream)", i, j)
+							}
 						}
 					}
 				}

@@ -342,9 +342,15 @@ func (m *AccountManager) ImportPasted(provider, name, secret, group string) (*Ac
 	a.ID = id
 	m.ensureAccountIdentity(a)
 
+	// 异步刷新额度：与本地导入同纪律——在库内新副本上刷新，本副本随即被
+	// handler 无锁序列化（accountPublicView），共享实例并发写会撕裂字符串字段
 	go func() {
 		time.Sleep(500 * time.Millisecond)
-		m.zapi.RefreshAccountQuota(a)
+		fresh, err := m.db.GetAccount(id)
+		if err != nil {
+			return
+		}
+		m.zapi.RefreshAccountQuota(fresh)
 	}()
 	return a, nil
 }
