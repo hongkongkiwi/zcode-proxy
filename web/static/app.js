@@ -190,7 +190,17 @@ function switchSettingsTab(tab) {
 }
 
 // 切换语言后重载当前分区，让已渲染的动态内容跟随新语言（登录页无需重载）
+// syncLlmPromptDefault 默认提示词是可编辑内容，属性型 i18n 覆盖不到：
+// 仅当仍是任一语言的默认文案时跟随当前语言
+function syncLlmPromptDefault() {
+  const p = document.getElementById('llmPrompt');
+  if (p && (p.value === '用一句话介绍你自己。' || p.value === 'Introduce yourself in one sentence.')) {
+    p.value = t('用一句话介绍你自己。');
+  }
+}
+
 function onLanguageChanged() {
+  syncLlmPromptDefault();
   const main = document.getElementById('mainApp');
   if (!main || main.style.display === 'none') return;
   const active = document.querySelector('.section.active');
@@ -1677,6 +1687,7 @@ function loadAll() {
   loadDashboard();
   loadGroups().then(loadAccounts);
   initLlmPlaceholders();
+  syncLlmPromptDefault();
 }
 
 setInterval(() => {
