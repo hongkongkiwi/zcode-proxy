@@ -816,6 +816,7 @@ var settingsWhitelist = map[string]bool{
 	"prompt_cache_breakpoint": true,
 	"captcha_prewarm":         true,
 	"auto_claim_promos":       true, "auto_claim_interval_minutes": true, "auto_claim_delay_seconds": true,
+	"auto_reset_enabled": true, "auto_reset_min_wait_minutes": true, "auto_reset_min_wait_week_hours": true,
 	"max_concurrent_per_account": true,
 	// 闲时免费通道（off-peak ticket queue）
 	"async_enabled": true, "async_poll_interval_ms": true,

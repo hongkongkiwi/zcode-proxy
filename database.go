@@ -401,6 +401,10 @@ func (db *DB) initSchema() error {
 		"auto_claim_promos":           "1",
 		"auto_claim_interval_minutes": "30",
 		"auto_claim_delay_seconds":    "10",
+		// 自动重置策略：默认关闭；开启后仅在"耗尽 && 自然窗口等待 > 阈值"时消耗
+		"auto_reset_enabled":           "0",
+		"auto_reset_min_wait_minutes":  "60",
+		"auto_reset_min_wait_week_hours": "24",
 	}
 	for k, v := range defaults {
 		if _, err := db.conn.Exec(

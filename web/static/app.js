@@ -1096,6 +1096,9 @@ async function loadSettings() {
     document.getElementById('setGatewayModels').value = s.gateway_models || '';
     document.getElementById('setSticky').checked = !(s.sticky_sessions === '0' || s.sticky_sessions === 'false');
     document.getElementById('setPromptCacheBreakpoint').checked = s.prompt_cache_breakpoint === '1';
+    document.getElementById('setAutoReset').checked = s.auto_reset_enabled === '1';
+    document.getElementById('setAutoResetMinWait5h').value = s.auto_reset_min_wait_minutes || '60';
+    document.getElementById('setAutoResetMinWaitWeek').value = s.auto_reset_min_wait_week_hours || '24';
     document.getElementById('setMaxConcurrent').value = s.max_concurrent_per_account || '3';
     window._fpCurrent = s.fingerprint || 'chrome';
     window._ja3Current = s.custom_ja3 || '';
@@ -1150,6 +1153,9 @@ async function saveStrategySettings() {
       quota_refresh_interval: document.getElementById('setQuotaInterval').value,
       sticky_sessions: document.getElementById('setSticky').checked ? '1' : '0',
       prompt_cache_breakpoint: document.getElementById('setPromptCacheBreakpoint').checked ? '1' : '0',
+      auto_reset_enabled: document.getElementById('setAutoReset').checked ? '1' : '0',
+      auto_reset_min_wait_minutes: document.getElementById('setAutoResetMinWait5h').value || '60',
+      auto_reset_min_wait_week_hours: document.getElementById('setAutoResetMinWaitWeek').value || '24',
       max_concurrent_per_account: document.getElementById('setMaxConcurrent').value || '3',
     }});
     toast(t('策略已保存'));

@@ -388,6 +388,8 @@ func (z *ZCodeAPI) forwardOnce(w http.ResponseWriter, r *http.Request, a *Accoun
 				z.pool.MarkExhausted(a, "额度已用完")
 				// 走节流+单飞版本：并发请求同时撞上同一耗尽账号时只拉一次 billing
 				go z.RefreshAccountQuotaThrottled(a)
+				// 自动重置策略（默认关闭）：耗尽且自然窗口等待超阈值时才消耗重置
+				go z.MaybeAutoReset(a, "relay")
 				return outcomeNextAccount
 			}
 
