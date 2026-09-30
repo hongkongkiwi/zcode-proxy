@@ -352,9 +352,21 @@ func matchAccountGroup(a *Account, group string) bool {
 
 // ---- 账号选择 ----
 
+// SnapshotAccounts 供转发热路径一次取全量账号快照：一次请求内最多会做
+// 十余次选择/提示扫描，各自 ListAccounts（逐行 6 列 vault 解密）是最坏情形
+// 下的主要 CPU 开销。快照在本请求内复用，跨请求不受影响（每请求重取）。
+func (p *AccountPool) SnapshotAccounts() []*Account {
+	accounts, err := p.db.ListAccounts("")
+	if err != nil {
+		log.Printf("[pool] snapshot list: %v", err)
+		return nil
+	}
+	return accounts
+}
+
 // Select 按策略选择账号（不限通道）。group 为空 = 不限组；skip 为已尝试过的账号 ID。
 func (p *AccountPool) Select(provider, group string, skip map[int64]bool) *Account {
-	return p.SelectChannel(provider, group, skip, "")
+	return p.SelectChannel(provider, group, nil, skip, "")
 }
 
 // channelHasCreds 通道凭证要求：候选账号必须持有该通道的凭证
@@ -368,12 +380,18 @@ func channelHasCreds(a *Account, channel string) bool {
 	return a.ZCodeJWT != "" || a.APIKey != ""
 }
 
-// SelectChannel 按策略在指定通道的候选里选账号；channel 为空 = 不限通道
-func (p *AccountPool) SelectChannel(provider, group string, skip map[int64]bool, channel string) *Account {
-	accounts, err := p.db.ListAccounts("")
-	if err != nil {
-		log.Printf("[pool] select list: %v", err)
-		return nil
+// SelectChannel 按策略在指定通道的候选里选账号；channel 为空 = 不限通道。
+// accounts 为调用方预取的快照（热路径传 SnapshotAccounts() 的结果，一次请求
+// 全程复用）；传 nil 则内部自取（非热路径/测试用）。
+// 快照取舍：本请求内其他请求/管理员/刷新循环对账号的标记不可见（skip 只挡
+// 本请求已试过的），最坏是多烧几次上游往返或 503 提示略欠准——下次请求即自愈；
+// 换来热路径上一次 ListAccounts 替代十余次。
+func (p *AccountPool) SelectChannel(provider, group string, accounts []*Account, skip map[int64]bool, channel string) *Account {
+	if accounts == nil {
+		accounts = p.SnapshotAccounts()
+		if accounts == nil {
+			return nil
+		}
 	}
 	now := time.Now().Unix()
 	var pool []*Account
@@ -454,13 +472,14 @@ func (p *AccountPool) stickyEnabled() bool {
 // SelectSticky 粘滞优先选择（不限通道）：sessionKey 命中且账号仍可选 → 复用；
 // 否则按策略选择并记录。skip（已尝试失败）的账号不粘滞。
 func (p *AccountPool) SelectSticky(provider, group, sessionKey string, skip map[int64]bool) *Account {
-	return p.SelectStickyChannel(provider, group, sessionKey, skip, "")
+	return p.SelectStickyChannel(provider, group, sessionKey, nil, skip, "")
 }
 
 // SelectStickyChannel 粘滞优先选择（通道感知）：粘滞命中时按通道可选性复验，
 // 免费侧受限的粘滞账号在付费阶段仍可粘滞复用（prompt 缓存跨通道失效，
-// 但账号一致性对排查与配额归因仍有价值）。
-func (p *AccountPool) SelectStickyChannel(provider, group, sessionKey string, skip map[int64]bool, channel string) *Account {
+// 但账号一致性对排查与配额归因仍有价值）。accounts 快照语义同 SelectChannel；
+// 粘滞命中始终走 selectableByIDChannel 的单账号实时读取（复验要新鲜状态）。
+func (p *AccountPool) SelectStickyChannel(provider, group, sessionKey string, accounts []*Account, skip map[int64]bool, channel string) *Account {
 	if sessionKey != "" && p.stickyEnabled() {
 		now := time.Now().Unix()
 		p.mu.Lock()
@@ -473,7 +492,7 @@ func (p *AccountPool) SelectStickyChannel(provider, group, sessionKey string, sk
 			}
 		}
 	}
-	a := p.SelectChannel(provider, group, skip, channel)
+	a := p.SelectChannel(provider, group, accounts, skip, channel)
 	if a != nil && sessionKey != "" && p.stickyEnabled() {
 		p.rememberSticky(sessionKey, a.ID)
 	}
@@ -637,10 +656,13 @@ func isRateLimitBody(status int, text string) bool {
 
 // ExhaustedResetInfo 返回 provider/group 下耗尽账号的最早重置时间（unix 秒）
 // 与账号名；读各自 quota_json 的 next_reset 字段（monitor 通道提供）。
-func (p *AccountPool) ExhaustedResetInfo(provider, group string) (int64, string) {
-	accounts, err := p.db.ListAccounts("")
-	if err != nil {
-		return 0, ""
+// accounts 快照语义同 SelectChannel（nil = 内部自取）。
+func (p *AccountPool) ExhaustedResetInfo(provider, group string, accounts []*Account) (int64, string) {
+	if accounts == nil {
+		accounts = p.SnapshotAccounts()
+		if accounts == nil {
+			return 0, ""
+		}
 	}
 	var until int64
 	email := ""
@@ -866,11 +888,14 @@ func (p *AccountPool) MarkFailed(a *Account, reason string) {
 	p.db.BumpAccountFail(a.ID, reason)
 }
 
-// CoolingInfo 返回该 provider/group 下最近一个冷却中账号的恢复时间与原因（用于 503 提示）
-func (p *AccountPool) CoolingInfo(provider, group string) (int64, string) {
-	accounts, err := p.db.ListAccounts("")
-	if err != nil {
-		return 0, ""
+// CoolingInfo 返回该 provider/group 下最近一个冷却中账号的恢复时间与原因（用于 503 提示）。
+// accounts 快照语义同 SelectChannel（nil = 内部自取）。
+func (p *AccountPool) CoolingInfo(provider, group string, accounts []*Account) (int64, string) {
+	if accounts == nil {
+		accounts = p.SnapshotAccounts()
+		if accounts == nil {
+			return 0, ""
+		}
 	}
 	now := time.Now().Unix()
 	var until int64

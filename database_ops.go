@@ -487,6 +487,34 @@ func (db *DB) ProxyNodeForGroup(group string) (*ProxyNode, error) {
 	return nil, nil
 }
 
+// ---- 记录保留（防无界增长：stats 聚合随表龄线性变慢）----
+
+// PruneUsageRecords 删除 created_at 早于 days 天的用量记录，返回删除行数。
+// days <= 0 = 永久保留（不执行）
+func (db *DB) PruneUsageRecords(days int) (int64, error) {
+	if days <= 0 {
+		return 0, nil
+	}
+	cutoff := time.Now().AddDate(0, 0, -days).Format("2006-01-02 15:04:05")
+	res, err := db.conn.Exec(`DELETE FROM usage_records WHERE created_at < ?`, cutoff)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
+
+// UsageRetentionDays 用量记录保留天数：未配置 = 90；显式 0 = 永久保留
+func (db *DB) UsageRetentionDays() int {
+	v, _ := db.GetSetting("usage_retention_days")
+	if v == "" {
+		return 90
+	}
+	if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+		return n
+	}
+	return 90
+}
+
 // ---- 计划运行记录 ----
 
 func (db *DB) InsertPlanRunRecord(r *PlanRunRecord) error {

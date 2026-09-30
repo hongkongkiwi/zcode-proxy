@@ -51,7 +51,9 @@ func main() {
 	defer db.Close()
 	log.Printf("[main] database: %s", absDBPath)
 
-	// -doctor：离线体检（配置/库完整性/vault/账号/代理/Key），不启动任何服务
+	// -doctor：离线体检（配置/库完整性/vault/账号/代理/Key），不启动任何服务。
+	// 注意副作用：NewDB 已执行 schema 迁移与 vault 密钥解析/迁移（含 VACUUM）——
+	// 对生产数据目录请先停服再运行
 	if *doctor {
 		runDoctorAndExit(cfg, db)
 	}
@@ -125,6 +127,53 @@ func main() {
 	autoClaim := NewAutoClaimer(db, zapi)
 	autoClaim.Start()
 	defer autoClaim.Stop()
+
+	// 用量记录保留清扫（默认 90 天，usage_retention_days 可调；0=永久）：
+	// usage_records 每请求一行、无界增长，stats 聚合随表龄线性变慢。
+	// 停机顺序必须是"先关信号再 join"：单个 defer 内先 close(retentionStop)
+	// 再等 retentionDone——LIFO 下若拆成两个 defer，join 会先于 close 执行，
+	// 白等 5 秒且 join 永远落空
+	retentionStop := make(chan struct{})
+	retentionDone := make(chan struct{})
+	go func() {
+		defer close(retentionDone)
+		t := time.NewTicker(6 * time.Hour)
+		defer t.Stop()
+		pruneOnce := func() {
+			days := db.UsageRetentionDays()
+			if days <= 0 {
+				return
+			}
+			if n, err := db.PruneUsageRecords(days); err != nil {
+				log.Printf("[retention] usage records prune: %v", err)
+			} else if n > 0 {
+				log.Printf("[retention] pruned %d usage record(s) older than %dd", n, days)
+			}
+		}
+		// 首次清扫延迟 10 分钟：老库首删可能锁住唯一连接数秒，避开启动窗口
+		select {
+		case <-retentionStop:
+			return
+		case <-time.After(10 * time.Minute):
+		}
+		pruneOnce()
+		for {
+			select {
+			case <-retentionStop:
+				return
+			case <-t.C:
+				pruneOnce()
+			}
+		}
+	}()
+	defer func() {
+		close(retentionStop)
+		select {
+		case <-retentionDone:
+		case <-time.After(5 * time.Second):
+			log.Printf("[main] shutdown: retention goroutine did not stop in 5s")
+		}
+	}()
 
 	// Web 认证
 	auth := NewAuthManager(db, os.Getenv("ZCODE_WEB_PASS"))
@@ -256,26 +305,16 @@ func main() {
 		log.Printf("[main] shutdown: in-flight handlers still draining after 30s; proceeding")
 	}
 	// 先停掉后台任务派生者并等它们收尾（调度器计划、自动领取、额度刷新轮），
-	// 再等 relay 派生的后台任务——顺序是 WaitGroup 契约要求：bgw.Wait 与
-	// 计划 goroutine 里新 spawn 的 goBackground（Add）不得并发，否则计数归零
-	// 后的 Add 会撞上 Wait（-race 直接致命，且任务逃过等待撞上 db.Close）。
-	// 三者的 Stop 都幂等（stopOnce + 有界 join），末尾 defer 再调一次是空操作
+	// 再等 relay 派生的后台任务。三者的 Stop 都幂等（stopOnce + 有界 join），
+	// 末尾 defer 再调一次是空操作
 	scheduler.Stop()
 	autoClaim.Stop()
 	pool.Stop()
 	// relay 派生的后台任务（额度刷新/自动重置）会在 handler 返回后继续跑：
-	// 等它们收尾再做 deferred db.Close，否则终态写库（重置成功的
-	// claim record 等）撞上已关闭的库被静默吞掉——稀缺重置槽就白烧了
-	bgDone := make(chan struct{})
-	go func() {
-		zapi.bgw.Wait()
-		close(bgDone)
-	}()
-	select {
-	case <-bgDone:
-	case <-time.After(20 * time.Second):
-		log.Printf("[main] shutdown: background tasks still running after 20s; proceeding")
-	}
+	// WaitBackground 先拒绝新任务（含 >30s 排水窗口里残存的 handler 迟到
+	// spawn，它们写库只会失败并被日志记录，不会撞 WaitGroup 契约）再有界等待，
+	// 终态写库不会撞上已关闭的库被静默吞掉——稀缺重置槽就白烧了
+	zapi.WaitBackground(20 * time.Second)
 }
 
 // limitBody 全局请求体上限：管理 API 与登录接口此前无大小限制，

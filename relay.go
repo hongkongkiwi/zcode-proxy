@@ -129,6 +129,11 @@ func (z *ZCodeAPI) relay(w http.ResponseWriter, r *http.Request, rc *relayCtx) {
 	start := time.Now()
 	sessionKey := rc.sessionKey()
 	policy := z.pool.PaidFallbackPolicy()
+	// 本请求的全量账号快照：一次取用，选择/503 提示全程复用（热路径上
+	// 逐次 ListAccounts 的逐行 vault 解密是最坏情形的主要 CPU 开销）。
+	// 取舍：本请求内其他请求对账号的标记不可见（skip 只挡本请求已试过的），
+	// 最坏多烧几次受限账号的往返，下次请求自愈；后台任务一律用库内新副本
+	accounts := z.pool.SnapshotAccounts()
 
 	// 阶段一：免费通道。balanced 策略下免费侧"软受限"（风控拦截/验证码拒绝）
 	// 立刻同账号试付费通道；硬失败（耗尽/限流/凭证失效）与 free_first 一致交给阶段二
@@ -138,7 +143,7 @@ func (z *ZCodeAPI) relay(w http.ResponseWriter, r *http.Request, rc *relayCtx) {
 	}
 	tried := map[int64]bool{}
 	for attempt := 0; attempt < maxAccountAttempts; attempt++ {
-		a := z.pool.SelectStickyChannel(rc.provider, rc.group, sessionKey, tried, ChannelFree)
+		a := z.pool.SelectStickyChannel(rc.provider, rc.group, sessionKey, accounts, tried, ChannelFree)
 		if a == nil {
 			break
 		}
@@ -167,7 +172,7 @@ func (z *ZCodeAPI) relay(w http.ResponseWriter, r *http.Request, rc *relayCtx) {
 	// never 策略不进付费阶段，但纯 API Key 账号（无 JWT，付费是唯一通道）仍须可服务
 	if policy == PaidModeNever && paidCapReason == "" {
 		for attempt := 0; attempt < maxAccountAttempts; attempt++ {
-			a := z.pool.SelectStickyChannel(rc.provider, rc.group, sessionKey, tried, ChannelPaidOnly)
+			a := z.pool.SelectStickyChannel(rc.provider, rc.group, sessionKey, accounts, tried, ChannelPaidOnly)
 			if a == nil {
 				break
 			}
@@ -198,7 +203,7 @@ func (z *ZCodeAPI) relay(w http.ResponseWriter, r *http.Request, rc *relayCtx) {
 			}
 		}
 		for attempt := 0; attempt < maxAccountAttempts; attempt++ {
-			a := z.pool.SelectStickyChannel(rc.provider, rc.group, sessionKey, triedPaid, ChannelPaid)
+			a := z.pool.SelectStickyChannel(rc.provider, rc.group, sessionKey, accounts, triedPaid, ChannelPaid)
 			if a == nil {
 				break
 			}
@@ -225,7 +230,7 @@ func (z *ZCodeAPI) relay(w http.ResponseWriter, r *http.Request, rc *relayCtx) {
 		msg += "；" + paidSkipReason
 	}
 	// 若因冷却导致无可用账号，给出预计恢复时间
-	if until, reason := z.pool.CoolingInfo(rc.provider, rc.group); until > 0 {
+	if until, reason := z.pool.CoolingInfo(rc.provider, rc.group, accounts); until > 0 {
 		secs := until - time.Now().Unix()
 		if secs < 0 {
 			secs = 0
@@ -234,7 +239,7 @@ func (z *ZCodeAPI) relay(w http.ResponseWriter, r *http.Request, rc *relayCtx) {
 	}
 	// F3：耗尽账号的上游重置时间已知时如实告知（monitor 通道 nextResetTime）。
 	// 不带账号邮箱/展示名：503 体面向命名 Key 持有方（可能发给第三方）
-	if until, _ := z.pool.ExhaustedResetInfo(rc.provider, rc.group); until > 0 {
+	if until, _ := z.pool.ExhaustedResetInfo(rc.provider, rc.group, accounts); until > 0 {
 		mins := (until - time.Now().Unix()) / 60
 		if mins < 0 {
 			mins = 0
@@ -310,9 +315,12 @@ func (z *ZCodeAPI) tryAccount(w http.ResponseWriter, r *http.Request, a *Account
 
 	needsCaptcha := rc.provider == "zai" && a.AuthType == "jwt" && a.ZCodeJWT != ""
 
-	// 路径 1：JWT + 阿里云无痕验证码（含失效重解重试）；无可用验证参数时跳过（与路径 2 直连等价）
+	// 路径 1：JWT + 阿里云无痕验证码（含失效重解重试）；无可用验证参数时跳过（与路径 2 直连等价）。
+	// 求解等待上限 45s（文档承诺值）：ctx 超时即放弃，在跑尝试转后台入缓存
 	if needsCaptcha {
-		verifyParam, region, err := z.captcha.GetVerifyParam(a)
+		captchaCtx, captchaCancel := context.WithTimeout(r.Context(), captchaSolveBudgetFront)
+		verifyParam, region, err := z.captcha.GetVerifyParamCtx(captchaCtx, a)
+		captchaCancel()
 		if err != nil {
 			note("人机校验求解失败: " + truncate(err.Error(), 180))
 		} else if verifyParam != "" {
@@ -499,7 +507,9 @@ func (z *ZCodeAPI) forwardOnce(w http.ResponseWriter, r *http.Request, a *Accoun
 				if verifyParam != "" && attempt+1 < retries {
 					z.captcha.InvalidateFor(a)
 					log.Printf("[relay] account %s captcha rejected, re-solving", a.Email)
-					newParam, newRegion, err := z.captcha.GetVerifyParam(a)
+					captchaCtx, captchaCancel := context.WithTimeout(r.Context(), captchaSolveBudgetFront)
+					newParam, newRegion, err := z.captcha.GetVerifyParamCtx(captchaCtx, a)
+					captchaCancel()
 					if err == nil && newParam != "" {
 						verifyParam, region = newParam, newRegion
 						continue
@@ -570,10 +580,25 @@ func (z *ZCodeAPI) forwardOnce(w http.ResponseWriter, r *http.Request, a *Accoun
 					return outcomeNextAccount
 				}
 				z.pool.MarkExhausted(a, "额度已用完")
+				// 后台任务在库内新副本上跑：relay 的账号快照被本请求的 503 提示
+				// 扫描无锁读取，共享实例就地写（setQuota/setRuntime）会与之竞态。
 				// 走节流+单飞版本：并发请求同时撞上同一耗尽账号时只拉一次 billing
-				z.goBackground("quota-refresh", func() { z.RefreshAccountQuotaThrottled(a) })
+				exhaustedID := a.ID
+				z.goBackground("quota-refresh", func() {
+					fresh, err := z.db.GetAccount(exhaustedID)
+					if err != nil {
+						return
+					}
+					z.RefreshAccountQuotaThrottled(fresh)
+				})
 				// 自动重置策略（默认关闭）：耗尽且自然窗口等待超阈值时才消耗重置
-				z.goBackground("auto-reset", func() { z.MaybeAutoReset(a, "relay") })
+				z.goBackground("auto-reset", func() {
+					fresh, err := z.db.GetAccount(exhaustedID)
+					if err != nil {
+						return
+					}
+					z.MaybeAutoReset(fresh, "relay")
+				})
 				return outcomeNextAccount
 			}
 
@@ -593,7 +618,15 @@ func (z *ZCodeAPI) forwardOnce(w http.ResponseWriter, r *http.Request, a *Accoun
 		} else {
 			z.pool.MarkUsed(a)
 		}
-		z.goBackground("relay-success-quota", func() { z.RefreshAccountQuotaThrottled(a) })
+		// 同耗尽路径：后台刷新用库内新副本，不在 relay 快照实例上就地写
+		successID := a.ID
+		z.goBackground("relay-success-quota", func() {
+			fresh, err := z.db.GetAccount(successID)
+			if err != nil {
+				return
+			}
+			z.RefreshAccountQuotaThrottled(fresh)
+		})
 		log.Printf("[relay] account %s success via %s [%s] (HTTP %d)", a.DisplayNameOrEmail(), pathLabel, channel, resp.StatusCode)
 
 		contentType := resp.Header.Get("Content-Type")

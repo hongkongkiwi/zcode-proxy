@@ -44,7 +44,9 @@ type ZCodeAPI struct {
 
 	quotaRefreshInflight sync.Map // 账号ID → 刷新中（单飞，防并发请求对 billing 形成风暴）
 
-	bgw sync.WaitGroup // relay 派生的后台任务（停机时 db.Close 前有界等待）
+	bgwMu sync.Mutex     // 序列化 bgw.Add 与停机等待（WaitGroup 契约：Add 不得与归零后的 Wait 并发）
+	bgwWg sync.WaitGroup // relay 派生的后台任务
+	bgwOn atomic.Bool    // 停机已开始：goBackground 拒绝新任务（等待方不再被迟到 Add 打破）
 
 	asyncRotation atomic.Int64 // 闲时通道轮转起点（并发请求分摊账号）
 
@@ -52,12 +54,21 @@ type ZCodeAPI struct {
 }
 
 // goBackground 转发路径派生的后台任务（额度刷新/自动重置）：panic 隔离 +
-// 停机计数。main 在 HTTP 排水后、db.Close 前等待 bgw，终态写库（如重置成功
-// 后的 claim record）才不会撞上已关闭的连接被静默吞掉。
+// 停机计数。main 在 HTTP 排水后、db.Close 前等 WaitBackground，终态写库（如
+// 重置成功后的 claim record）才不会撞上已关闭的连接被静默吞掉。
+// bgwMu 把 Add 与 WaitBGW 的交接串行化：停机侧先关 bgwOn 再等待，迟到调用
+// 在 bgwOn 下被拒（记日志）而不是 Add-after-Wait 违反 WaitGroup 契约
 func (z *ZCodeAPI) goBackground(name string, fn func()) {
-	z.bgw.Add(1)
+	z.bgwMu.Lock()
+	if z.bgwOn.Load() {
+		z.bgwMu.Unlock()
+		log.Printf("[bg] %s rejected: shutdown in progress", name)
+		return
+	}
+	z.bgwWg.Add(1)
+	z.bgwMu.Unlock()
 	go func() {
-		defer z.bgw.Done()
+		defer z.bgwWg.Done()
 		defer func() {
 			if r := recover(); r != nil {
 				log.Printf("[bg] %s panic: %v\n%s", name, r, debug.Stack())
@@ -65,6 +76,24 @@ func (z *ZCodeAPI) goBackground(name string, fn func()) {
 		}()
 		fn()
 	}()
+}
+
+// WaitBackground 停机等待：拒绝新任务后有界等待在途后台任务收尾。
+// 先置 bgwOn（此后 goBackground 一律拒绝）再等待，杜绝 Add-after-Wait
+func (z *ZCodeAPI) WaitBackground(maxWait time.Duration) {
+	z.bgwMu.Lock()
+	z.bgwOn.Store(true)
+	z.bgwMu.Unlock()
+	done := make(chan struct{})
+	go func() {
+		z.bgwWg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(maxWait):
+		log.Printf("[bg] background tasks still running after %v; proceeding", maxWait)
+	}
 }
 
 // NewZCodeAPI 创建上游 API 封装，并把额度刷新函数注入账号池

@@ -80,7 +80,7 @@ func TestStickySessions(t *testing.T) {
 		}
 	}
 	// 粘滞账号停用 → 自动让位（且新粘滞落到另一账号）
-	if err := db.UpdateAccountFields(first.ID, "", "", false, false); err != nil {
+	if err := db.UpdateAccountFieldsWithPriority(first.ID, "", "", false, false, nil); err != nil {
 		t.Fatal(err)
 	}
 	other := p.SelectSticky("zai", "", "sess-x", nil)
@@ -88,7 +88,7 @@ func TestStickySessions(t *testing.T) {
 		t.Fatalf("expected fallback after disable, got %+v", other)
 	}
 	// skip 中的账号不参与粘滞：重新启用 s1，跳过 s2 → 应选中 s1
-	if err := db.UpdateAccountFields(first.ID, "", "", true, false); err != nil {
+	if err := db.UpdateAccountFieldsWithPriority(first.ID, "", "", true, false, nil); err != nil {
 		t.Fatal(err)
 	}
 	third := p.SelectSticky("zai", "", "sess-y", map[int64]bool{other.ID: true})

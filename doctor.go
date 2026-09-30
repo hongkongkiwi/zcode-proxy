@@ -9,6 +9,8 @@ import (
 // ---- 离线体检（-doctor）----
 // 不打任何上游请求：配置 / 数据库完整性 / vault 加解密 / 账号状态 /
 // 出口代理 / 网关 Key / 用量记录。退出码 0=全部通过，1=存在 FAIL。
+// 注意：副作用（schema 迁移、vault 密钥解析/迁移含 VACUUM）发生在 NewDB
+// 阶段——main 在进入本函数前已打印提示，对生产库请先停服。
 
 func runDoctor(cfg *FileConfig, db *DB) int {
 	fail := 0
