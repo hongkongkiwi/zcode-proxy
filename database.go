@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"fmt"
 	"log"
+	"os"
 	"strings"
 	"sync"
 
@@ -184,18 +185,30 @@ type DB struct {
 
 // NewDB 打开/创建 SQLite 数据库并初始化 schema
 func NewDB(dbPath string) (*DB, error) {
+	return NewDBWithOptions(dbPath, true)
+}
+
+// NewDBWithOptions 打开数据库。migrate=false（-doctor 体检路径）跳过一切
+// 会写库的启动动作：schema DDL、加列迁移、设置播种、vault 密钥生成/轮换/
+// 明文迁移（含 VACUUM）——体检一个备份库时不得顺手把它升级或换钥匙。
+// 仍以只读方式解析 vault 密钥（已存在的 keyfile/env 只认领不轮换），
+// 保证 doctor 的 AES 回环探测与账号读取可用；并跳过 journal_mode=WAL
+// （对非 WAL 库改模式会写文件头，读路径在默认日志模式下照常工作）。
+func NewDBWithOptions(dbPath string, migrate bool) (*DB, error) {
 	conn, err := sql.Open("sqlite", dbPath)
 	if err != nil {
 		return nil, fmt.Errorf("open sqlite: %w", err)
 	}
 	conn.SetMaxOpenConns(1) // SQLite 单写
 	pragmas := []string{
-		"PRAGMA journal_mode=WAL",
 		"PRAGMA synchronous=NORMAL",
 		"PRAGMA busy_timeout=5000",
 		"PRAGMA foreign_keys=ON",
 		// 凭证迁移/删除后，空闲页中的明文残留要在释放时即被清零
 		"PRAGMA secure_delete=ON",
+	}
+	if migrate {
+		pragmas = append([]string{"PRAGMA journal_mode=WAL"}, pragmas...)
 	}
 	for _, p := range pragmas {
 		if _, err := conn.Exec(p); err != nil {
@@ -204,6 +217,11 @@ func NewDB(dbPath string) (*DB, error) {
 		}
 	}
 	db := &DB{conn: conn}
+	if !migrate {
+		resolveVaultSeedReadOnly(db, dbPath)
+		db.ProbeVaultHealth()
+		return db, nil
+	}
 	if err := db.initSchema(); err != nil {
 		conn.Close()
 		return nil, err
@@ -260,6 +278,39 @@ func (db *DB) addColumnMigrate(stmt string) error {
 	}
 	log.Printf("[db] %s", stmt)
 	return nil
+}
+
+// resolveVaultSeedReadOnly ResolveVaultSeed 的只读变体（-doctor 体检路径）：
+// 只"认领"现有钥匙——env 显式指定，或已有 keyfile 且能解开库中全部密文。
+// 绝不生成 keyfile、绝不轮换/合并重加密：体检备份库不能改变其密钥状态。
+// 无法确定钥匙时停留在派生种子并告警（doctor 的 vault 探测与账号读取
+// 会如实反映解不开的部分）。
+func resolveVaultSeedReadOnly(db *DB, dbPath string) {
+	if s := os.Getenv("ZCODE_PROXY_VAULT_SECRET"); s != "" {
+		setVaultSeedOverride(s)
+		return
+	}
+	if keyFile := vaultKeyFile(dbPath); keyFile != "" {
+		if seed, ok := loadVaultKeyFile(keyFile); ok {
+			_, broken, err := db.scanVaultCiphertext(seed)
+			if err == nil && broken == 0 {
+				setVaultSeedOverride(seed)
+				return
+			}
+		}
+	}
+	legacy := legacyVaultSeed()
+	total, broken, err := db.scanVaultCiphertext(legacy)
+	switch {
+	case err != nil:
+		log.Printf("[vault] doctor: ciphertext scan failed (%v); staying on derived key", err)
+	case total == 0:
+		// 库中无密文（新库/无账号）：无需钥匙；真实启动才会生成 keyfile
+	case broken == 0:
+		log.Printf("[vault] doctor: %d plaintext-era credential value(s) would be rotated to vault.key on a real start; left untouched", total)
+	default:
+		log.Printf("[vault] doctor: WARNING %d of %d encrypted credential value(s) cannot be decrypted without their original key (restore data/vault.key or set ZCODE_PROXY_VAULT_SECRET)", broken, total)
+	}
 }
 
 // Close 关闭数据库连接

@@ -8,9 +8,9 @@ import (
 
 // ---- 离线体检（-doctor）----
 // 不打任何上游请求：配置 / 数据库完整性 / vault 加解密 / 账号状态 /
-// 出口代理 / 网关 Key / 用量记录。退出码 0=全部通过，1=存在 FAIL。
-// 注意：副作用（schema 迁移、vault 密钥解析/迁移含 VACUUM）发生在 NewDB
-// 阶段——main 在进入本函数前已打印提示，对生产库请先停服。
+// 出口代理 / 网关 Key / 记录表行数。退出码 0=全部通过，1=存在 FAIL。
+// 打开走 NewDBWithOptions(migrate=false)：只读体检，不建表、不迁移、
+// 不播种、不生成/轮换 vault 钥匙——对备份库体检不会顺手升级/轮换它。
 
 func runDoctor(cfg *FileConfig, db *DB) int {
 	fail := 0
@@ -115,12 +115,18 @@ func runDoctor(cfg *FileConfig, db *DB) int {
 		ok("gateway_keys", fmt.Sprintf("total=%d disabled=%d（根 api_key 不受影响）", len(keys), disabled))
 	}
 
-	// 7. 用量记录
-	var usage int
-	if err := db.conn.QueryRow(`SELECT COUNT(*) FROM usage_records`).Scan(&usage); err != nil && err != sql.ErrNoRows {
-		bad("usage_records", err.Error())
-	} else {
-		ok("usage_records", fmt.Sprintf("%d 条", usage))
+	// 7. 记录表行数（保留清扫 usage_retention_days 应把三张记录表压在 200k 以下）
+	for _, tbl := range []string{"usage_records", "claim_records", "plan_run_records"} {
+		var n int
+		if err := db.conn.QueryRow(`SELECT COUNT(*) FROM ` + tbl).Scan(&n); err != nil && err != sql.ErrNoRows {
+			bad(tbl, err.Error())
+			continue
+		}
+		if n > 200000 {
+			warn(tbl, fmt.Sprintf("%d 条（超过 200k：检查 usage_retention_days 保留清扫是否生效）", n))
+		} else {
+			ok(tbl, fmt.Sprintf("%d 条", n))
+		}
 	}
 
 	fmt.Println("----------------------------------------")

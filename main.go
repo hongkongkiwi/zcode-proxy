@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io/fs"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -44,16 +45,16 @@ func main() {
 		log.Fatalf("resolve db path: %v", err)
 	}
 	os.MkdirAll(filepath.Dir(absDBPath), 0755)
-	db, err := NewDB(absDBPath)
+	// -doctor：离线体检（配置/库完整性/vault/账号/代理/Key/记录表行数），
+	// 走无迁移打开——不建表、不迁移、不播种、不生成/轮换 vault 钥匙，
+	// 体检备份库不会顺手把它升级；正常启动才执行全部写库初始化
+	db, err := NewDBWithOptions(absDBPath, !*doctor)
 	if err != nil {
 		log.Fatalf("open database: %v", err)
 	}
 	defer db.Close()
 	log.Printf("[main] database: %s", absDBPath)
 
-	// -doctor：离线体检（配置/库完整性/vault/账号/代理/Key），不启动任何服务。
-	// 注意副作用：NewDB 已执行 schema 迁移与 vault 密钥解析/迁移（含 VACUUM）——
-	// 对生产数据目录请先停服再运行
 	if *doctor {
 		runDoctorAndExit(cfg, db)
 	}
@@ -128,8 +129,10 @@ func main() {
 	autoClaim.Start()
 	defer autoClaim.Stop()
 
-	// 用量记录保留清扫（默认 90 天，usage_retention_days 可调；0=永久）：
-	// usage_records 每请求一行、无界增长，stats 聚合随表龄线性变慢。
+	// 记录保留清扫（默认 90 天，usage_retention_days 可调；0=永久）：
+	// usage_records 每请求一行、claim_records 自动领取每账号每轮一行、
+	// plan_run_records 分钟级计划一天 1440 行——三表共用一个旋钮，
+	// 无界增长会让 stats 聚合随表龄线性变慢。
 	// 停机顺序必须是"先关信号再 join"：单个 defer 内先 close(retentionStop)
 	// 再等 retentionDone——LIFO 下若拆成两个 defer，join 会先于 close 执行，
 	// 白等 5 秒且 join 永远落空
@@ -144,10 +147,10 @@ func main() {
 			if days <= 0 {
 				return
 			}
-			if n, err := db.PruneUsageRecords(days); err != nil {
-				log.Printf("[retention] usage records prune: %v", err)
+			if n, err := db.PruneRecords(days); err != nil {
+				log.Printf("[retention] record prune: %v", err)
 			} else if n > 0 {
-				log.Printf("[retention] pruned %d usage record(s) older than %dd", n, days)
+				log.Printf("[retention] pruned %d record(s) older than %dd (usage/claim/plan_run)", n, days)
 			}
 		}
 		// 首次清扫延迟 10 分钟：老库首删可能锁住唯一连接数秒，避开启动窗口
@@ -245,6 +248,12 @@ func main() {
 	})
 
 	listenAddr := cfg.GetListenAddr()
+	// 非环回监听 + cookie 未强制 Secure：面板登录跨网明文传输，一条告警
+	// 指路反代 + ZCODE_COOKIE_SECURE=1（auth.go 的 cookieSecureOverride）
+	if !listenAddrIsLoopback(listenAddr) && !cookieSecureOverride() {
+		log.Printf("[main] WARNING: listening on non-loopback address %s without forced-secure session cookies — "+
+			"panel login crosses the network in cleartext; put a TLS reverse proxy in front and set ZCODE_COOKIE_SECURE=1", listenAddr)
+	}
 	log.Printf("[main] zcode-proxy listening on http://%s", listenAddr)
 	log.Printf("[main] web UI: http://%s/web", listenAddr)
 	// 显式 Server：ReadHeaderTimeout 防 Slowloris；SSE 决定不设 WriteTimeout。
@@ -315,6 +324,23 @@ func main() {
 	// spawn，它们写库只会失败并被日志记录，不会撞 WaitGroup 契约）再有界等待，
 	// 终态写库不会撞上已关闭的库被静默吞掉——稀缺重置槽就白烧了
 	zapi.WaitBackground(20 * time.Second)
+}
+
+// listenAddrIsLoopback 监听地址是否只绑定环回（localhost / 127.0.0.0/8 / ::1）。
+// 通配（空 host、0.0.0.0、::、*）= 对外暴露，按非环回处理。
+func listenAddrIsLoopback(addr string) bool {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		host = addr
+	}
+	switch host {
+	case "", "*", "0.0.0.0", "::":
+		return false
+	case "localhost":
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 // limitBody 全局请求体上限：管理 API 与登录接口此前无大小限制，
