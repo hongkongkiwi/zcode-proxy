@@ -60,6 +60,7 @@ const (
 	protocolAnthropic protocol = iota
 	protocolOpenAI
 	protocolResponses
+	protocolCompletions
 )
 
 // relayCtx 一次转发请求的上下文
@@ -71,6 +72,8 @@ type relayCtx struct {
 	clientStream bool   // 客户端是否要 SSE
 	clientModel  string // 回显给客户端的模型名
 	includeUsage bool   // OpenAI stream_options.include_usage
+	echo         bool   // /v1/completions echo=true：choices.text 前缀原 prompt
+	prompt       string // /v1/completions 原始 prompt（echo 回显用）
 }
 
 // HandleMessages POST /v1/messages — 原生 Anthropic 协议
@@ -424,7 +427,7 @@ func (z *ZCodeAPI) forwardOnce(w http.ResponseWriter, r *http.Request, a *Accoun
 			}
 			usage := parseAnthropicUsageJSON(body)
 			z.recordUsage(a, r, payload, resp.StatusCode, start, 0, usage, rc.clientStream)
-			writeProtocolResponse(w, rc.proto, resp.StatusCode, contentType, body, usage, rc.clientModel)
+			writeProtocolResponse(w, rc, resp.StatusCode, contentType, body, usage)
 			return outcomeWritten
 		}
 

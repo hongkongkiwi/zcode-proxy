@@ -138,8 +138,10 @@ func main() {
 	mux.HandleFunc("/v1/messages/", zapi.HandleMessages)
 	mux.HandleFunc("/v1/messages/count_tokens", zapi.HandleCountTokens)
 	mux.HandleFunc("/v1/chat/completions", zapi.HandleChatCompletions)
+	mux.HandleFunc("/v1/completions", zapi.HandleCompletions)
 	mux.HandleFunc("/v1/responses", zapi.HandleResponses)
 	mux.HandleFunc("/v1/models", zapi.HandleModels)
+	mux.HandleFunc("/v1/models/", zapi.HandleModelRetrieve)
 
 	// 闲时免费通道（off-peak ticket queue；设置 async_enabled 开启）
 	mux.HandleFunc("/async/v1/messages", zapi.HandleAsyncMessages)
@@ -188,7 +190,7 @@ func main() {
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprint(w, `{"service":"zcode-proxy","version":"1.0","endpoints":["/v1/messages","/v1/chat/completions","/v1/responses","/v1/models","/api/","/web","/health"]}`)
+		fmt.Fprint(w, `{"service":"zcode-proxy","version":"1.0","endpoints":["/v1/messages","/v1/chat/completions","/v1/completions","/v1/responses","/v1/models","/api/","/web","/health"]}`)
 	})
 
 	listenAddr := cfg.GetListenAddr()

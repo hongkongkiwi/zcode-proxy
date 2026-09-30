@@ -320,9 +320,10 @@ func toInt(v interface{}) int {
 // ---- 非流式响应写回 ----
 
 // writeProtocolResponse 按客户端协议写回非流式响应
-func writeProtocolResponse(w http.ResponseWriter, proto protocol, status int, contentType string,
-	body []byte, usage *StreamUsage, clientModel string) {
+func writeProtocolResponse(w http.ResponseWriter, rc *relayCtx, status int, contentType string,
+	body []byte, usage *StreamUsage) {
 
+	proto := rc.proto
 	if proto == protocolAnthropic {
 		w.Header().Set("Content-Type", firstNonEmpty(contentType, "application/json"))
 		w.Header().Set("Cache-Control", "no-cache")
@@ -381,9 +382,11 @@ func writeProtocolResponse(w http.ResponseWriter, proto protocol, status int, co
 	u.ThinkingBlocks = append(u.ThinkingBlocks, thinkBlocks...)
 	cacheThinkingForOutput(text, u)
 	if proto == protocolOpenAI {
-		writeJSON(w, status, openaiResponse(clientModel, text, thinking, u))
+		writeJSON(w, status, openaiResponse(rc.clientModel, text, thinking, u))
+	} else if proto == protocolResponses {
+		writeJSON(w, status, responsesResponse(rc.clientModel, newResponseID(), text, thinking, u))
 	} else {
-		writeJSON(w, status, responsesResponse(clientModel, newResponseID(), text, thinking, u))
+		writeJSON(w, status, completionsResponse(rc.clientModel, text, u, rc.echo, rc.prompt))
 	}
 }
 
@@ -471,6 +474,12 @@ func streamProtocolResponse(w http.ResponseWriter, rc *relayCtx, resp *http.Resp
 		w.WriteHeader(resp.StatusCode)
 		z.streamResponses(w, flusher, resp, clientModel, a, r, payload, start)
 
+	case proto == protocolCompletions && clientStream:
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.WriteHeader(resp.StatusCode)
+		z.streamCompletions(w, flusher, resp, clientModel, includeUsage, rc.echo, rc.prompt, a, r, payload, start)
+
 	default:
 		// 客户端要非流式，但上游是流式：聚合后写单个 JSON
 		if proto == protocolAnthropic {
@@ -519,8 +528,10 @@ func streamProtocolResponse(w http.ResponseWriter, rc *relayCtx, resp *http.Resp
 		w.WriteHeader(resp.StatusCode)
 		if proto == protocolOpenAI {
 			json.NewEncoder(w).Encode(openaiResponse(clientModel, text, thinking, &usage))
-		} else {
+		} else if proto == protocolResponses {
 			json.NewEncoder(w).Encode(responsesResponse(clientModel, newResponseID(), text, thinking, &usage))
+		} else {
+			json.NewEncoder(w).Encode(completionsResponse(clientModel, text, &usage, rc.echo, rc.prompt))
 		}
 		z.recordUsage(a, r, payload, resp.StatusCode, start, 0, &usage, rc.clientStream)
 	}
@@ -1197,6 +1208,159 @@ func responsesResponseWithItems(model, responseID string, items []map[string]int
 			"input_tokens": in, "output_tokens": out, "total_tokens": in + out,
 		},
 	}
+}
+
+// ---- OpenAI legacy text_completion 构造（/v1/completions shim）----
+
+// completionsFinish legacy text_completion 的 finish_reason：无 tool_calls 语义，
+// 工具调用回合只能回 stop
+func completionsFinish(stopReason string) string {
+	if stopReason == "max_tokens" {
+		return "length"
+	}
+	return "stop"
+}
+
+// completionsResponse 构造非流式 text_completion 响应；echo=true 时 text 前缀原 prompt
+func completionsResponse(model, text string, usage *StreamUsage, echo bool, prompt string) map[string]interface{} {
+	if echo {
+		text = prompt + text
+	}
+	in, out := 0, 0
+	stop := ""
+	if usage != nil {
+		in, out, stop = usage.InputTokens, usage.OutputTokens, usage.StopReason
+	}
+	return map[string]interface{}{
+		"id":      "cmpl-" + randomHex(12),
+		"object":  "text_completion",
+		"created": time.Now().Unix(),
+		"model":   model,
+		"choices": []map[string]interface{}{{
+			"index": 0, "text": text, "logprobs": nil, "finish_reason": completionsFinish(stop),
+		}},
+		"usage": map[string]interface{}{
+			"prompt_tokens": in, "completion_tokens": out, "total_tokens": in + out,
+		},
+	}
+}
+
+// streamCompletions Anthropic SSE → OpenAI legacy text_completion.chunk。
+// 思考/工具块无 legacy 槽位：只计 usage 与思考重放缓存，不进输出流。
+func (z *ZCodeAPI) streamCompletions(w http.ResponseWriter, flusher http.Flusher, resp *http.Response,
+	model string, includeUsage, echo bool, prompt string, a *Account, r *http.Request, payload []byte, start time.Time) {
+
+	now := time.Now().Unix()
+	cid := "cmpl-" + randomHex(12)
+	var usage StreamUsage
+	var activeTool map[string]interface{}
+	var texts, thinks []string
+	ttft := 0
+	echoPending := echo
+
+	writeChunk := func(text string, finish interface{}, chunkUsage interface{}) {
+		p := map[string]interface{}{
+			"id": cid, "object": "text_completion.chunk", "created": now, "model": model,
+			"choices": []map[string]interface{}{{
+				"index": 0, "text": text, "logprobs": nil, "finish_reason": finish,
+			}},
+		}
+		if chunkUsage != nil {
+			p["usage"] = chunkUsage
+		}
+		b, _ := json.Marshal(p)
+		fmt.Fprintf(w, "data: %s\n\n", b)
+		if flusher != nil {
+			flusher.Flush()
+		}
+	}
+
+	parser := &sseParser{}
+	handle := func(ev sseEvent) {
+		if ttft == 0 {
+			ttft = int(time.Since(start).Milliseconds())
+		}
+		applyEventToUsage(ev, &usage, &activeTool, &texts, &thinks)
+		if ev.Event != "content_block_delta" {
+			return
+		}
+		delta, _ := ev.Data["delta"].(map[string]interface{})
+		if delta == nil || delta["type"] != "text_delta" {
+			return
+		}
+		t, _ := delta["text"].(string)
+		if t == "" {
+			return
+		}
+		if echoPending {
+			echoPending = false
+			t = prompt + t
+		}
+		writeChunk(t, nil, nil)
+	}
+
+	buf := make([]byte, 32*1024)
+	var readErr error
+	for {
+		n, err := resp.Body.Read(buf)
+		if n > 0 {
+			if ferr := parser.feed(buf[:n], handle); ferr != nil {
+				readErr = ferr
+				break
+			}
+		}
+		if err != nil {
+			readErr = err
+			break
+		}
+	}
+	parser.flush(handle)
+	finalizeToolCalls(&usage)
+	cacheThinkingForOutput(strings.Join(texts, ""), &usage)
+
+	// 上游流内错误或中途断流：发 OpenAI 错误 chunk 而非伪装成功
+	if usage.StreamError != "" || (readErr != nil && readErr != io.EOF) {
+		msg := usage.StreamError
+		if msg == "" {
+			msg = fmt.Sprintf("upstream stream interrupted: %v", readErr)
+		}
+		ep, _ := json.Marshal(map[string]interface{}{
+			"error": map[string]interface{}{"message": msg, "type": "api_error", "code": "stream_error"},
+		})
+		fmt.Fprintf(w, "data: %s\n\n", ep)
+		fmt.Fprint(w, "data: [DONE]\n\n")
+		if flusher != nil {
+			flusher.Flush()
+		}
+		z.recordUsage(a, r, payload, 502, start, ttft, &usage, true)
+		return
+	}
+
+	// echo 且上游零输出：prompt 前缀仍须发出，不能静默丢掉
+	if echoPending {
+		writeChunk(prompt, nil, nil)
+	}
+	writeChunk("", completionsFinish(usage.StopReason), nil)
+	if includeUsage {
+		finalUsage := map[string]interface{}{
+			"prompt_tokens":     usage.InputTokens,
+			"completion_tokens": usage.OutputTokens,
+			"total_tokens":      usage.InputTokens + usage.OutputTokens,
+		}
+		p, _ := json.Marshal(map[string]interface{}{
+			"id": cid, "object": "text_completion.chunk", "created": now, "model": model,
+			"choices": []interface{}{}, "usage": finalUsage,
+		})
+		fmt.Fprintf(w, "data: %s\n\n", p)
+		if flusher != nil {
+			flusher.Flush()
+		}
+	}
+	fmt.Fprint(w, "data: [DONE]\n\n")
+	if flusher != nil {
+		flusher.Flush()
+	}
+	z.recordUsage(a, r, payload, resp.StatusCode, start, ttft, &usage, true)
 }
 
 func randomHex(n int) string {

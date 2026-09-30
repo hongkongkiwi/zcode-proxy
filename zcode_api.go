@@ -259,8 +259,38 @@ func (z *ZCodeAPI) HandleCountTokens(w http.ResponseWriter, r *http.Request) {
 
 // HandleModels GET /v1/models — 同时兼容 OpenAI 与 Anthropic 字段
 func (z *ZCodeAPI) HandleModels(w http.ResponseWriter, r *http.Request) {
+	models := z.effectiveModels()
+	now := time.Now().Unix()
+	data := make([]map[string]interface{}, 0, len(models))
+	for _, m := range models {
+		data = append(data, modelObject(m, now))
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{"object": "list", "data": data})
+}
+
+// HandleModelRetrieve GET /v1/models/{id} — 部分 SDK 在 list 后按 id 单查模型
+func (z *ZCodeAPI) HandleModelRetrieve(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeAPIError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	id := strings.TrimPrefix(r.URL.Path, "/v1/models/")
+	if id == "" || strings.Contains(id, "/") {
+		writeAPIError(w, http.StatusNotFound, "not found: "+r.URL.Path)
+		return
+	}
+	for _, m := range z.effectiveModels() {
+		if m == id {
+			writeJSON(w, http.StatusOK, modelObject(m, time.Now().Unix()))
+			return
+		}
+	}
+	writeAPIError(w, http.StatusNotFound, "model not found: "+id)
+}
+
+// effectiveModels 生效模型清单：DB gateway_models 设置覆盖优先
+func (z *ZCodeAPI) effectiveModels() []string {
 	models := z.cfg.GetModels()
-	// DB 设置可覆盖模型清单
 	if extra, _ := z.db.GetSetting("gateway_models"); strings.TrimSpace(extra) != "" {
 		var list []string
 		for _, m := range strings.Split(extra, ",") {
@@ -272,20 +302,20 @@ func (z *ZCodeAPI) HandleModels(w http.ResponseWriter, r *http.Request) {
 			models = list
 		}
 	}
-	now := time.Now().Unix()
-	data := make([]map[string]interface{}, 0, len(models))
-	for _, m := range models {
-		data = append(data, map[string]interface{}{
-			"id":           m,
-			"object":       "model", // OpenAI 客户端校验字段
-			"type":         "model", // Anthropic 客户端校验字段
-			"display_name": m,
-			"created":      now,
-			"created_at":   "2025-01-01T00:00:00Z",
-			"owned_by":     "zcode-proxy",
-		})
+	return models
+}
+
+// modelObject OpenAI / Anthropic 双兼容的单模型对象
+func modelObject(id string, now int64) map[string]interface{} {
+	return map[string]interface{}{
+		"id":           id,
+		"object":       "model", // OpenAI 客户端校验字段
+		"type":         "model", // Anthropic 客户端校验字段
+		"display_name": id,
+		"created":      now,
+		"created_at":   "2025-01-01T00:00:00Z",
+		"owned_by":     "zcode-proxy",
 	}
-	writeJSON(w, http.StatusOK, map[string]interface{}{"object": "list", "data": data})
 }
 
 // isPromoTier 判断套餐档位是否属于免费促销层（自动降 priority 用）

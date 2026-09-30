@@ -110,6 +110,107 @@ func (z *ZCodeAPI) HandleResponses(w http.ResponseWriter, r *http.Request) {
 	z.relay(w, r, rc)
 }
 
+// HandleCompletions POST /v1/completions — legacy text completion（Bifrost 等
+// 网关的 Text Completion 请求类型）。shim：prompt 转单条 chat 消息走同一
+// relay 管道，响应按 text_completion / text_completion.chunk 形状回写。
+func (z *ZCodeAPI) HandleCompletions(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeAPIError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	body, errResp := readJSONBody(r)
+	if errResp != nil {
+		errResp.Write(w)
+		return
+	}
+	if s, ok := body["stream"]; ok {
+		if _, isBool := s.(bool); !isBool {
+			writeAPIError(w, http.StatusBadRequest, "stream must be a boolean")
+			return
+		}
+	}
+	prompt, err := completionsPrompt(body["prompt"])
+	if err != nil {
+		writeAPIError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if prompt == "" {
+		writeAPIError(w, http.StatusBadRequest, "prompt must not be empty")
+		return
+	}
+
+	chat := map[string]interface{}{
+		"model": body["model"],
+		"messages": []interface{}{
+			// 补一句系统引导：指令模型收到裸 prompt 时倾向"回答"而非"续写"
+			map[string]interface{}{"role": "system", "content": "You are a text completion engine. Continue the user's text seamlessly; output only the continuation, never repeat the prompt and add no commentary."},
+			map[string]interface{}{"role": "user", "content": prompt},
+		},
+	}
+	for _, k := range []string{"max_tokens", "temperature", "top_p", "stop", "stream", "stream_options"} {
+		if v, ok := body[k]; ok {
+			chat[k] = v
+		}
+	}
+	// suffix / n / logprobs / 各类 penalty 上游无法兑现，静默忽略
+
+	provider := detectProvider(chat, r.Header)
+	anth, err := openaiToAnthropic(chat)
+	if err != nil {
+		writeAPIError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	anth["stream"] = true // 内部一律流式，按需聚合
+	if err := normalizeBody(anth, z); err != nil {
+		writeAPIError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if err := validateMessagesBody(anth); err != nil {
+		writeAPIError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	clientStream, _ := chat["stream"].(bool)
+	clientModel, _ := body["model"].(string)
+	if clientModel == "" {
+		clientModel = "gpt-3.5-turbo-instruct"
+	}
+	includeUsage := false
+	if so, ok := chat["stream_options"].(map[string]interface{}); ok {
+		includeUsage, _ = so["include_usage"].(bool)
+	}
+	echo, _ := body["echo"].(bool)
+	rc := &relayCtx{
+		body: anth, provider: provider, group: r.Header.Get("x-zcode-group"),
+		proto: protocolCompletions, clientStream: clientStream,
+		clientModel: clientModel, includeUsage: includeUsage,
+		echo: echo, prompt: prompt,
+	}
+	z.relay(w, r, rc)
+}
+
+// completionsPrompt 提取并归一化 prompt：字符串原样；多元素数组按多采样语义
+// 上游无法批量生成，降级为空行拼接的单一 prompt
+func completionsPrompt(v interface{}) (string, error) {
+	switch p := v.(type) {
+	case nil:
+		return "", nil
+	case string:
+		return p, nil
+	case []interface{}:
+		var parts []string
+		for _, item := range p {
+			s, ok := item.(string)
+			if !ok {
+				return "", errString("prompt array elements must be strings")
+			}
+			parts = append(parts, s)
+		}
+		return strings.Join(parts, "\n\n"), nil
+	default:
+		return "", errString("prompt must be a string or array of strings")
+	}
+}
+
 // asIfaceSlice 将 []interface{} 或 []map[string]interface{} 等切片统一为 []interface{}
 func asIfaceSlice(v interface{}) []interface{} {
 	switch s := v.(type) {
