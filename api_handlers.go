@@ -814,6 +814,8 @@ var settingsWhitelist = map[string]bool{
 	"upstream_proxy": true, "fingerprint": true, "custom_ja3": true,
 	"captcha_mode": true, "gateway_models": true, "sticky_sessions": true,
 	"prompt_cache_breakpoint": true,
+	"captcha_prewarm":         true,
+	"auto_claim_promos":       true, "auto_claim_interval_minutes": true, "auto_claim_delay_seconds": true,
 	"max_concurrent_per_account": true,
 	// 闲时免费通道（off-peak ticket queue）
 	"async_enabled": true, "async_poll_interval_ms": true,

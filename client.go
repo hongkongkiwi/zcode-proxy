@@ -316,10 +316,11 @@ func ProxyURLForNode(n *ProxyNode) string {
 // 等非 ESA WAF 保护的端点（实测 api.z.ai 协商 h2）。
 func NewUpstreamHTTPClient(proxyURL string, timeout time.Duration) *http.Client {
 	transport := &http.Transport{
-		TLSClientConfig:   &tls.Config{MinVersion: tls.VersionTLS12},
-		ForceAttemptHTTP2: true,
-		MaxIdleConns:      32,
-		IdleConnTimeout:   90 * time.Second,
+		TLSClientConfig:      &tls.Config{MinVersion: tls.VersionTLS12},
+		ForceAttemptHTTP2:    true,
+		MaxIdleConns:         32,
+		MaxIdleConnsPerHost:  16, // Go 默认 2：并发下多余连接被关闭，每请求重握手直拉高 TTFB
+		IdleConnTimeout:      90 * time.Second,
 	}
 	applyProxy(transport, proxyURL)
 	return &http.Client{
@@ -351,11 +352,12 @@ func NewFingerprintHTTPClient(proxyURL string, timeout time.Duration) *http.Clie
 	}
 
 	transport := &http.Transport{
-		DialContext:     dialer.DialContext,
-		DialTLSContext:  dialTLS,
-		TLSNextProto:    map[string]func(string, *tls.Conn) http.RoundTripper{}, // 禁 h2
-		MaxIdleConns:    32,
-		IdleConnTimeout: 90 * time.Second,
+		DialContext:          dialer.DialContext,
+		DialTLSContext:       dialTLS,
+		TLSNextProto:         map[string]func(string, *tls.Conn) http.RoundTripper{}, // 禁 h2
+		MaxIdleConns:         32,
+		MaxIdleConnsPerHost:  16, // utls 握手成本高，保活连接直接决定 TTFB 稳定性
+		IdleConnTimeout:      90 * time.Second,
 	}
 	return &http.Client{
 		Transport: transport,

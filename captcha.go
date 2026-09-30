@@ -282,6 +282,90 @@ func (s *CaptchaService) InvalidateFor(a *Account) {
 	s.mu.Unlock()
 }
 
+// prewarmTick prewarm 周期（节流上限：每 15s 最多触发一轮后台刷新）
+const prewarmTick = 15 * time.Second
+
+// prewarmFreshAhead 提前刷新线：缓存条目年龄超过该值即在后台换新，
+// 使转发请求在 45s TTL 内永远命中新鲜参数（请求路径零求解延迟）
+const prewarmRefreshAhead = 30 * time.Second
+
+// StartPrewarm 参数保温循环（速度优先）：常驻后台按出口代理组把验证参数
+// 保持在新鲜状态，转发与自动领取的 GetVerifyParam 全部命中缓存。
+// captcha_prewarm 设为 "0" 可关闭（如需完全静默降低求解频率）。
+func (s *CaptchaService) StartPrewarm(stopCh <-chan struct{}) {
+	go func() {
+		// 首轮延迟 10s：等服务起来、账号导入完成
+		t := time.NewTimer(10 * time.Second)
+		defer t.Stop()
+		for {
+			select {
+			case <-stopCh:
+				return
+			case <-t.C:
+			}
+			s.prewarmOnce()
+			t.Reset(prewarmTick)
+		}
+	}()
+}
+
+// prewarmOnce 单轮保温：找出可选的 zai JWT 账号，按出口代理组去重后，
+// 对新鲜度不足的组触发后台求解（组信号量保证与前台求解互斥、重复轮次合并）
+func (s *CaptchaService) prewarmOnce() {
+	if s.getSetting("captcha_mode") == "off" {
+		return
+	}
+	if v, _ := s.db.GetSetting("captcha_prewarm"); v == "0" {
+		return
+	}
+	accounts, err := s.db.ListAccounts("")
+	if err != nil {
+		return
+	}
+	now := time.Now()
+	seen := map[string]bool{}
+	s.mu.Lock()
+	var stale []string
+	for _, a := range accounts {
+		if !a.Enabled || a.Provider != "zai" || a.ZCodeJWT == "" {
+			continue
+		}
+		if !accountSelectable(a, now.Unix()) {
+			continue
+		}
+		key := s.cacheKey(a)
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		if e, ok := s.cache[key]; ok && now.Sub(e.at) < prewarmRefreshAhead {
+			continue // 仍然新鲜
+		}
+		if t, ok := s.failAt[key]; ok && now.Sub(t) < captchaFailCacheTTL {
+			continue // 近期求解失败，等待冷却，不硬顶
+		}
+		stale = append(stale, key)
+	}
+	s.mu.Unlock()
+
+	// 刷新动作代理到组内任一账号：参数按出口代理组缓存，组内账号等价
+	byKey := map[string]*Account{}
+	for _, a := range accounts {
+		if !a.Enabled || a.Provider != "zai" || a.ZCodeJWT == "" {
+			continue
+		}
+		byKey[s.cacheKey(a)] = a
+	}
+	for _, key := range stale {
+		a := byKey[key]
+		if a == nil {
+			continue
+		}
+		log.Printf("[captcha] prewarm: refreshing param for egress group")
+		s.refreshInBackground(a)
+	}
+}
+
 // Invalidate 失效全部缓存
 func (s *CaptchaService) Invalidate() {
 	s.mu.Lock()

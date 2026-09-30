@@ -103,6 +103,11 @@ func main() {
 	// 上游 API 客户端封装（额度/活动/激活/聊天转发）
 	zapi := NewZCodeAPI(cfg, db, pool, captcha, appVersion)
 
+	// 验证码参数保温：后台持续换新缓存参数，转发请求零求解等待
+	prewarmStop := make(chan struct{})
+	defer close(prewarmStop)
+	captcha.StartPrewarm(prewarmStop)
+
 	// OAuth 登录管理（环回回调 + 手动粘贴兜底）
 	oauth := NewOAuthManager(db, zapi, cfg.GetListenAddr())
 
@@ -113,6 +118,11 @@ func main() {
 	scheduler := NewCronScheduler(db, zapi)
 	scheduler.Start()
 	defer scheduler.Stop()
+
+	// 自动领取促销活动（只领活动，绝不自动消耗重置）
+	autoClaim := NewAutoClaimer(db, zapi)
+	autoClaim.Start()
+	defer autoClaim.Stop()
 
 	// Web 认证
 	auth := NewAuthManager(db, os.Getenv("ZCODE_WEB_PASS"))

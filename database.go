@@ -158,6 +158,12 @@ type PlanRunRecord struct {
 // DB 持有数据库连接
 type DB struct {
 	conn *sql.DB
+
+	// 设置项读缓存（TTL 见 database_settings.go）：转发热路径每请求读
+	// fingerprint/sticky/strategy 等多个设置，逐条 SQLite 查询是纯开销。
+	// 仅进程内缓存；外部直改 sqlite 最迟 3s 生效。
+	setMu    sync.Mutex
+	setCache map[string]settingsCacheEntry
 }
 
 // NewDB 打开/创建 SQLite 数据库并初始化 schema
@@ -389,6 +395,12 @@ func (db *DB) initSchema() error {
 		"gateway_models":         "",
 		// R5 prompt-cache 断点默认关闭（上游各通道对 cache_control 支持未全量实测）
 		"prompt_cache_breakpoint": "0",
+		// 速度：验证参数后台保温，转发零求解等待
+		"captcha_prewarm": "1",
+		// 自动领取促销活动（只领活动，绝不自动消耗重置）
+		"auto_claim_promos":           "1",
+		"auto_claim_interval_minutes": "30",
+		"auto_claim_delay_seconds":    "10",
 	}
 	for k, v := range defaults {
 		if _, err := db.conn.Exec(

@@ -356,7 +356,11 @@ func (s *CronScheduler) executeTask(taskType string, a *Account) *ClaimResult {
 	case "activate":
 		return s.zapi.ActivateForAccount(a)
 	case "reset":
-		return s.zapi.ResetForAccount(a)
+		// 重置仅手动触发：自动消耗 5h/周重置窗口可能把宝贵机会浪费在
+		// 不需要的时刻。按策略 cron 计划一律拒绝执行 reset，
+		// 手动入口（POST /api/accounts/{id}/reset）不受影响。
+		log.Printf("[scheduler] reset task refused for %s: resets are manual-only", a.DisplayNameOrEmail())
+		return &ClaimResult{Code: -1, Message: "重置已改为仅手动触发：计划不再自动执行 reset"}
 	default: // claim
 		return s.zapi.ClaimForAccount(a)
 	}
