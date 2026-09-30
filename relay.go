@@ -148,6 +148,21 @@ func (z *ZCodeAPI) relay(w http.ResponseWriter, r *http.Request, rc *relayCtx) {
 		}
 	}
 
+	// never 策略不进付费阶段，但纯 API Key 账号（无 JWT，付费是唯一通道）仍须可服务
+	if policy == PaidModeNever {
+		for attempt := 0; attempt < maxAccountAttempts; attempt++ {
+			a := z.pool.SelectStickyChannel(rc.provider, rc.group, sessionKey, tried, ChannelPaidOnly)
+			if a == nil {
+				break
+			}
+			tried[a.ID] = true
+			outcome := z.tryAccount(w, r, a, payload, rc, &reasons, start, relayModePaid)
+			if outcome == outcomeWritten || outcome == outcomeUpstreamError {
+				return
+			}
+		}
+	}
+
 	// 阶段二：付费回退。走到这里说明免费通道没能写回任何响应（全部受限）。
 	// 策略开关与每日 token 上限都在进入阶段前拦截。
 	triedPaid := map[int64]bool{}

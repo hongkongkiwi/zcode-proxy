@@ -44,6 +44,10 @@ const (
 const (
 	ChannelFree = "free"
 	ChannelPaid = "paid"
+	// ChannelPaidOnly 伪通道：仅匹配"没有 JWT、API Key 是唯一通道"的账号。
+	// paid_fallback_mode=never 不进付费阶段，但这些账号仍必须可服务
+	//（"不用付费回退"不等于"把纯 API Key 账号整个排除"）
+	ChannelPaidOnly = "paid_only"
 )
 
 // 付费回退策略（设置 paid_fallback_mode）
@@ -287,14 +291,11 @@ func paidChannelAvailable(a *Account, now int64) bool {
 	return true
 }
 
-// selectableForFreePhase 免费优先阶段的候选判定：
-// 有 JWT 的账号走账号级判定（免费通道语义）；纯 API Key 账号没有免费通道，
-// 但付费是它唯一通道——不放进候选会让它在本阶段永远选不上（含 never 策略）。
+// selectableForFreePhase 免费优先阶段的候选判定：有 JWT（免费通道）且账号级可选。
+// 纯 API Key 账号没有免费通道，不进本阶段——它们由付费阶段（或 never 策略的
+// paid_only 兜底轮）服务。
 func selectableForFreePhase(a *Account, now int64) bool {
-	if a.ZCodeJWT != "" {
-		return accountSelectable(a, now)
-	}
-	return paidChannelAvailable(a, now)
+	return a.ZCodeJWT != "" && accountSelectable(a, now)
 }
 
 // channelSelectable 按通道判定可选性（"" = 任意通道，账号级判定）
@@ -304,6 +305,8 @@ func channelSelectable(a *Account, channel string, now int64) bool {
 		return selectableForFreePhase(a, now)
 	case ChannelPaid:
 		return paidChannelAvailable(a, now)
+	case ChannelPaidOnly:
+		return a.ZCodeJWT == "" && a.APIKey != "" && accountSelectable(a, now)
 	}
 	return accountSelectable(a, now)
 }
@@ -340,7 +343,7 @@ func channelHasCreds(a *Account, channel string) bool {
 	switch channel {
 	case ChannelFree:
 		return a.ZCodeJWT != ""
-	case ChannelPaid:
+	case ChannelPaid, ChannelPaidOnly:
 		return a.APIKey != ""
 	}
 	return a.ZCodeJWT != "" || a.APIKey != ""

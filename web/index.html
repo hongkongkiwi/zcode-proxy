@@ -296,6 +296,19 @@
 <label class="form-label" data-i18n="每账号并发上限（1-32，默认 3；排队而非打满并发触发 1302 限流）">每账号并发上限（1-32，默认 3；排队而非打满并发触发 1302 限流）</label>
 <input type="number" id="setMaxConcurrent" class="form-input" min="1" max="32">
 </div>
+<div class="form-group" style="margin-bottom:16px">
+<label class="form-label" data-i18n="付费通道回退（免费受限时无缝切到按量计费）">付费通道回退（免费受限时无缝切到按量计费）</label>
+<select id="setPaidFallback" class="form-input">
+<option value="free_first" data-i18n="免费优先，受限后回退付费（推荐）">免费优先，受限后回退付费（推荐）</option>
+<option value="balanced" data-i18n="均衡：同账号免费失败立刻试其付费通道">均衡：同账号免费失败立刻试其付费通道</option>
+<option value="never" data-i18n="仅免费（不使用付费通道，纯 API Key 账号除外）">仅免费（不使用付费通道，纯 API Key 账号除外）</option>
+</select>
+<div class="hint" style="margin-top:6px" data-i18n="免费通道 = Coding Plan JWT（套餐额度）；付费通道 = api.z.ai API Key（按量计费）。免费侧并发满 / 限流 / 额度耗尽 / 风控均触发回退；各账号独立开关见账号列表。">免费通道 = Coding Plan JWT（套餐额度）；付费通道 = api.z.ai API Key（按量计费）。免费侧并发满 / 限流 / 额度耗尽 / 风控均触发回退；各账号独立开关见账号列表。</div>
+</div>
+<div class="form-group" style="margin-bottom:16px">
+<label class="form-label" data-i18n="付费通道每日 token 上限（0=不限制；超过后当日不再回退付费）">付费通道每日 token 上限（0=不限制；超过后当日不再回退付费）</label>
+<input type="number" id="setPaidCap" class="form-input" min="0" placeholder="0">
+</div>
 <button class="btn btn-primary" onclick="saveStrategySettings()" data-i18n="保存策略">保存策略</button>
 </div>
 </div>
@@ -308,6 +321,7 @@
 <div><span class="badge badge-danger">invalid</span> <span data-i18n="凭证失效（401/403），需重新登录">凭证失效（401/403），需重新登录</span></div>
 <div><span class="badge badge-info">inactive</span> <span data-i18n="套餐未激活，可尝试「激活套餐」">套餐未激活，可尝试「激活套餐」</span></div>
 <div><span class="badge badge-secondary">disabled</span> <span data-i18n="手动禁用">手动禁用</span></div>
+<div style="margin-top:8px"><span class="badge badge-purple">paid</span> <span data-i18n="付费通道冷却/余额不足（独立计时，不影响免费通道；到期自动恢复）">付费通道冷却/余额不足（独立计时，不影响免费通道；到期自动恢复）</span></div>
 </div>
 </div>
 </div>

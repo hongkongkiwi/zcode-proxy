@@ -104,22 +104,26 @@ const accountCols = `id, user_id, email, display_name, provider, auth_type,
 	status, enabled, account_group, priority, quota_json, plan_tier, plan_expire,
 	total_units, used_units, remaining, use_count, fail_count,
 	last_used_at, last_checked_at, cooling_until, last_error,
-	last_claim_at, last_claim_plan, last_claim_msg, remark, created_at, updated_at`
+	last_claim_at, last_claim_plan, last_claim_msg, remark, created_at, updated_at,
+	paid_fallback, paid_cooling_until`
 
 func scanAccount(row interface{ Scan(...interface{}) error }) (*Account, error) {
 	var a Account
 	var enabled int
+	var paidFallback int
 	err := row.Scan(
 		&a.ID, &a.UserID, &a.Email, &a.DisplayName, &a.Provider, &a.AuthType,
 		&a.AccessToken, &a.RefreshToken, &a.ZCodeJWT, &a.APIKey, &a.UserInfo, &a.DeviceMid, &a.CredsRaw,
 		&a.Status, &enabled, &a.AccountGroup, &a.Priority, &a.QuotaJSON, &a.PlanTier, &a.PlanExpire,
 		&a.TotalUnits, &a.UsedUnits, &a.Remaining, &a.UseCount, &a.FailCount,
 		&a.LastUsedAt, &a.LastCheckedAt, &a.CoolingUntil, &a.LastError,
-		&a.LastClaimAt, &a.LastClaimPlan, &a.LastClaimMsg, &a.Remark, &a.CreatedAt, &a.UpdatedAt)
+		&a.LastClaimAt, &a.LastClaimPlan, &a.LastClaimMsg, &a.Remark, &a.CreatedAt, &a.UpdatedAt,
+		&paidFallback, &a.PaidCoolingUntil)
 	if err != nil {
 		return nil, err
 	}
 	a.Enabled = enabled == 1
+	a.PaidFallback = paidFallback == 1
 	// 凭证列静态加密：读取时透明解密
 	a.AccessToken = vaultDecrypt(a.AccessToken)
 	a.RefreshToken = vaultDecrypt(a.RefreshToken)
@@ -207,6 +211,49 @@ func (a *Account) statusError() (string, string) {
 	return a.Status, a.LastError
 }
 
+// setUsageChannel 标记本次请求实际使用的通道（"free"/"paid"）；recordUsage 读取。
+// 每个请求持有独立 Account 副本，写读同 goroutine，mu 仅防刷新 goroutine 并发读。
+func (a *Account) setUsageChannel(ch string) {
+	a.mu.Lock()
+	a.usageChannel = ch
+	a.mu.Unlock()
+}
+
+// usageChannelName 读通道归因；空（旧路径/闲时队列未标记）按免费通道计
+func (a *Account) usageChannelName() string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.usageChannel == "" {
+		return "free"
+	}
+	return a.usageChannel
+}
+
+// paidCoolingActive 付费通道冷却是否生效中（锁保护）
+func (a *Account) paidCoolingActive(now int64) bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return now < a.PaidCoolingUntil
+}
+
+// setPaidRuntime 写付费通道冷却（内存副本；DB 由调用方跟进）
+func (a *Account) setPaidRuntime(lastError string, coolingUntil int64) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.LastError = lastError
+	a.PaidCoolingUntil = coolingUntil
+}
+
+// bumpUsePaid 记录一次付费通道成功使用；只清付费冷却，不动免费侧 status/cooling
+// （免费侧冷却只能由免费通道成功或自然到期解除）
+func (a *Account) bumpUsePaid() {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.UseCount++
+	a.LastUsedAt = time.Now().Unix()
+	a.PaidCoolingUntil = 0
+}
+
 // credentialSnapshot 锁保护地读取凭证三元组（供独立 goroutine 如异步 settle 使用，
 // 避免与 setCredentials 并发读写）
 func (a *Account) credentialSnapshot() (jwt, apiKey, deviceMid string) {
@@ -278,15 +325,33 @@ func (db *DB) DeleteAccount(id int64) error {
 	return err
 }
 
-// UpdateAccountFields 更新账号可变字段（UI 编辑：备注/分组/启用）
-func (db *DB) UpdateAccountFields(id int64, group, remark string, enabled bool) error {
+// UpdateAccountFields 更新账号可变字段（UI 编辑：备注/分组/启用/付费回退开关）
+func (db *DB) UpdateAccountFields(id int64, group, remark string, enabled, paidFallback bool) error {
 	_, err := db.conn.Exec(`
-		UPDATE accounts SET account_group = ?, remark = ?, enabled = ?,
+		UPDATE accounts SET account_group = ?, remark = ?, enabled = ?, paid_fallback = ?,
 		status = CASE WHEN ? = 0 AND status != 'disabled' THEN 'disabled'
 		             WHEN ? = 1 AND status = 'disabled' THEN 'active'
 		             ELSE status END,
 		updated_at = datetime('now','localtime') WHERE id = ?`,
-		group, remark, boolInt(enabled), boolInt(enabled), boolInt(enabled), id)
+		group, remark, boolInt(enabled), boolInt(paidFallback), boolInt(enabled), boolInt(enabled), id)
+	return err
+}
+
+// SetAccountPaidStatus 写付费通道冷却（含余额不足长冷却）；不触碰免费侧状态列
+func (db *DB) SetAccountPaidStatus(id int64, lastError string, coolingUntil int64) error {
+	_, err := db.conn.Exec(`
+		UPDATE accounts SET last_error = ?, paid_cooling_until = ?,
+		updated_at = datetime('now','localtime') WHERE id = ?`,
+		lastError, coolingUntil, id)
+	return err
+}
+
+// TouchAccountPaidUse 付费通道成功使用（只清付费冷却；免费侧 status 不动）
+func (db *DB) TouchAccountPaidUse(id int64) error {
+	_, err := db.conn.Exec(`
+		UPDATE accounts SET use_count = use_count + 1, last_used_at = ?,
+		paid_cooling_until = 0,
+		updated_at = datetime('now','localtime') WHERE id = ?`, time.Now().Unix(), id)
 	return err
 }
 
