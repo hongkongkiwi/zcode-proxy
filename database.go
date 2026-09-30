@@ -134,23 +134,24 @@ type UsageRecord struct {
 
 // ProxyNode 出口代理节点（组绑定）
 type ProxyNode struct {
-	ID           int64  `json:"id"`
-	Name         string `json:"name"`
-	Type         string `json:"type"` // socks5 | http
-	Host         string `json:"host"`
-	Port         int    `json:"port"`
-	Username     string `json:"username"`
-	Password     string `json:"password"`
-	IsDefault    bool   `json:"is_default"`
-	GroupName    string `json:"group_name"` // 绑定的账号组（多组用逗号分隔）
-	Enabled      bool   `json:"enabled"`
-	CheckStatus  string `json:"check_status"`
-	CheckLatency int    `json:"check_latency"`
-	CheckIP      string `json:"check_ip"`
-	CheckMsg     string `json:"check_msg"`
-	CheckAt      string `json:"check_at"`
-	CreatedAt    string `json:"created_at"`
-	UpdatedAt    string `json:"updated_at"`
+	ID             int64  `json:"id"`
+	Name           string `json:"name"`
+	Type           string `json:"type"` // socks5 | http
+	Host           string `json:"host"`
+	Port           int    `json:"port"`
+	Username       string `json:"username"`
+	Password       string `json:"password"`
+	PasswordBroken bool   `json:"password_broken"` // 密文存在但当前钥匙解不开（ListProxyNodes 检测）
+	IsDefault      bool   `json:"is_default"`
+	GroupName      string `json:"group_name"` // 绑定的账号组（多组用逗号分隔）
+	Enabled        bool   `json:"enabled"`
+	CheckStatus    string `json:"check_status"`
+	CheckLatency   int    `json:"check_latency"`
+	CheckIP        string `json:"check_ip"`
+	CheckMsg       string `json:"check_msg"`
+	CheckAt        string `json:"check_at"`
+	CreatedAt      string `json:"created_at"`
+	UpdatedAt      string `json:"updated_at"`
 }
 
 // PlanRunRecord 计划运行记录

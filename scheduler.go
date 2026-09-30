@@ -32,7 +32,8 @@ type PlanRunState struct {
 	StartedAt      string `json:"started_at"`
 }
 
-// CronScheduler cron 调度器
+// CronScheduler cron 调度器（单次使用：Start→Stop 后不可重启——
+// stopCh/tickDone 关闭后不复位；当前 main 只启动一次，属有意简化）
 type CronScheduler struct {
 	db   *DB
 	zapi *ZCodeAPI

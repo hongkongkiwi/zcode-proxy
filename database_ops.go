@@ -376,8 +376,9 @@ func (db *DB) ListProxyNodes() ([]*ProxyNode, error) {
 			return nil, err
 		}
 		// 密码静态加密读回明文（vault1: 前缀才解；历史明文行原样透传，
-		// 下次保存时加密迁移）
-		n.Password = vaultDecrypt(n.Password)
+		// 下次保存时加密迁移）。解不开标记 PasswordBroken——静默变空串
+		// 会让带用户名的节点用空密码拨号、整组账号连环冷却
+		n.Password, n.PasswordBroken = vaultDecryptOK(n.Password)
 		n.IsDefault = isDef == 1
 		n.Enabled = enabled == 1
 		out = append(out, &n)
@@ -456,14 +457,19 @@ func (db *DB) UpdateProxyNodeCheck(id int64, status string, latency int, ip, msg
 
 // ProxyNodeForGroup 查找组绑定的启用代理节点；组无绑定则回退默认节点。
 // group_name 支持逗号分隔多组。
+// 密码密文解不开（PasswordBroken）的节点跳过：带用户名却用空密码拨号必被
+// 代理拒绝，整组账号会连环冷却——跳过让组回退默认节点/直连，面板可见告警。
 func (db *DB) ProxyNodeForGroup(group string) (*ProxyNode, error) {
 	nodes, err := db.ListProxyNodes()
 	if err != nil {
 		return nil, err
 	}
+	unusable := func(n *ProxyNode) bool {
+		return !n.Enabled || (n.PasswordBroken && n.Username != "")
+	}
 	if group != "" {
 		for _, n := range nodes {
-			if !n.Enabled {
+			if unusable(n) {
 				continue
 			}
 			for _, g := range strings.Split(n.GroupName, ",") {
@@ -474,7 +480,7 @@ func (db *DB) ProxyNodeForGroup(group string) (*ProxyNode, error) {
 		}
 	}
 	for _, n := range nodes {
-		if n.Enabled && n.IsDefault {
+		if n.Enabled && n.IsDefault && !unusable(n) {
 			return n, nil
 		}
 	}

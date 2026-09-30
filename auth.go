@@ -370,9 +370,10 @@ func (am *AuthManager) Middleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		path := r.URL.Path
 
-		// 免认证路径：登录接口、健康检查、Web 页面、OAuth 环回回调
+		// 免认证路径：登录接口、健康检查、Web 页面、OAuth 环回回调。
+		// /web 必须整段匹配：裸前缀会把未来的 /webhooks 之类静默变成免认证路由
 		if path == "/api/login" || path == "/health" ||
-			strings.HasPrefix(path, "/web") || strings.HasPrefix(path, "/oauth/") {
+			path == "/web" || strings.HasPrefix(path, "/web/") || strings.HasPrefix(path, "/oauth/") {
 			next.ServeHTTP(w, r)
 			return
 		}

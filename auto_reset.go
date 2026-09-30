@@ -127,7 +127,14 @@ func (z *ZCodeAPI) MaybeAutoReset(a *Account, trigger string) {
 	autoResetState.Lock()
 	if last, ok := autoResetState.lastAttempt[a.ID]; ok && time.Since(last) < autoResetAttemptInterval {
 		autoResetState.Unlock()
-		return
+		// 单飞重试（-retry 后缀）不受他人刚盖的印记阻挡：印记被并发 402
+		// 重盖会让延迟重试在 debounce 处静默丢失（耗尽账号不再有下一触发）
+		if !strings.HasSuffix(trigger, "-retry") {
+			return
+		}
+		autoResetState.Lock()
+		delete(autoResetState.lastAttempt, a.ID)
+		autoResetState.Unlock()
 	}
 	autoResetState.lastAttempt[a.ID] = time.Now()
 	autoResetState.Unlock()

@@ -542,11 +542,18 @@ func streamProtocolResponse(w http.ResponseWriter, rc *relayCtx, resp *http.Resp
 		var usage StreamUsage
 		var activeTool map[string]interface{}
 		var texts, thinks []string
+		sawStart := false
 		parser := &sseParser{}
-		if ferr := parser.feed(all, func(ev sseEvent) { applyEventToUsage(ev, &usage, &activeTool, &texts, &thinks) }); ferr != nil {
+		feedFn := func(ev sseEvent) {
+			if ev.Event == "message_start" {
+				sawStart = true
+			}
+			applyEventToUsage(ev, &usage, &activeTool, &texts, &thinks)
+		}
+		if ferr := parser.feed(all, feedFn); ferr != nil {
 			readErr = ferr
 		}
-		parser.flush(func(ev sseEvent) { applyEventToUsage(ev, &usage, &activeTool, &texts, &thinks) })
+		parser.flush(feedFn)
 		finalizeToolCalls(&usage)
 		cacheThinkingForOutput(strings.Join(texts, ""), &usage)
 		// 上游流内错误或中途断流：不得伪装成成功空响应
@@ -558,6 +565,15 @@ func streamProtocolResponse(w http.ResponseWriter, rc *relayCtx, resp *http.Resp
 			z.recordUsage(a, r, payload, 502, start, 0, &usage, rc.clientStream)
 			writeJSON(w, http.StatusBadGateway, map[string]interface{}{
 				"error": map[string]string{"message": msg, "type": "upstream_error"},
+			})
+			return
+		}
+		// 零事件干净 EOF（裸 keepalive 注释后直接关闭）：与 Anthropic 聚合
+		// 路径同规，不得合成 200 空助手回合
+		if !sawStart && len(texts) == 0 && len(usage.ToolCalls) == 0 {
+			z.recordUsage(a, r, payload, 502, start, 0, &usage, rc.clientStream)
+			writeJSON(w, http.StatusBadGateway, map[string]interface{}{
+				"error": map[string]string{"message": "upstream stream ended without any events", "type": "upstream_error"},
 			})
 			return
 		}

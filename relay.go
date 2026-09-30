@@ -604,6 +604,9 @@ func (z *ZCodeAPI) forwardOnce(w http.ResponseWriter, r *http.Request, a *Accoun
 				z.pool.MarkFailed(a, "上游 2xx 内联错误信封")
 				z.recordUsage(a, r, payload, http.StatusBadGateway, start, 0, nil, rc.clientStream)
 				writeUpstreamErrorForProto(w, resp, string(body), rc.proto)
+				// 终态失败解绑粘滞（与下方 4xx/5xx 分支同规）：MarkFailed 不改
+				// 可选状态，粘滞命中会把会话域钉死在持续吐错误信封的账号上
+				z.pool.ForgetSticky(rc.sessionKey())
 				return outcomeUpstreamError
 			}
 			usage := parseAnthropicUsageJSON(body)
@@ -653,8 +656,8 @@ func isErrorEnvelope(body []byte) bool {
 		if json.Unmarshal(v.Code, &n) != nil {
 			return true // 非数值 code（字符串形态）按错误信封处理
 		}
-		if n != 0 {
-			return true
+		if n != 0 && n != 200 {
+			return true // code 200 是成功封套（与 zcode_api 的解析同规），不算错误
 		}
 	}
 	return false

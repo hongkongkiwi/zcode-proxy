@@ -900,6 +900,20 @@ func (s *APIServer) handlePutSettings(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		}
+		// auto-reset 数值项按 UI 界限校验：静默收下非法值会让 settingInt 回落
+		// 默认（保存≠生效），或把"临期窗口"撑到 10 天令每个槽位恒"临期"
+		if k == "auto_reset_min_wait_minutes" || k == "auto_reset_expiry_spend_minutes" {
+			if n, err := strconv.Atoi(v); err != nil || n < 0 || n > 1440 {
+				writeAPIError(w, http.StatusBadRequest, "无效阈值（0-1440 分钟）")
+				return
+			}
+		}
+		if k == "auto_reset_min_wait_week_hours" {
+			if n, err := strconv.Atoi(v); err != nil || n < 0 || n > 168 {
+				writeAPIError(w, http.StatusBadRequest, "无效阈值（0-168 小时）")
+				return
+			}
+		}
 		// 付费回退策略：白名单取值；token 上限非负整数（0=不限）
 		if k == "paid_fallback_mode" {
 			switch v {
@@ -978,7 +992,8 @@ func (s *APIServer) handleListProxies(w http.ResponseWriter, r *http.Request) {
 		item := map[string]interface{}{
 			"id": n.ID, "name": n.Name, "type": n.Type, "host": n.Host, "port": n.Port,
 			"username": n.Username, "has_password": n.Password != "",
-			"is_default": n.IsDefault, "group_name": n.GroupName, "enabled": n.Enabled,
+			"password_broken": n.PasswordBroken,
+			"is_default":      n.IsDefault, "group_name": n.GroupName, "enabled": n.Enabled,
 			"check_status": n.CheckStatus, "check_latency": n.CheckLatency,
 			"check_ip": n.CheckIP, "check_msg": n.CheckMsg, "check_at": n.CheckAt,
 			"created_at": n.CreatedAt, "updated_at": n.UpdatedAt,

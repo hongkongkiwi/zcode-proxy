@@ -220,13 +220,6 @@ func (t offPeakTickets) status(ctx context.Context, a *Account, ticketID string)
 	return nil, fmt.Errorf("查票响应不含该票")
 }
 
-// settle 关票；4xx 已按成功处理；失败仅记日志（关票是 best-effort）。
-// 用独立 context：断连后的补偿关票不能随请求取消。
-func (t offPeakTickets) settle(a *Account, ticketID string) {
-	jwt, apiKey, deviceMid := a.credentialSnapshot()
-	t.settleSnapshot(offPeakCreds{z: t.z, jwt: jwt, apiKey: apiKey, deviceMid: deviceMid}, ticketID)
-}
-
 // offPeakCreds 关票 goroutine 用的凭证快照（无锁读取，避免与 setCredentials 竞争）
 type offPeakCreds struct {
 	z         *ZCodeAPI
@@ -505,7 +498,16 @@ func (z *ZCodeAPI) offPeakBridge(w http.ResponseWriter, r *http.Request, a *Acco
 			return
 		}
 		settled[ticketID] = true
-		go tickets.settleSnapshot(cred, ticketID)
+		// 关票凭证取"当下"快照：401 恢复路径的 setCredentials 会就地更新本
+		// 副本，桥起点快照的旧 JWT 若已被上游吊销，关票 401 会被 4xx 分支
+		// 吞成"服务端已清理"——票实际挂着占坑到 active_deadline，零日志。
+		// credentialSnapshot 锁保护，可安全跨 goroutine 调；proxyURL 维持取票同出口
+		jwt2, apiKey2, deviceMid2 := a.credentialSnapshot()
+		if jwt2 == "" {
+			jwt2 = jwt
+		}
+		go tickets.settleSnapshot(offPeakCreds{z: z, jwt: jwt2, apiKey: apiKey2,
+			deviceMid: deviceMid2, proxyURL: cred.proxyURL}, ticketID)
 	}
 	// settleCur 关闭"当前"票（闭包捕获变量，随 retake 更新）。
 	// 只在终态路径调用：失败 / 放弃 / 客户端断开 / 响应完成——绝不取票即关。
@@ -942,6 +944,7 @@ type anthropicAgg struct {
 	id, model                string
 	blocks                   []map[string]interface{}
 	stopReason               string
+	sawMessageDelta          bool   // message_delta 到达过（干净的完整流必有；缺失 = 中途截断）
 	streamError              string // 上游内联错误帧（独立于 stop_reason，不被后续 delta 掩盖）
 	in, out                  int
 	cacheRead, cacheCreation int
@@ -1072,6 +1075,7 @@ func aggregateAnthropicStream(r io.Reader) ([]byte, *StreamUsage, error) {
 				}
 			}
 			if d, ok := ev.Data["delta"].(map[string]interface{}); ok {
+				agg.sawMessageDelta = true
 				if sr, ok := d["stop_reason"].(string); ok && sr != "" {
 					agg.stopReason = sr
 				}
@@ -1143,6 +1147,12 @@ func aggregateAnthropicStream(r io.Reader) ([]byte, *StreamUsage, error) {
 	// "把死流伪装成成功"——不满足 message_start 必至的一律按失败处理
 	if agg.id == "" && len(agg.blocks) == 0 {
 		return nil, partialUsage(agg), fmt.Errorf("upstream stream ended without any events")
+	}
+	// 有内容但没等到 message_delta（干净截断）：合成 end_turn 会把半截回答
+	// 伪装成完整消息、把截断的 tool_use 变成空参执行——与透传路径的
+	// truncated 判定同规按失败处理
+	if !agg.sawMessageDelta && agg.stopReason == "" {
+		return nil, partialUsage(agg), fmt.Errorf("upstream stream truncated before message_delta")
 	}
 	sr := agg.stopReason
 	if sr == "" {

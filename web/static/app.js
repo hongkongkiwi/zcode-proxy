@@ -1366,7 +1366,7 @@ function renderProxies() {
   el.innerHTML = `<div class="table-wrap"><table>
     <thead><tr><th>${t('名称')}</th><th>${t('类型')}</th><th>${t('地址')}</th><th>${t('绑定分组')}</th><th>${t('默认')}</th><th>${t('启用')}</th><th>${t('检测')}</th><th style="width:180px">${t('操作')}</th></tr></thead>
     <tbody>${proxiesCache.map(n => `<tr>
-      <td style="font-weight:700">${esc(n.name || '-')}</td>
+      <td style="font-weight:700">${esc(n.name || '-')}${n.password_broken ? ` <span class="badge badge-danger" title="${t('密码密文无法用当前钥匙解密，节点已被跳过')}">${t('密码损坏')}</span>` : ''}</td>
       <td>${esc(n.type)}</td>
       <td class="mono">${esc(n.host)}:${n.port}${n.username ? ' · ' + esc(n.username) : ''}</td>
       <td>${n.group_name ? n.group_name.split(',').map(g => `<span class="pill-group" style="margin:1px">${esc(g.trim())}</span>`).join('') : '-'}</td>
@@ -1680,7 +1680,10 @@ async function runLlmTest() {
     }
   } catch (e) {
     // status 在 fetch 成功后已保有真实 HTTP 码；走到这里说明请求本身失败
+    // （流中途断连 reader.read() reject 也落这里）——必须进失败判定，
+    // 否则 200 起始的流挂掉会绿灯"测试完成"
     text = tf('请求失败: %s', e.message);
+    streamError = e.message;
   }
   const latency = Math.round(performance.now() - t0);
   btn.disabled = false;
@@ -1689,7 +1692,7 @@ async function runLlmTest() {
     <div class="kv-item"><div class="k">${t('HTTP 状态')}</div><div class="v" style="color:${ok ? 'var(--c-success-dark)' : 'var(--c-danger)'}">${status || t('网络错误')}</div></div>
     <div class="kv-item"><div class="k">${t('总延迟')}</div><div class="v">${latency}ms</div></div>
     <div class="kv-item"><div class="k">${t('首字 TTFT')}</div><div class="v">${stream ? ttft + 'ms' : '-'}</div></div>
-    <div class="kv-item"><div class="k">Tokens in/out</div><div class="v">${usage ? usage.in + ' / ' + usage.out : '-'}</div></div>
+    <div class="kv-item"><div class="k">Tokens in/out</div><div class="v">${usage ? `${usage.in ?? '-'} / ${usage.out ?? '-'}` : '-'}</div></div>
     <div class="kv-item"><div class="k">${t('SSE 事件数')}</div><div class="v">${stream ? events : '-'}</div></div>
     ${streamError ? `<div class="kv-item"><div class="k">${t('流内错误')}</div><div class="v" style="color:var(--c-danger)">${esc(streamError)}</div></div>` : ''}
     <div class="kv-item"><div class="k">${t('协议')}</div><div class="v">${proto}${stream ? ' (stream)' : ''}</div></div>`;
@@ -1697,7 +1700,7 @@ async function runLlmTest() {
     ? text
     : (think ? t('【模型仅输出思考过程（max_tokens 不足或未产出正文）】') + '\n' + think : t('（空响应）'));
   contentEl.dataset.placeholderLang = ''; // 真实输出：不再是占位文案
-  llmHistory.unshift({ t: new Date().toLocaleTimeString(), proto, model, status, latency, ttft, ok: ok && !streamError });
+  llmHistory.unshift({ t: new Date().toLocaleTimeString(), proto, model, status, latency, ttft, ok });
   document.getElementById('llmHistory').innerHTML = llmHistory.slice(0, 10).map(h =>
     `<div>${esc(h.t)} · ${esc(h.proto)} · ${esc(h.model)} · <span style="color:${h.ok ? 'var(--c-success-dark)' : 'var(--c-danger)'}">${h.status}</span> · ${h.latency}ms${h.ttft ? ' / ttft ' + h.ttft + 'ms' : ''}</div>`).join('');
   if (!ok) toast(streamError ? tf('流内错误: %s', streamError) : tf('测试返回 %s', status), 'error');
