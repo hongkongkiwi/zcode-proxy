@@ -40,6 +40,15 @@ func (s *APIServer) handleCreateKey(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, http.StatusBadRequest, "name 必填且不超过 64 字符")
 		return
 	}
+	// 名称唯一：用量归因与面板按名字展示 Key，重名会让审计/告知混淆
+	if keys, err := s.db.ListGatewayKeys(); err == nil {
+		for _, k := range keys {
+			if k.Name == name {
+				writeAPIError(w, http.StatusConflict, "同名网关 Key 已存在: "+name)
+				return
+			}
+		}
+	}
 	if body.RPMLimit < 0 || body.RPMLimit > 100000 {
 		writeAPIError(w, http.StatusBadRequest, "rpm_limit 取值范围 0-100000（0=不限）")
 		return
@@ -108,6 +117,15 @@ func (s *APIServer) handleUpdateKey(w http.ResponseWriter, r *http.Request) {
 		if name == "" || len(name) > 64 {
 			writeAPIError(w, http.StatusBadRequest, "name 必填且不超过 64 字符")
 			return
+		}
+		// 名称唯一（改名撞别的 Key 同样拒绝）
+		if keys, err := s.db.ListGatewayKeys(); err == nil {
+			for _, k := range keys {
+				if k.ID != id && k.Name == name {
+					writeAPIError(w, http.StatusConflict, "同名网关 Key 已存在: "+name)
+					return
+				}
+			}
 		}
 	}
 	enabled := existing.Enabled

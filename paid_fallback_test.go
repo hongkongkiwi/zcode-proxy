@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"path/filepath"
 	"testing"
 	"time"
@@ -189,14 +190,14 @@ func TestPerChannelSlotGates(t *testing.T) {
 	a.ID = id
 	db.SetSetting("max_concurrent_per_account", "1")
 
-	relFree, ok := p.AcquireAccountSlot(a, ChannelFree, 50*time.Millisecond)
+	relFree, ok := p.AcquireAccountSlot(context.Background(), a, ChannelFree, 50*time.Millisecond)
 	if !ok {
 		t.Fatal("free slot acquire should succeed")
 	}
-	if _, ok := p.AcquireAccountSlot(a, ChannelFree, 50*time.Millisecond); ok {
+	if _, ok := p.AcquireAccountSlot(context.Background(), a, ChannelFree, 50*time.Millisecond); ok {
 		t.Fatal("free slot over cap should time out")
 	}
-	relPaid, ok := p.AcquireAccountSlot(a, ChannelPaid, 50*time.Millisecond)
+	relPaid, ok := p.AcquireAccountSlot(context.Background(), a, ChannelPaid, 50*time.Millisecond)
 	if !ok {
 		t.Fatal("paid slot must be independent of full free slot")
 	}

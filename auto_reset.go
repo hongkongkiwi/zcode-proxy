@@ -52,7 +52,10 @@ var autoResetState = struct {
 	sync.Mutex
 	lastAttempt     map[int64]time.Time
 	lastExpirySpend map[int64]time.Time
-}{lastAttempt: map[int64]time.Time{}, lastExpirySpend: map[int64]time.Time{}}
+	// 上一次临期消耗的槽位到期时间：gap 内出现"不同到期时间"的临期槽时，
+	// 锁内重拉列表即上游亲证是另一槽，gap 让位（否则第二个临期槽必死在 gap 内）
+	lastExpirySpendSlot map[int64]int64
+}{lastAttempt: map[int64]time.Time{}, lastExpirySpend: map[int64]time.Time{}, lastExpirySpendSlot: map[int64]int64{}}
 
 // autoResetShouldSpend 阈值判定（纯函数，供测试）：等待未知 = 花；
 // 等待已知且 >= 阈值 = 花；否则等自然恢复
@@ -176,17 +179,30 @@ func (z *ZCodeAPI) MaybeAutoReset(a *Account, trigger string) {
 	if expiryOn {
 		windowSec = int64(settingInt(z.db, "auto_reset_expiry_spend_minutes", autoResetExpirySpendDefaultMin)) * 60
 	}
-	var chosen []ResetSlot
-	if resetType == "FIVE_HOUR" {
-		chosen = st.AvailableFiveHourResets
-	} else {
-		chosen = st.AvailableWeekResets
+	// 临期判定必须跨两表：five-hour 列表非空时 WEEK 临期槽此前不可见，
+	// 阈值保留路径会白等到它过期作废
+	now := time.Now().Unix()
+	exp5, expiring5 := autoResetSlotExpiringSoon(now, windowSec, st.AvailableFiveHourResets)
+	expW, expiringW := autoResetSlotExpiringSoon(now, windowSec, st.AvailableWeekResets)
+	var expireAt int64
+	expiring := false
+	switch {
+	case expiring5:
+		resetType = "FIVE_HOUR"
+		expireAt, expiring = exp5, true
+	case expiringW:
+		resetType = "WEEK"
+		expireAt, expiring = expW, true
 	}
-	expireAt, expiring := autoResetSlotExpiringSoon(time.Now().Unix(), windowSec, chosen)
 	// 阈值消耗只在主开关开时生效；主开关关时仅临期槽位可触发消耗
 	if !expiring && !(autoOn && autoResetShouldSpend(waitKnown, wait, thresholdSeconds)) {
-		log.Printf("[auto-reset] %s: %s window resets naturally in %dm (< threshold), keeping reset slot",
-			a.DisplayNameOrEmail(), resetType, (wait+59)/60)
+		if autoOn {
+			log.Printf("[auto-reset] %s: %s window resets naturally in %s (< threshold), keeping reset slot",
+				a.DisplayNameOrEmail(), resetType, humanizeWait(wait, waitKnown))
+		} else {
+			log.Printf("[auto-reset] %s: threshold spend disabled (auto_reset_enabled=0), keeping %s slot",
+				a.DisplayNameOrEmail(), resetType)
+		}
 		return
 	}
 	detail := "耗尽触发，等待 " + humanizeWait(wait, waitKnown) + " 超过阈值"
@@ -286,12 +302,6 @@ func (z *ZCodeAPI) spendExpiringResetForSync(a *Account, st *ResetStatus) {
 	if windowSec <= 0 {
 		return
 	}
-	autoResetState.Lock()
-	last := autoResetState.lastExpirySpend[a.ID]
-	autoResetState.Unlock()
-	if time.Since(last) < autoResetExpirySpendGap {
-		return
-	}
 	now := time.Now().Unix()
 	if _, soon5 := autoResetSlotExpiringSoon(now, windowSec, st.AvailableFiveHourResets); !soon5 {
 		if _, soonW := autoResetSlotExpiringSoon(now, windowSec, st.AvailableWeekResets); !soonW {
@@ -327,6 +337,15 @@ func (z *ZCodeAPI) spendExpiringResetForSync(a *Account, st *ResetStatus) {
 	} else {
 		return
 	}
+	// 30 分钟 gap 防上游列表滞后双花；但锁内重拉列表里出现"不同到期时间"的
+	// 临期槽 = 上游亲证是另一槽，gap 让位（否则第二个临期槽必死在 gap 内）
+	autoResetState.Lock()
+	last := autoResetState.lastExpirySpend[fresh.ID]
+	lastSlot := autoResetState.lastExpirySpendSlot[fresh.ID]
+	autoResetState.Unlock()
+	if time.Since(last) < autoResetExpirySpendGap && expireAt == lastSlot {
+		return
+	}
 	used, _, msg, err := z.UseReset(fresh, resetType)
 	record := &ClaimRecord{AccountID: fresh.ID, Email: fresh.Email, TaskType: "reset", UsedAt: time.Now().Unix()}
 	if err != nil || !used {
@@ -337,6 +356,7 @@ func (z *ZCodeAPI) spendExpiringResetForSync(a *Account, st *ResetStatus) {
 	}
 	autoResetState.Lock()
 	autoResetState.lastExpirySpend[fresh.ID] = time.Now()
+	autoResetState.lastExpirySpendSlot[fresh.ID] = expireAt
 	autoResetState.Unlock()
 	record.Success = true
 	record.PlanName = "配额重置(" + resetType + ")[自动-临期]"

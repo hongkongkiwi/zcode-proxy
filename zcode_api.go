@@ -134,6 +134,11 @@ func (z *ZCodeAPI) applyQuotaResult(a *Account, ov *QuotaOverview) {
 		return
 	case ov.AllExhausted():
 		z.pool.MarkExhausted(a, "额度已用完")
+		// 阈值自动重置的第二个触发点：额度刷新发现的耗尽没有 402（账号已不可选，
+		// relay 永远打不到它）——402 是唯一触发点时，被外部设备耗尽的账号
+		// 即使 auto_reset_enabled=1 也永远轮不到评估。MaybeAutoReset 自带
+		// debounce + fresh 重读 + inflight 避让，重复触发无害
+		z.goBackground("auto-reset", func() { z.MaybeAutoReset(a, "quota") })
 	default:
 		// 有剩余额度：cooling 到期 / exhausted / inactive / invalid（凭证其实有效）恢复 active
 		if a.tryRecoverActive() {

@@ -255,6 +255,12 @@ func (m *AccountManager) ensureAccountIdentity(a *Account) {
 	}
 	id := a.ID
 	go func() {
+		// 安装序是补偿性上报：panic 只记日志（net/http 管不到独立 goroutine）
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("[identity] install sequence panic: %v", r)
+			}
+		}()
 		fresh, err := m.db.GetAccount(id)
 		if err != nil {
 			return

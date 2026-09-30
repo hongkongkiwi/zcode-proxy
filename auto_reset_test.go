@@ -21,12 +21,43 @@ func TestAutoResetShouldSpend(t *testing.T) {
 		{"90min left >= threshold spends", true, 90 * 60, 60 * 60, true},
 		{"exactly at threshold spends", true, 60 * 60, 60 * 60, true},
 		{"zero threshold always spends", true, 30, 0, true},
-		{"already-past window spends", true, 0, 60 * 60, false},
+		{"already-past window keeps (recoverable now)", true, 0, 60 * 60, false},
 	}
 	for _, c := range cases {
 		if got := autoResetShouldSpend(c.waitKnown, c.waitSecs, c.threshold); got != c.wantSpend {
 			t.Errorf("%s: autoResetShouldSpend(%v,%d,%d) = %v, want %v",
 				c.name, c.waitKnown, c.waitSecs, c.threshold, got, c.wantSpend)
+		}
+	}
+}
+
+// 消耗决策的组合真值表（auto_reset.go 的门控表达式）：
+//
+//	spend = expiring || (autoOn && autoResetShouldSpend(...))
+//
+// 临期压过一切；阈值路径只认主开关
+func TestAutoResetSpendGateComposition(t *testing.T) {
+	cases := []struct {
+		name      string
+		autoOn    bool
+		expiring  bool
+		waitKnown bool
+		waitSecs  int64
+		threshold int64
+		wantSpend bool
+	}{
+		{"expiry window hit spends even with master off", false, true, true, 5 * 60, 60 * 60, true},
+		{"master off + not expiring keeps", false, false, true, 5 * 60, 60 * 60, false},
+		{"master on + threshold pass spends", true, false, true, 90 * 60, 60 * 60, true},
+		{"master on + threshold fail keeps", true, false, true, 5 * 60, 60 * 60, false},
+		{"master on + threshold fail but expiring spends", true, true, true, 5 * 60, 60 * 60, true},
+		{"unknown wait spends under master", true, false, false, 0, 60 * 60, true},
+	}
+	for _, c := range cases {
+		got := c.expiring || (c.autoOn && autoResetShouldSpend(c.waitKnown, c.waitSecs, c.threshold))
+		if got != c.wantSpend {
+			t.Errorf("%s: gate(autoOn=%v, expiring=%v) = %v, want %v",
+				c.name, c.autoOn, c.expiring, got, c.wantSpend)
 		}
 	}
 }

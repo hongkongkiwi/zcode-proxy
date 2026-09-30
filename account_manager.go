@@ -261,6 +261,11 @@ func (m *AccountManager) importLocalClient(f localClientFiles, group, remark str
 	// 异步刷新额度：在库内新副本上刷新——本副本随即被 handler 无锁序列化
 	// （accountPublicView），共享实例就地写会撕裂字符串字段（-race/segfault 面）
 	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("[import] quota refresh panic: %v", r)
+			}
+		}()
 		time.Sleep(500 * time.Millisecond)
 		fresh, err := m.db.GetAccount(id)
 		if err != nil {
@@ -350,6 +355,11 @@ func (m *AccountManager) ImportPasted(provider, name, secret, group string) (*Ac
 	// 异步刷新额度：与本地导入同纪律——在库内新副本上刷新，本副本随即被
 	// handler 无锁序列化（accountPublicView），共享实例并发写会撕裂字符串字段
 	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("[import] paste quota refresh panic: %v", r)
+			}
+		}()
 		time.Sleep(500 * time.Millisecond)
 		fresh, err := m.db.GetAccount(id)
 		if err != nil {

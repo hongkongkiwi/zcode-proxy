@@ -61,7 +61,15 @@ func (ac *AutoClaimer) Start() {
 			}
 			iv := ac.interval()
 			if iv > 0 && ac.enabled() {
-				ac.RunOnce("cron")
+				// 常驻循环：单轮 panic 不得带走整个 goroutine（net/http 管不到这里）
+				func() {
+					defer func() {
+						if r := recover(); r != nil {
+							log.Printf("[auto-claim] round panic: %v", r)
+						}
+					}()
+					ac.RunOnce("cron")
+				}()
 			}
 			if iv == 0 {
 				// 手动模式（间隔显式 0）：循环空转，每分钟复查设置是否改回

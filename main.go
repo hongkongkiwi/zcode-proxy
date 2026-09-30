@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"syscall"
@@ -202,12 +203,26 @@ func main() {
 	// 否则长 SSE 期间 usage/状态写库会撞上已关闭的库
 	var inFlight sync.WaitGroup
 	authed := limitBody(auth.Middleware(mux))
+	// panic 隔离：net/http 虽自带 recover（进程不死），但客户端只看到连接重置、
+	// 无状态码无错误体。响应未开始时补一个 502；已开流的只记日志（协议帧格式
+	// 依 proto 而异，中间层无法可靠代写）
 	srv := &http.Server{
 		Addr: listenAddr,
 		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			inFlight.Add(1)
 			defer inFlight.Done()
-			authed.ServeHTTP(w, r)
+			wt := &writeTracker{ResponseWriter: w}
+			defer func() {
+				if rec := recover(); rec != nil {
+					log.Printf("[http] handler panic on %s %s: %v\n%s", r.Method, r.URL.Path, rec, debug.Stack())
+					if !wt.wrote {
+						wt.Header().Set("Content-Type", "application/json")
+						wt.WriteHeader(http.StatusBadGateway)
+						fmt.Fprint(wt, `{"error":{"message":"internal error (panic contained)","type":"api_error"}}`)
+					}
+				}
+			}()
+			authed.ServeHTTP(wt, r)
 		}),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
@@ -273,4 +288,28 @@ func limitBody(next http.Handler) http.Handler {
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+// writeTracker 记录响应是否已开写（panic 兜底据此决定补 502 还是静默）。
+// Flush 必须透传：SSE 路径靠 w.(http.Flusher) 断言刷新，包一层丢了接口
+// 流式就整个哑掉
+type writeTracker struct {
+	http.ResponseWriter
+	wrote bool
+}
+
+func (wt *writeTracker) WriteHeader(code int) {
+	wt.wrote = true
+	wt.ResponseWriter.WriteHeader(code)
+}
+
+func (wt *writeTracker) Write(b []byte) (int, error) {
+	wt.wrote = true
+	return wt.ResponseWriter.Write(b)
+}
+
+func (wt *writeTracker) Flush() {
+	if f, ok := wt.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
 }

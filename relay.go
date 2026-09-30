@@ -422,9 +422,9 @@ func (z *ZCodeAPI) forwardOnce(w http.ResponseWriter, r *http.Request, a *Accoun
 	rc *relayCtx, start time.Time, pathLabel, channel string) relayOutcome {
 
 	// 每（账号×通道）并发闸门：排队而非打满并发（上游 1302 并发超限的根治手段）。
-	// 排队 45s 仍无名额 → 让位下一候选（10s 短冷却，很快回来）。
+	// 排队 45s 仍无名额或客户端已断开 → 让位下一候选（10s 短冷却，很快回来）。
 	// release 绑定获取时的闸门对象：设置变更重建闸门后旧持有者不会错放新闸门
-	release, ok := z.pool.AcquireAccountSlot(a, channel, 45*time.Second)
+	release, ok := z.pool.AcquireAccountSlot(r.Context(), a, channel, 45*time.Second)
 	if !ok {
 		if channel == ChannelPaid {
 			z.pool.MarkPaidCooling(a, "付费通道并发已满（在途请求达到上限），短暂冷却", 10)
@@ -499,6 +499,14 @@ func (z *ZCodeAPI) forwardOnce(w http.ResponseWriter, r *http.Request, a *Accoun
 				return outcomeCaptchaRejected
 			}
 
+			// 风控拦截（3012）先于凭证分支判类：上游曾以 401/403 壳携带 3012 体，
+			// 落进凭证分支会烧一次 90s 刷新退避再把临时风控标记的账号标成
+			// invalid（需人工干预）；短冷却后真死的凭证会再次失败，无害
+			if isRiskBlocked(text) {
+				log.Printf("[relay] account %s risk-blocked on %s path", a.DisplayNameOrEmail(), pathLabel)
+				return outcomeRiskBlocked
+			}
+
 			switch {
 			case resp.StatusCode == 401 || resp.StatusCode == 403:
 				if channel == ChannelPaid {
@@ -546,11 +554,6 @@ func (z *ZCodeAPI) forwardOnce(w http.ResponseWriter, r *http.Request, a *Accoun
 					z.pool.MarkCooling(a, fmt.Sprintf("%s，冷却 %ds", reason, cool), cool)
 				}
 				return outcomeNextAccount
-			case isRiskBlocked(text):
-				// 3012 unusual activity：风控拦截。不立即冷却，先试本模式内其余路径
-				//（api.z.ai 是独立服务，通常不受免费侧风控影响）
-				log.Printf("[relay] account %s risk-blocked on %s path", a.DisplayNameOrEmail(), pathLabel)
-				return outcomeRiskBlocked
 			case isExhaustedError(resp.StatusCode, text):
 				if channel == ChannelPaid {
 					// 付费通道余额/额度不足：长冷却留充值自愈窗口，免费侧不受牵连
@@ -598,6 +601,14 @@ func (z *ZCodeAPI) forwardOnce(w http.ResponseWriter, r *http.Request, a *Accoun
 		if !isStream {
 			body, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<20))
 			resp.Body.Close()
+			// 撞到 64MB 上限（LimitReader EOF 与真实 EOF 无法区分）按失败处理：
+			// 静默截断会把截在半截的 input_json_delta 洗成"成功的空参 tool_use"
+			if len(body) == 64<<20 {
+				z.pool.MarkFailed(a, "上游响应超过 64MB 上限")
+				z.recordUsage(a, r, payload, http.StatusBadGateway, start, 0, nil, rc.clientStream)
+				writeAPIError(w, http.StatusBadGateway, "upstream response exceeds the 64MB limit")
+				return outcomeUpstreamError
+			}
 			// 2xx + JSON 但不是 message（上游内联错误信封，SSE 路径已证实存在）：
 			// 不得洗成"成功空响应"，按上游错误处理
 			if isErrorEnvelope(body) {
@@ -1000,8 +1011,8 @@ func validateMessagesBody(body map[string]interface{}) error {
 	}
 	// tool_use/tool_result 配对预检：孤儿 tool_result 上游必 400，且会把
 	// 健康账号计一次 MarkFailed——本地拒绝并给出准确原因
-	declaredToolUses := map[string]bool{}
-	for _, m := range msgs {
+	declaredToolUses := map[string]int{} // id → 首次出现的 message 下标
+	for i, m := range msgs {
 		mm, _ := m.(map[string]interface{})
 		if mm == nil {
 			continue
@@ -1020,7 +1031,29 @@ func validateMessagesBody(body map[string]interface{}) error {
 				}
 				if t, _ := bm["type"].(string); t == "tool_use" {
 					if id, _ := bm["id"].(string); id != "" {
-						declaredToolUses[id] = true
+						if _, seen := declaredToolUses[id]; !seen {
+							declaredToolUses[id] = i
+						}
+					}
+				}
+			}
+		}
+	}
+	referencedToolUses := map[string]bool{}
+	for _, m := range msgs {
+		mm, _ := m.(map[string]interface{})
+		if mm == nil {
+			continue
+		}
+		if blocks := asIfaceSlice(mm["content"]); blocks != nil {
+			for _, b := range blocks {
+				bm, ok := b.(map[string]interface{})
+				if !ok {
+					continue
+				}
+				if t, _ := bm["type"].(string); t == "tool_result" {
+					if id, _ := bm["tool_use_id"].(string); id != "" {
+						referencedToolUses[id] = true
 					}
 				}
 			}
@@ -1079,8 +1112,8 @@ func validateMessagesBody(body map[string]interface{}) error {
 				case "tool_use":
 					if id, _ := bm["id"].(string); id == "" {
 						return fmt.Errorf("messages[%d].content[%d]: tool_use block must have an id", i, j)
-					} else {
-						declaredToolUses[id] = true
+					} else if _, seen := declaredToolUses[id]; !seen {
+						declaredToolUses[id] = i
 					}
 					if name, _ := bm["name"].(string); name == "" {
 						return fmt.Errorf("messages[%d].content[%d]: tool_use block must have a name", i, j)
@@ -1090,7 +1123,7 @@ func validateMessagesBody(body map[string]interface{}) error {
 					if tid == "" {
 						return fmt.Errorf("messages[%d].content[%d]: tool_result block must have a tool_use_id", i, j)
 					}
-					if !declaredToolUses[tid] {
+					if _, ok := declaredToolUses[tid]; !ok {
 						return fmt.Errorf("messages[%d].content[%d]: tool_result references unknown tool_use_id %q (dropped assistant turn?)", i, j, tid)
 					}
 				case "image":
@@ -1104,6 +1137,17 @@ func validateMessagesBody(body map[string]interface{}) error {
 				}
 			}
 		}
+	}
+	// 反向配对：tool_use 无任何 tool_result 引用 → 上游 400 + 账号计失败。
+	// 末条 assistant 消息例外（prefill 到工具调用的合法形状，模型从这里继续）
+	for id, msgIdx := range declaredToolUses {
+		if referencedToolUses[id] {
+			continue
+		}
+		if msgIdx == len(msgs)-1 {
+			continue
+		}
+		return fmt.Errorf("messages[%d].content contains tool_use %q with no matching tool_result (dropped tool turn?)", msgIdx, id)
 	}
 	if mt, ok := body["max_tokens"]; ok {
 		switch v := mt.(type) {

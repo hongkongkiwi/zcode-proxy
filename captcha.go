@@ -335,7 +335,15 @@ func (s *CaptchaService) StartPrewarm(stopCh <-chan struct{}) {
 				return
 			case <-t.C:
 			}
-			s.prewarmOnce()
+			// 常驻循环：单轮 panic 不得带走保温（验证码缓存从此不再刷新）
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						log.Printf("[captcha] prewarm round panic: %v", r)
+					}
+				}()
+				s.prewarmOnce()
+			}()
 			t.Reset(prewarmTick)
 		}
 	}()
