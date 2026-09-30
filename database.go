@@ -15,7 +15,9 @@ import (
 
 // Account 数据库中的 ZCode 账号记录。
 // user_id 为自然键：重复导入同一账号时按 user_id upsert，
-// device_mid / credentials_raw 一旦写入不会被后续导入清空（COALESCE 保留）。
+// device_mid / credentials_raw 不会被后续导入"清空"（COALESCE 保留空值场景）；
+// 但携带非空值的导入（OAuth 本机指纹/多实例遥测/导出包）会覆盖旧 device_mid
+// （设备信号跟随导入源，有意为之）；自动生成的指纹由 CAS 保护不轮换。
 type Account struct {
 	// mu 串行化下方运行时可变字段的写入：转发请求与额度刷新 goroutine 并发读写
 	// （状态/冷却/错误/额度快照/Use-Fail 计数，见 database_accounts.go 的写入方法）。

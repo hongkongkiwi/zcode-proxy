@@ -126,6 +126,13 @@ func (z *ZCodeAPI) MaybeAutoReset(a *Account, trigger string) {
 		return
 	}
 
+	// 配额刷新仍在单飞中：等下一轮 debounce 再评估。刷新可能恰好把账号恢复
+	// active——此刻烧重置就是白烧一个稀缺槽位（fresh 重读只覆盖已落库的恢复）
+	if _, busy := z.quotaRefreshInflight.Load(a.ID); busy {
+		log.Printf("[auto-reset] %s: quota refresh in flight, deferring", a.DisplayNameOrEmail())
+		return
+	}
+
 	used, _, msg, err := z.UseReset(a, resetType)
 	record := &ClaimRecord{AccountID: a.ID, Email: a.Email, TaskType: "reset"}
 	if err != nil || !used {
@@ -141,10 +148,10 @@ func (z *ZCodeAPI) MaybeAutoReset(a *Account, trigger string) {
 	z.db.InsertClaimRecord(record)
 	z.db.SetAccountClaimResult(a.ID, record.PlanName, record.Message)
 	log.Printf("[auto-reset] %s: quota restored via %s (trigger=%s)", a.DisplayNameOrEmail(), resetType, trigger)
-	go func() {
+	z.goBackground("auto-reset-quota", func() {
 		time.Sleep(2 * time.Second)
 		z.RefreshAccountQuota(a)
-	}()
+	})
 }
 
 // settingInt 整数设置读取（非法/缺失回落默认）

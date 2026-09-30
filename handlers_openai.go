@@ -400,7 +400,7 @@ func openaiToAnthropic(body map[string]interface{}) (map[string]interface{}, err
 		out["max_tokens"] = float64(4096)
 	}
 	if t, ok := body["temperature"]; ok && t != nil {
-		out["temperature"] = t
+		out["temperature"] = clampOpenAITemperature(t)
 	}
 	if tp, ok := body["top_p"]; ok && tp != nil {
 		out["top_p"] = tp
@@ -518,6 +518,23 @@ func asBlockList(v interface{}) []map[string]interface{} {
 }
 
 // ---- 请求体转换：OpenAI Responses → Anthropic Messages ----
+
+// clampOpenAITemperature OpenAI 规格允许 [0,2]，Anthropic/Z.ai 上游只收 0..1：
+// 超范围值是确定性 400，且会记到健康账号头上（MarkFailed 计失败）。
+// 夹紧而非拒绝，保持 OpenAI 客户端兼容
+func clampOpenAITemperature(v interface{}) interface{} {
+	tv, ok := v.(float64)
+	if !ok {
+		return v
+	}
+	if tv > 1 {
+		return float64(1)
+	}
+	if tv < 0 {
+		return float64(0)
+	}
+	return tv
+}
 
 // responsesContentToText 提取文本部分；图片 part（input_image）显式报错而非静默丢弃——
 // 否则纯图片消息整体消失（"input must contain at least one message"），多轮对话里
@@ -638,7 +655,7 @@ func responsesToAnthropic(body map[string]interface{}) (map[string]interface{}, 
 		chatBody["max_tokens"] = mt
 	}
 	if t, ok := body["temperature"]; ok && t != nil {
-		chatBody["temperature"] = t
+		chatBody["temperature"] = clampOpenAITemperature(t)
 	}
 	if tp, ok := body["top_p"]; ok && tp != nil {
 		chatBody["top_p"] = tp

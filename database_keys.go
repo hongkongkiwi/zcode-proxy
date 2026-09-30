@@ -2,6 +2,7 @@ package main
 
 import (
 	"database/sql"
+	"log"
 	"strings"
 	"time"
 )
@@ -14,8 +15,8 @@ import (
 type GatewayKey struct {
 	ID         int64  `json:"id"`
 	Name       string `json:"name"`
-	KeyHash    string `json:"-"`            // sha256 hex（明文不落库）
-	KeyPrefix  string `json:"key_prefix"`   // 展示用前缀，如 sk-ab12…
+	KeyHash    string `json:"-"`          // sha256 hex（明文不落库）
+	KeyPrefix  string `json:"key_prefix"` // 展示用前缀，如 sk-ab12…
 	Enabled    bool   `json:"enabled"`
 	RPMLimit   int    `json:"rpm_limit"`    // 每分钟请求数上限，0 = 不限
 	QuotaTotal int64  `json:"quota_total"`  // 总 token 配额（prompt+completion），0 = 不限
@@ -112,8 +113,12 @@ func (db *DB) BumpGatewayKeyUsage(id int64, tokens int) {
 	if id <= 0 {
 		return
 	}
-	db.conn.Exec(`UPDATE gateway_keys SET quota_used = quota_used + ?,
-		last_used_at = ?, updated_at = updated_at WHERE id = ?`, tokens, time.Now().Unix(), id)
+	if _, err := db.conn.Exec(`UPDATE gateway_keys SET quota_used = quota_used + ?,
+		last_used_at = ?, updated_at = updated_at WHERE id = ?`, tokens, time.Now().Unix(), id); err != nil {
+		// 配额累加失败只能记日志（存储故障类）；静默丢更新会让 quota_used
+		// 永远追不上真实消耗，配额闸永不触发
+		log.Printf("[gateway-key] bump usage id=%d tokens=%d: %v", id, tokens, err)
+	}
 }
 
 // normalizeModelWhitelist 白名单归一化：trim + 小写 + 去空项 + 去重，保序

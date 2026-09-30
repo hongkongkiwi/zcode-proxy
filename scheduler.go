@@ -41,6 +41,7 @@ type CronScheduler struct {
 	ticker   *time.Ticker
 	runMu    sync.Mutex
 	running  map[int64]*PlanRunState
+	runWG    sync.WaitGroup // 在途 runPlan goroutine（Stop 有界等待）
 
 	execMu    sync.Mutex
 	execLocks map[int64]*sync.Mutex // per-plan 执行互斥（TryLock，拿不到跳过本 tick）
@@ -86,7 +87,17 @@ func (s *CronScheduler) Start() {
 	}()
 }
 
-// Stop 停止调度器（幂等）
+// goPlan 计划执行入口：入 WaitGroup，Stop 时有界等待——停机中断路径的
+// 终态写库必须先于 main 的 db.Close，否则计划行永远卡在 running
+func (s *CronScheduler) goPlan(spawn func()) {
+	s.runWG.Add(1)
+	go func() {
+		defer s.runWG.Done()
+		spawn()
+	}()
+}
+
+// Stop 停止调度器（幂等）：关停信号 + 有界等待在途 runPlan 收尾
 func (s *CronScheduler) Stop() {
 	s.stopOnce.Do(func() {
 		if s.ticker != nil {
@@ -94,6 +105,16 @@ func (s *CronScheduler) Stop() {
 		}
 		close(s.stopCh)
 	})
+	done := make(chan struct{})
+	go func() {
+		s.runWG.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(15 * time.Second):
+		log.Printf("[scheduler] stop: plan goroutines still running after 15s")
+	}
 }
 
 // GetRunning 当前运行中的计划状态
@@ -149,7 +170,7 @@ func (s *CronScheduler) checkAndRun() {
 				}
 			}
 		}
-		go s.executePlan(plan, now)
+		s.goPlan(func() { s.executePlan(plan, now) })
 	}
 }
 
@@ -168,10 +189,10 @@ func (s *CronScheduler) RunPlanNow(planID int64) error {
 	if !lock.TryLock() {
 		return fmt.Errorf("计划正在执行中，请稍后再试")
 	}
-	go func() {
+	s.goPlan(func() {
 		defer lock.Unlock()
 		s.runPlan(plan, time.Now())
-	}()
+	})
 	return nil
 }
 

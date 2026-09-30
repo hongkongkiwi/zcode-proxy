@@ -23,7 +23,8 @@ import (
 // （端点/事件体与 dengyie/zcode2api app/install.py、app/telemetry.py 逐字段对齐）。
 
 // SetAccountDeviceMid 回填账号设备指纹。比较写入：仅当库内为空才落——
-// 重导入场景 upsert 的 COALESCE 已保留原指纹，绝不能轮换既有值。
+// 无指纹导入（粘贴导入）场景 upsert 的 COALESCE 已保留原指纹，自动生成的
+// 指纹绝不轮换；携带指纹的导入（OAuth/遥测）按 upsert 语义有意覆盖。
 // 返回库内生效的指纹（已有值时为原值）。
 func (db *DB) SetAccountDeviceMid(id int64, deviceMid string) (string, error) {
 	res, err := db.conn.Exec(`UPDATE accounts SET device_mid = ?,
@@ -242,6 +243,8 @@ func (z *ZCodeAPI) SendInstallSequence(a *Account, httpClient *http.Client) {
 
 // ensureAccountIdentity 补齐设备身份并异步仿真一次官方安装序（仅 JWT 账号；
 // API Key 账号无 zcode.z.ai 登录态，保持未登录安装形态不发）。导入路径共用。
+// 安装序 goroutine 用库内新副本：调用方的导入副本随即被 handler 无锁序列化，
+// 共享实例并发读写（billingToken 读凭证 vs setQuota/setCredentials 写）会撕裂。
 func (m *AccountManager) ensureAccountIdentity(a *Account) {
 	if a == nil || a.ID <= 0 {
 		return
@@ -250,8 +253,13 @@ func (m *AccountManager) ensureAccountIdentity(a *Account) {
 	if !strings.HasPrefix(a.AuthType, "jwt") {
 		return
 	}
-	go func(acc *Account) {
-		client := ClientForURL(m.zapi.egress.ProxyURLForAccount(acc), EventReportURL, 5*time.Second)
-		m.zapi.SendInstallSequence(acc, client)
-	}(a)
+	id := a.ID
+	go func() {
+		fresh, err := m.db.GetAccount(id)
+		if err != nil {
+			return
+		}
+		client := ClientForURL(m.zapi.egress.ProxyURLForAccount(fresh), EventReportURL, 5*time.Second)
+		m.zapi.SendInstallSequence(fresh, client)
+	}()
 }

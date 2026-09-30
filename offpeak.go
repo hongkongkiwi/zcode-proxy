@@ -779,6 +779,13 @@ func (z *ZCodeAPI) offPeakForward(w http.ResponseWriter, r *http.Request, a *Acc
 
 	switch {
 	case resp.StatusCode == 401 || resp.StatusCode == 403:
+		// Cloudflare/WAF 挑战页与凭证失效同状态码：先按挑战分类（与主转发
+		// relay 同款），不能掉进下方 401/403 分支把健康账号误标 invalid
+		chalBody, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+		if isCloudflareChallenge(resp.Header, string(chalBody)) {
+			z.pool.MarkCooling(a, fmt.Sprintf("Cloudflare/WAF 挑战 HTTP %d（闲时通道）", resp.StatusCode), 300)
+			return outcomeNextAccount
+		}
 		// 与主转发/取票路径同一恢复优先策略：先试 refresh_token 兑换
 		if ok, inflight := z.tryRefreshAccount(a); ok || inflight {
 			return outcomeNextAccount
@@ -1011,9 +1018,12 @@ func aggregateAnthropicStream(r io.Reader) ([]byte, *StreamUsage, error) {
 			idx := toInt(ev.Data["index"])
 			if b, ok := agg.toolJSON[idx]; ok {
 				var parsed interface{}
-				if err := json.Unmarshal([]byte(b.String()), &parsed); err == nil {
-					agg.blocks[idx]["input"] = parsed
+				if err := json.Unmarshal([]byte(b.String()), &parsed); err != nil || parsed == nil {
+					// 解析失败或字面量 "null"（Unmarshal 成功但得 nil）：一律空对象，
+					// 客户端工具执行器期待 input 为对象
+					parsed = map[string]interface{}{}
 				}
+				agg.blocks[idx]["input"] = parsed
 				delete(agg.toolJSON, idx)
 			}
 		case "message_delta":
@@ -1124,7 +1134,9 @@ func newUsageSniffReader(r io.Reader) *usageSniffReader { return &usageSniffRead
 
 func (u *usageSniffReader) usage() *StreamUsage {
 	u.flushPeek()
-	if u.acc.InputTokens == 0 && u.acc.OutputTokens == 0 {
+	// 无 usage 帧但有内联错误：照样返回——否则 ERR: 标记随 nil 丢失，
+	// 失败流会被记成干净的 200 成功
+	if u.acc.InputTokens == 0 && u.acc.OutputTokens == 0 && !strings.HasPrefix(u.acc.StopReason, "ERR:") {
 		return nil
 	}
 	cp := u.acc
@@ -1158,13 +1170,17 @@ func (u *usageSniffReader) sniffLine(line string) {
 		} `json:"error"`
 		Message struct {
 			Usage struct {
-				InputTokens  int `json:"input_tokens"`
-				OutputTokens int `json:"output_tokens"`
+				InputTokens              int `json:"input_tokens"`
+				OutputTokens             int `json:"output_tokens"`
+				CacheReadInputTokens     int `json:"cache_read_input_tokens"`
+				CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
 			} `json:"usage"`
 		} `json:"message"`
 		Usage struct {
-			InputTokens  int `json:"input_tokens"`
-			OutputTokens int `json:"output_tokens"`
+			InputTokens              int `json:"input_tokens"`
+			OutputTokens             int `json:"output_tokens"`
+			CacheReadInputTokens     int `json:"cache_read_input_tokens"`
+			CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
 		} `json:"usage"`
 		Delta struct {
 			StopReason string `json:"stop_reason"`
@@ -1185,12 +1201,25 @@ func (u *usageSniffReader) sniffLine(line string) {
 		if v.Message.Usage.InputTokens > u.acc.InputTokens {
 			u.acc.InputTokens = v.Message.Usage.InputTokens
 		}
+		// R3 缓存计量：与主路径同 max 语义（否则闲时流的缓存 token 恒为 0）
+		if v.Message.Usage.CacheReadInputTokens > u.acc.CacheReadTokens {
+			u.acc.CacheReadTokens = v.Message.Usage.CacheReadInputTokens
+		}
+		if v.Message.Usage.CacheCreationInputTokens > u.acc.CacheCreationTokens {
+			u.acc.CacheCreationTokens = v.Message.Usage.CacheCreationInputTokens
+		}
 	case "message_delta":
 		if v.Usage.OutputTokens > 0 {
 			u.acc.OutputTokens = v.Usage.OutputTokens
 		}
 		if v.Usage.InputTokens > u.acc.InputTokens {
 			u.acc.InputTokens = v.Usage.InputTokens
+		}
+		if v.Usage.CacheReadInputTokens > u.acc.CacheReadTokens {
+			u.acc.CacheReadTokens = v.Usage.CacheReadInputTokens
+		}
+		if v.Usage.CacheCreationInputTokens > u.acc.CacheCreationTokens {
+			u.acc.CacheCreationTokens = v.Usage.CacheCreationInputTokens
 		}
 		// 已标记的内联错误（ERR: 前缀）不被后续 delta 的 stop_reason 掩盖
 		if v.Delta.StopReason != "" && !strings.HasPrefix(u.acc.StopReason, "ERR:") {

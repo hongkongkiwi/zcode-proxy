@@ -109,7 +109,8 @@ func (z *ZCodeAPI) resetRequest(a *Account, method, path string, body map[string
 
 // FetchResetStatus GET reset/status
 func (z *ZCodeAPI) FetchResetStatus(a *Account) (*ResetStatus, int, string, error) {
-	if a.ZCodeJWT == "" {
+	// 锁保护读：本副本可能正被并发刷新 goroutine setCredentials 改写
+	if jwt, _, _ := a.credentialSnapshot(); jwt == "" {
 		return nil, 0, "", fmt.Errorf("需要 ZCode JWT")
 	}
 	v, status, err := z.resetRequest(a, "GET", "/status", nil)
@@ -209,10 +210,10 @@ func (z *ZCodeAPI) resetForAccountLocked(a *Account) *ClaimResult {
 	z.db.InsertClaimRecord(record)
 	z.db.SetAccountClaimResult(a.ID, record.PlanName, record.Message)
 	log.Printf("[reset] account %s quota reset via %s", a.Email, resetType)
-	go func() {
+	z.goBackground("reset-quota-refresh", func() {
 		time.Sleep(2 * time.Second)
 		z.RefreshAccountQuota(a)
-	}()
+	})
 	return &ClaimResult{OK: true, PlanName: record.PlanName, Message: record.Message}
 }
 

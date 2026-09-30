@@ -258,10 +258,16 @@ func (m *AccountManager) importLocalClient(f localClientFiles, group, remark str
 	log.Printf("[import] local client account imported: %s (id=%d, jwt=%v, apikey=%v)",
 		email, id, zcodeJWT != "", apiKey != "")
 
-	// 异步刷新额度
+	// 异步刷新额度：在库内新副本上刷新——本副本随即被 handler 无锁序列化
+	// （accountPublicView），共享实例就地写会撕裂字符串字段（-race/segfault 面）
 	go func() {
 		time.Sleep(500 * time.Millisecond)
-		if err := m.zapi.RefreshAccountQuota(a); err != nil {
+		fresh, err := m.db.GetAccount(id)
+		if err != nil {
+			log.Printf("[import] quota refresh %s: %v", email, err)
+			return
+		}
+		if err := m.zapi.RefreshAccountQuota(fresh); err != nil {
 			log.Printf("[import] quota refresh %s: %v", email, err)
 		}
 	}()
@@ -581,6 +587,13 @@ func (m *AccountManager) RestoreLocalFromSnapshot(accountID int64) error {
 		}
 		if err := os.Rename(tmp, path); err != nil {
 			return err
+		}
+	}
+	if _, hasCreds := snapshot["credentials.json"]; hasCreds {
+		if _, hasCfg := snapshot["config.json"]; !hasCfg {
+			// 快照缺 config.json（导入时不可读）：切回写入的 provider keys
+			// 会与快照登录态混装，如实告警而不是静默半还原
+			log.Printf("[switch-back] WARNING: snapshot of account %s has credentials.json but no config.json; provider keys written by switch-back remain in config.json", a.Email)
 		}
 	}
 	os.Remove(f.cache)

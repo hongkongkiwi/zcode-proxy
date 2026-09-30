@@ -39,8 +39,9 @@ const (
 )
 
 // 通道（免费优先 / 付费回退）
-//   free: zcode.z.ai JWT 通道（Coding Plan / Start Plan 套餐额度，无按量成本）
-//   paid: api.z.ai API Key 通道（按量计费，真实扣费）
+//
+//	free: zcode.z.ai JWT 通道（Coding Plan / Start Plan 套餐额度，无按量成本）
+//	paid: api.z.ai API Key 通道（按量计费，真实扣费）
 const (
 	ChannelFree = "free"
 	ChannelPaid = "paid"
@@ -241,6 +242,12 @@ func (p *AccountPool) refreshAll() {
 			}()
 			// 每账号随机延迟 0-2s，模拟人工行为
 			time.Sleep(time.Duration(rand.Intn(2000)) * time.Millisecond)
+			// 停机感知：Stop 之后不再打上游/写库（sleep 期间可能已停机）
+			select {
+			case <-p.stopCh:
+				return
+			default:
+			}
 			if err := fn(acc); err != nil {
 				log.Printf("[pool] refresh quota %s: %v", acc.Email, err)
 			}
@@ -525,8 +532,10 @@ func (p *AccountPool) accountSlotCap() int {
 
 // AcquireAccountSlot 占用一个在途名额（阻塞至 timeout）；false = 排队超时。
 // 闸门按（账号×通道）隔离：免费与付费是两条上游链路，免费侧打满不得堵死付费回退。
-// 上限设置变更时重建闸门（旧名额 token 作废由 Release 的幂等保护兜底）。
-func (p *AccountPool) AcquireAccountSlot(a *Account, channel string, timeout time.Duration) bool {
+// 返回绑定式 release：名额始终归还给"获取时"的那把闸门。上限设置变更会重建
+// 闸门对象——若按"当前对象"释放，旧持有者会错放新闸门的 token，在途计数被
+// 放空后并发上限失守（恰是本闸门要防的 1302 条件）。
+func (p *AccountPool) AcquireAccountSlot(a *Account, channel string, timeout time.Duration) (func(), bool) {
 	capNow := p.accountSlotCap()
 	key := slotKey{id: a.ID, channel: channel}
 	p.mu.Lock()
@@ -538,35 +547,28 @@ func (p *AccountPool) AcquireAccountSlot(a *Account, channel string, timeout tim
 	ch := as.ch
 	p.mu.Unlock()
 
+	// 幂等释放：多余释放忽略
+	release := func() {
+		select {
+		case <-ch:
+		default:
+		}
+	}
 	if timeout <= 0 {
 		select {
 		case ch <- struct{}{}:
-			return true
+			return release, true
 		default:
-			return false
+			return func() {}, false
 		}
 	}
 	timer := time.NewTimer(timeout)
 	defer timer.Stop()
 	select {
 	case ch <- struct{}{}:
-		return true
+		return release, true
 	case <-timer.C:
-		return false
-	}
-}
-
-// ReleaseAccountSlot 释放在途名额（幂等：多余释放忽略）
-func (p *AccountPool) ReleaseAccountSlot(a *Account, channel string) {
-	p.mu.Lock()
-	as := p.slots[slotKey{id: a.ID, channel: channel}]
-	p.mu.Unlock()
-	if as == nil {
-		return
-	}
-	select {
-	case <-as.ch:
-	default:
+		return func() {}, false
 	}
 }
 
@@ -576,7 +578,9 @@ func nextRateLimitCooldown(a *Account) int {
 	switch {
 	case strings.Contains(a.LastError, "冷却 120s"), strings.Contains(a.LastError, "冷却 300s"):
 		return 300
-	case strings.Contains(a.LastError, "限流"), strings.Contains(a.LastError, "Rate limit"):
+	case strings.Contains(a.LastError, "冷却 30s"):
+		// 只认免费侧自己写入的冷却标记升级：付费通道的限流 reason 也落
+		// last_error（含"限流"字样），此前会错把免费首档 30s 直接抬到 120s
 		return 120
 	default:
 		return 30

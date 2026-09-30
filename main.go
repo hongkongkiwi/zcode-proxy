@@ -240,6 +240,19 @@ func main() {
 	case <-time.After(30 * time.Second):
 		log.Printf("[main] shutdown: in-flight handlers still draining after 30s; proceeding")
 	}
+	// relay 派生的后台任务（额度刷新/自动重置）会在 handler 返回后继续跑：
+	// 等它们收尾再做 deferred 池停止与 db.Close，否则终态写库（重置成功的
+	// claim record 等）撞上已关闭的库被静默吞掉——稀缺重置槽就白烧了
+	bgDone := make(chan struct{})
+	go func() {
+		zapi.bgw.Wait()
+		close(bgDone)
+	}()
+	select {
+	case <-bgDone:
+	case <-time.After(20 * time.Second):
+		log.Printf("[main] shutdown: background tasks still running after 20s; proceeding")
+	}
 }
 
 // limitBody 全局请求体上限：管理 API 与登录接口此前无大小限制，

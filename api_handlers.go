@@ -1140,7 +1140,14 @@ func (s *APIServer) handleCaptchaSolve(w http.ResponseWriter, r *http.Request) {
 	}
 	var a *Account
 	if body.AccountID > 0 {
-		a, _ = s.db.GetAccount(body.AccountID)
+		var err error
+		a, err = s.db.GetAccount(body.AccountID)
+		// 静默降级到全局代理会在错误的出口 IP 下解题并缓存，后续该组账号
+		// 重放必然触发风控：显式 404 而不是 nil 账号继续
+		if err != nil || a == nil {
+			writeAPIError(w, http.StatusNotFound, "account not found")
+			return
+		}
 	}
 	param, region, err := s.captcha.GetVerifyParam(a)
 	if err != nil {

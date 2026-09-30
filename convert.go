@@ -299,6 +299,11 @@ func finalizeToolCalls(usage *StreamUsage) {
 		if raw != "" {
 			var parsed map[string]interface{}
 			if json.Unmarshal([]byte(raw), &parsed) == nil {
+				if parsed == nil {
+					// 字面量 "null"：Unmarshal 成功但得 nil，客户端工具执行器
+					// 期待对象（与非流式路径的 input 缺省修复同因）
+					parsed = map[string]interface{}{}
+				}
 				call["input"] = parsed
 			}
 		}
@@ -651,8 +656,13 @@ func (z *ZCodeAPI) streamOpenAI(w http.ResponseWriter, flusher http.Flusher, res
 				writeChunk(map[string]interface{}{"reasoning_content": t}, nil, nil)
 			case "input_json_delta":
 				srcIdx := toInt(ev.Data["index"])
+				// 未开过工具块的 index 收到参数增量（上游协议违例）：忽略本事件，
+				// 否则按零值落 index 0、污染第一个工具的累计参数
+				toolIdx, isTool := toolIndices[srcIdx]
+				if !isTool {
+					return
+				}
 				toolArgsSeen[srcIdx] = true
-				toolIdx := toolIndices[srcIdx]
 				pj, _ := delta["partial_json"].(string)
 				writeChunk(map[string]interface{}{
 					"tool_calls": []map[string]interface{}{{
@@ -906,7 +916,9 @@ func (z *ZCodeAPI) streamResponses(w http.ResponseWriter, flusher http.Flusher, 
 			arguments = "{}"
 		}
 		var parsed map[string]interface{}
-		if json.Unmarshal([]byte(arguments), &parsed) != nil {
+		if err := json.Unmarshal([]byte(arguments), &parsed); err != nil || parsed == nil {
+			// 解析失败或字面量 "null"（Unmarshal 成功但得 nil）：一律空对象，
+			// 客户端工具执行器期待 input 为对象
 			parsed = map[string]interface{}{}
 		}
 		usage.ToolCalls = append(usage.ToolCalls, map[string]interface{}{
@@ -959,9 +971,14 @@ func (z *ZCodeAPI) streamResponses(w http.ResponseWriter, flusher http.Flusher, 
 				usage.thinkBufs[idx] = &strings.Builder{}
 			}
 			if kind == "tool_use" {
+				// 未正常关闭的 text/thinking 块先收尾，保证事件序列的 output_index
+				// 单调（上游违例交错的兜底）；map 遍历无序，按 index 排序
+				stale := make([]int, 0, len(blocks))
 				for i := range blocks {
-					// 未正常关闭的 text/thinking 块先收尾，保证事件序列
-					// 的 output_index 单调（上游违例交错的兜底）
+					stale = append(stale, i)
+				}
+				sort.Ints(stale)
+				for _, i := range stale {
 					if blocks[i].kind == "text" && blocks[i].itemID != "" {
 						closeMessageEvents(i)
 					} else if blocks[i].kind == "thinking" && blocks[i].itemID != "" {

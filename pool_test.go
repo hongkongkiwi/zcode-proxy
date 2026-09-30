@@ -137,25 +137,72 @@ func TestAccountSlotGate(t *testing.T) {
 	a.ID = id
 	db.SetSetting("max_concurrent_per_account", "2")
 
-	if !p.AcquireAccountSlot(a, "free", 50*time.Millisecond) {
+	rel1, ok := p.AcquireAccountSlot(a, "free", 50*time.Millisecond)
+	if !ok {
 		t.Fatal("first acquire should succeed")
 	}
-	if !p.AcquireAccountSlot(a, "free", 50*time.Millisecond) {
+	rel2, ok := p.AcquireAccountSlot(a, "free", 50*time.Millisecond)
+	if !ok {
 		t.Fatal("second acquire should succeed")
 	}
-	if p.AcquireAccountSlot(a, "free", 50*time.Millisecond) {
+	if _, ok := p.AcquireAccountSlot(a, "free", 50*time.Millisecond); ok {
 		t.Fatal("third acquire over cap should time out")
 	}
-	p.ReleaseAccountSlot(a, "free")
-	if !p.AcquireAccountSlot(a, "free", 50*time.Millisecond) {
+	rel1()
+	rel3, ok := p.AcquireAccountSlot(a, "free", 50*time.Millisecond)
+	if !ok {
 		t.Fatal("acquire after release should succeed")
 	}
-	p.ReleaseAccountSlot(a, "free")
-	p.ReleaseAccountSlot(a, "free") // 幂等：多余释放不 panic 不负计数
-	if !p.AcquireAccountSlot(a, "free", 50*time.Millisecond) {
+	rel3()
+	rel3() // 幂等：多余释放不 panic 不负计数
+	rel2() // 旧持有者的释放同样幂等（绑定获取时的同一把闸门）
+	rel4, ok := p.AcquireAccountSlot(a, "free", 50*time.Millisecond)
+	if !ok {
 		t.Fatal("idempotent double-release should not corrupt the gate")
 	}
-	p.ReleaseAccountSlot(a, "free")
+	rel4()
+}
+
+// 闸门重建：上限变更后旧持有者的 release 不得错放新闸门的 token
+func TestAccountSlotGateRebuildReleaseBinding(t *testing.T) {
+	p, db := newPoolTestPool(t)
+	a := mkPoolAccount("slot-rebuild", DefaultPriority, StatusActive)
+	id, err := db.UpsertAccount(a)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a.ID = id
+	db.SetSetting("max_concurrent_per_account", "2")
+
+	rel1, ok := p.AcquireAccountSlot(a, "free", 50*time.Millisecond)
+	if !ok {
+		t.Fatal("first acquire should succeed")
+	}
+	rel2, ok := p.AcquireAccountSlot(a, "free", 50*time.Millisecond)
+	if !ok {
+		t.Fatal("second acquire should succeed")
+	}
+	// 上限变更：下一次 acquire 重建闸门对象
+	db.SetSetting("max_concurrent_per_account", "3")
+	if _, ok := p.AcquireAccountSlot(a, "free", 50*time.Millisecond); !ok {
+		t.Fatal("acquire after cap change should succeed")
+	}
+	// 旧持有者释放：不得放掉新闸门的 token（修复前会错放，新闸门被放空）
+	rel1()
+	rel2()
+	a1, ok := p.AcquireAccountSlot(a, "free", 50*time.Millisecond)
+	if !ok {
+		t.Fatal("new gate acquire 1 should succeed after stale releases")
+	}
+	a2, ok := p.AcquireAccountSlot(a, "free", 50*time.Millisecond)
+	if !ok {
+		t.Fatal("new gate acquire 2 should succeed after stale releases")
+	}
+	if _, ok := p.AcquireAccountSlot(a, "free", 50*time.Millisecond); ok {
+		t.Fatal("new gate should enforce its own cap after stale releases")
+	}
+	a1()
+	a2()
 }
 
 func TestIsRateLimitBody(t *testing.T) {

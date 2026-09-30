@@ -189,17 +189,19 @@ func TestPerChannelSlotGates(t *testing.T) {
 	a.ID = id
 	db.SetSetting("max_concurrent_per_account", "1")
 
-	if !p.AcquireAccountSlot(a, ChannelFree, 50*time.Millisecond) {
+	relFree, ok := p.AcquireAccountSlot(a, ChannelFree, 50*time.Millisecond)
+	if !ok {
 		t.Fatal("free slot acquire should succeed")
 	}
-	if p.AcquireAccountSlot(a, ChannelFree, 50*time.Millisecond) {
+	if _, ok := p.AcquireAccountSlot(a, ChannelFree, 50*time.Millisecond); ok {
 		t.Fatal("free slot over cap should time out")
 	}
-	if !p.AcquireAccountSlot(a, ChannelPaid, 50*time.Millisecond) {
+	relPaid, ok := p.AcquireAccountSlot(a, ChannelPaid, 50*time.Millisecond)
+	if !ok {
 		t.Fatal("paid slot must be independent of full free slot")
 	}
-	p.ReleaseAccountSlot(a, ChannelPaid)
-	p.ReleaseAccountSlot(a, ChannelFree)
+	relPaid()
+	relFree()
 }
 
 // 付费回退策略读取：默认 free_first，非法值回落

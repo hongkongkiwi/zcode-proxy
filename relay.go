@@ -57,7 +57,7 @@ const (
 const (
 	relayModeFree     = "free"     // 仅免费通道（JWT 两条路径）
 	relayModePaid     = "paid"     // 仅付费通道（API Key 回退端点）
-	relayModeBalanced = "balanced" // 传统级联：同账号免费路径失败立刻试其付费通道
+	relayModeBalanced = "balanced" // 软受限（风控/验证码）就地级联付费；硬失败交阶段二
 )
 
 // protocol 客户端协议类型（决定响应转换）
@@ -130,7 +130,8 @@ func (z *ZCodeAPI) relay(w http.ResponseWriter, r *http.Request, rc *relayCtx) {
 	sessionKey := rc.sessionKey()
 	policy := z.pool.PaidFallbackPolicy()
 
-	// 阶段一：免费通道。balanced 策略保持传统级联语义（同账号免费失败立刻试其付费）
+	// 阶段一：免费通道。balanced 策略下免费侧"软受限"（风控拦截/验证码拒绝）
+	// 立刻同账号试付费通道；硬失败（耗尽/限流/凭证失效）与 free_first 一致交给阶段二
 	freeMode := relayModeFree
 	if policy == PaidModeBalanced {
 		freeMode = relayModeBalanced
@@ -148,8 +149,23 @@ func (z *ZCodeAPI) relay(w http.ResponseWriter, r *http.Request, rc *relayCtx) {
 		}
 	}
 
+	// paidDailyTokenCap 是计费通道（channel=paid）唯一的消费闸：对 never 模式的
+	// keyonly 循环同样生效（纯 API Key 账号的流量全走 paid 归因，不设闸即失控）。
+	// 查询失败按已达上限处理（fail closed）——静默放行会在存储故障期间持续产生计费流量
+	paidCapReason := ""
+	if cap := z.pool.paidDailyTokenCap(); cap > 0 {
+		used, err := z.db.PaidTokensToday()
+		switch {
+		case err != nil:
+			log.Printf("[relay] paid tokens today: %v; treating daily cap as exceeded", err)
+			paidCapReason = "付费通道当日 token 上限状态不可知（fail closed）"
+		case used >= cap:
+			paidCapReason = fmt.Sprintf("付费通道已达当日 token 上限（%s）", truncate(strconv.FormatInt(cap, 10), 20))
+		}
+	}
+
 	// never 策略不进付费阶段，但纯 API Key 账号（无 JWT，付费是唯一通道）仍须可服务
-	if policy == PaidModeNever {
+	if policy == PaidModeNever && paidCapReason == "" {
 		for attempt := 0; attempt < maxAccountAttempts; attempt++ {
 			a := z.pool.SelectStickyChannel(rc.provider, rc.group, sessionKey, tried, ChannelPaidOnly)
 			if a == nil {
@@ -166,20 +182,17 @@ func (z *ZCodeAPI) relay(w http.ResponseWriter, r *http.Request, rc *relayCtx) {
 	// 阶段二：付费回退。走到这里说明免费通道没能写回任何响应（全部受限）。
 	// 策略开关与每日 token 上限都在进入阶段前拦截。
 	triedPaid := map[int64]bool{}
-	paidSkipReason := ""
-	switch {
-	case policy == PaidModeNever:
-		paidSkipReason = "付费回退已关闭（仅免费模式）"
-	default:
-		if cap := z.pool.paidDailyTokenCap(); cap > 0 {
-			if used, err := z.db.PaidTokensToday(); err == nil && used >= cap {
-				paidSkipReason = fmt.Sprintf("付费通道已达当日 token 上限（%s）", truncate(strconv.FormatInt(cap, 10), 20))
-			}
+	paidSkipReason := paidCapReason
+	if paidSkipReason == "" {
+		switch {
+		case policy == PaidModeNever:
+			paidSkipReason = "付费回退已关闭（仅免费模式）"
 		}
 	}
 	if paidSkipReason == "" {
 		if policy == PaidModeBalanced {
-			// balanced 阶段一已试过已选账号的付费通道，不重复打
+			// balanced 阶段一只对软受限（风控/验证码）就地试过付费通道；硬失败的
+			// 账号付费通道其实未打过，但保持历史级联语义：本请求不再回头重打
 			for id := range tried {
 				triedPaid[id] = true
 			}
@@ -274,7 +287,8 @@ func (rc *relayCtx) sessionKey() string {
 //
 //	free     仅免费通道（JWT+验证码 → JWT 直连）；失败统一交给付费回退阶段
 //	paid     仅付费通道（API Key 回退端点）；免费侧受限的账号正是要兜底的对象
-//	balanced 传统级联：免费路径失败立刻试同账号付费通道
+//	balanced 免费侧软受限（风控/验证码）立刻试同账号付费通道；硬失败（耗尽/限流/401）
+//	         不就地级联，统一交给付费回退阶段
 //
 // 实测免费通道要求人机校验（验证码参数 45s 内可复用），直连仅作放宽时的快速路径。
 // 风控拦截（3012）不立即冷却：先试完本模式内其余路径，全部失败才冷却。
@@ -408,8 +422,10 @@ func (z *ZCodeAPI) forwardOnce(w http.ResponseWriter, r *http.Request, a *Accoun
 	rc *relayCtx, start time.Time, pathLabel, channel string) relayOutcome {
 
 	// 每（账号×通道）并发闸门：排队而非打满并发（上游 1302 并发超限的根治手段）。
-	// 排队 45s 仍无名额 → 让位下一候选（10s 短冷却，很快回来）
-	if !z.pool.AcquireAccountSlot(a, channel, 45*time.Second) {
+	// 排队 45s 仍无名额 → 让位下一候选（10s 短冷却，很快回来）。
+	// release 绑定获取时的闸门对象：设置变更重建闸门后旧持有者不会错放新闸门
+	release, ok := z.pool.AcquireAccountSlot(a, channel, 45*time.Second)
+	if !ok {
 		if channel == ChannelPaid {
 			z.pool.MarkPaidCooling(a, "付费通道并发已满（在途请求达到上限），短暂冷却", 10)
 		} else {
@@ -417,7 +433,7 @@ func (z *ZCodeAPI) forwardOnce(w http.ResponseWriter, r *http.Request, a *Accoun
 		}
 		return outcomeNextAccount
 	}
-	defer z.pool.ReleaseAccountSlot(a, channel)
+	defer release()
 
 	// 用量按实际通道归因（付费通道按量计费，paid_daily_token_cap 依赖此标记）
 	a.setUsageChannel(channel)
@@ -543,9 +559,9 @@ func (z *ZCodeAPI) forwardOnce(w http.ResponseWriter, r *http.Request, a *Accoun
 				}
 				z.pool.MarkExhausted(a, "额度已用完")
 				// 走节流+单飞版本：并发请求同时撞上同一耗尽账号时只拉一次 billing
-				go z.RefreshAccountQuotaThrottled(a)
+				z.goBackground("quota-refresh", func() { z.RefreshAccountQuotaThrottled(a) })
 				// 自动重置策略（默认关闭）：耗尽且自然窗口等待超阈值时才消耗重置
-				go z.MaybeAutoReset(a, "relay")
+				z.goBackground("auto-reset", func() { z.MaybeAutoReset(a, "relay") })
 				return outcomeNextAccount
 			}
 
@@ -562,7 +578,7 @@ func (z *ZCodeAPI) forwardOnce(w http.ResponseWriter, r *http.Request, a *Accoun
 		} else {
 			z.pool.MarkUsed(a)
 		}
-		go z.RefreshAccountQuotaThrottled(a)
+		z.goBackground("relay-success-quota", func() { z.RefreshAccountQuotaThrottled(a) })
 		log.Printf("[relay] account %s success via %s [%s] (HTTP %d)", a.DisplayNameOrEmail(), pathLabel, channel, resp.StatusCode)
 
 		contentType := resp.Header.Get("Content-Type")

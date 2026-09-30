@@ -326,7 +326,7 @@ function showQuotaModal(id) {
           <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;border:1px solid var(--c-border);border-radius:8px;padding:8px 12px;margin-bottom:6px;font-size:12.5px">
             <div><b>${esc(c.source)}</b> <span class="badge badge-secondary">${esc(c.plan_tier || '-')}</span>
               ${c.exhausted ? `<span class="badge badge-danger">${t('已耗尽')}</span>` : `<span class="badge badge-success">${t('有余量')}</span>`}</div>
-            <div>${t('剩余 %s', fmtNum(c.remaining))}${c.next_reset ? ` · ${tf('重置 %s', fmtT(c.next_reset))}` : ''}</div>
+            <div>${tf('剩余 %s', fmtNum(c.remaining))}${c.next_reset ? ` · ${tf('重置 %s', fmtT(c.next_reset))}` : ''}</div>
           </div>`).join('')}
       </div>` : ''}
       ${slots.map(s => `
@@ -733,7 +733,10 @@ function pollOAuth() {
       } else if (el && f.status === 'exchanging') {
         el.textContent = t('正在兑换 token 并提取 API Key…');
       }
-    } catch (e) { /* 流程过期 */ }
+    } catch (e) {
+      // 流程过期/会话失效：终止轮询，否则弹窗叠在登录页上 1.5s 一次打 401
+      clearInterval(oauthPollTimer);
+    }
   }, 1500);
 }
 
@@ -1004,7 +1007,7 @@ async function pollRunning() {
         <div class="progress-track" style="flex:1;min-width:120px"><div class="progress-fill" style="width:${s.total ? s.done / s.total * 100 : 0}%"></div></div>
         <span class="rb-meta">${s.done}/${s.total} · ✅${s.success} ❌${s.fail}${s.current_account ? ' · ' + esc(s.current_account) : ''}</span>
       </div>`).join('');
-  } catch (e) { reportLoadError(e); }
+  } catch (e) { /* 5s 轮询：持续失败不占 toast（会盖掉用户操作反馈） */ }
 }
 
 async function loadClaimRecords() {

@@ -9,6 +9,7 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -43,9 +44,27 @@ type ZCodeAPI struct {
 
 	quotaRefreshInflight sync.Map // 账号ID → 刷新中（单飞，防并发请求对 billing 形成风暴）
 
+	bgw sync.WaitGroup // relay 派生的后台任务（停机时 db.Close 前有界等待）
+
 	asyncRotation atomic.Int64 // 闲时通道轮转起点（并发请求分摊账号）
 
 	tokenRefreshInflight sync.Map // 账号ID → refresh_token 兑换中（单飞）
+}
+
+// goBackground 转发路径派生的后台任务（额度刷新/自动重置）：panic 隔离 +
+// 停机计数。main 在 HTTP 排水后、db.Close 前等待 bgw，终态写库（如重置成功
+// 后的 claim record）才不会撞上已关闭的连接被静默吞掉。
+func (z *ZCodeAPI) goBackground(name string, fn func()) {
+	z.bgw.Add(1)
+	go func() {
+		defer z.bgw.Done()
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("[bg] %s panic: %v\n%s", name, r, debug.Stack())
+			}
+		}()
+		fn()
+	}()
 }
 
 // NewZCodeAPI 创建上游 API 封装，并把额度刷新函数注入账号池
@@ -376,7 +395,22 @@ func estimateMessagesTokens(raw json.RawMessage) int {
 
 // HandleModels GET /v1/models — 同时兼容 OpenAI 与 Anthropic 字段
 func (z *ZCodeAPI) HandleModels(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeAPIError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
 	models := z.effectiveModels()
+	// 命名 Key 的白名单同样作用于目录：不允许调用的模型不应出现在其可见
+	// 列表里（转发层本就 403，这里只是不再误导客户端）
+	if gk := gatewayKeyFromCtx(r.Context()); gk != nil {
+		filtered := make([]string, 0, len(models))
+		for _, m := range models {
+			if gk.modelAllowed(strings.ToLower(strings.TrimSpace(m))) {
+				filtered = append(filtered, m)
+			}
+		}
+		models = filtered
+	}
 	now := time.Now().Unix()
 	data := make([]map[string]interface{}, 0, len(models))
 	for _, m := range models {
