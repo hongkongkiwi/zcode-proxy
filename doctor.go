@@ -48,6 +48,13 @@ func runDoctor(cfg *FileConfig, db *DB) int {
 		ok("vault", "AES-256-GCM 加解密回环通过")
 	}
 
+	// 3.5 验证码求解浏览器（离线 stat，不打上游）
+	if bin := findRealBrowser(); bin == "" {
+		warn("captcha_browser", "未找到本机真实 Chrome/Edge（将回退 rod 托管 Chromium，易被阿里云风控识别；有头手动档不可用）")
+	} else {
+		ok("captcha_browser", bin)
+	}
+
 	// 4. 账号状态
 	if counts, err := db.CountAccountsByStatus(); err != nil {
 		bad("accounts", err.Error())

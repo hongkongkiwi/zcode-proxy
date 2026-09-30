@@ -456,6 +456,14 @@ func (z *ZCodeAPI) forwardOnce(w http.ResponseWriter, r *http.Request, a *Accoun
 			resp.Body.Close()
 			text := string(body)
 
+			// Cloudflare/WAF 人机挑战页：出口 IP/风控档位问题，与凭证无关——
+			// 既不能走下方 401/403 分支误杀账号，也不能当验证码被拒触发重解；
+			// 只冷却本账号该通道（同出口其他账号/路径先顶上）
+			if isCloudflareChallenge(resp.Header, text) {
+				z.markChannelFailure(a, channel, fmt.Sprintf("Cloudflare/WAF 挑战 HTTP %d", resp.StatusCode), 300)
+				return outcomeNextAccount
+			}
+
 			// 验证码被拒：失效缓存 → 重解 → 带新参数重试本路径
 			if isCaptchaError(text) && (resp.StatusCode == 400 || resp.StatusCode == 401 || resp.StatusCode == 403) {
 				if verifyParam != "" && attempt+1 < retries {
@@ -706,9 +714,31 @@ func rcModel(payload []byte) string {
 	return b.Model
 }
 
+// isCloudflareChallenge 判定是否 Cloudflare/WAF 人机挑战页
+// （cf-mitigated 头或挑战页指纹）。命中说明是出口 IP/风控档位问题：
+// 与账号凭证无关，也与阿里云验证码无关——调用方既不能据此判死账号
+// （401/403 凭证分支会误杀），也不能当验证码被拒触发重解。
+func isCloudflareChallenge(header http.Header, text string) bool {
+	if header.Get("Cf-Mitigated") == "challenge" {
+		return true
+	}
+	low := strings.ToLower(text)
+	for _, m := range []string{
+		"just a moment", "attention required", "checking your browser",
+		"verifying you are human", "cf-challenge", "challenge-platform",
+		"_cf_chl_opt", "cf-browser-verification", "cf-error-details",
+	} {
+		if strings.Contains(low, m) {
+			return true
+		}
+	}
+	return false
+}
+
 func isCaptchaError(text string) bool {
 	low := strings.ToLower(text)
-	for _, m := range []string{"captcha", "verify token", "verify failed", "human verification", "verifycode"} {
+	for _, m := range []string{"captcha", "verify token", "verify failed", "verifycode", "human verification",
+		"人机验证", "请完成验证", "安全验证"} {
 		if strings.Contains(low, m) {
 			return true
 		}
