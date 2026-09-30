@@ -43,6 +43,7 @@
 <nav class="pill-nav">
 <a class="nav-link active" data-section="dashboard"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="9" rx="1.5"/><rect x="14" y="3" width="7" height="5" rx="1.5"/><rect x="14" y="12" width="7" height="9" rx="1.5"/><rect x="3" y="16" width="7" height="5" rx="1.5"/></svg><span data-i18n="仪表盘">仪表盘</span></a>
 <a class="nav-link" data-section="accounts"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg><span data-i18n="账号管理">账号管理</span></a>
+<a class="nav-link" data-section="keys"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M21 2l-2 2m-7.61 7.61a5.5 5.5 0 1 1-7.778 7.778 5.5 5.5 0 0 1 7.777-7.777zm0 0L15.5 7.5m0 0l3 3L22 7l-3-3m-3.5 3.5L19 4"/></svg><span data-i18n="网关 Key / API Keys">网关 Key / API Keys</span></a>
 <a class="nav-link" data-section="activity"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M20 12v6a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2v-6"/><path d="M12 3v13m0-13l-4 4m4-4l4 4"/></svg><span data-i18n="活动任务">活动任务</span></a>
 <a class="nav-link" data-section="usage"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/><path d="M8 13h8M8 17h5"/></svg><span data-i18n="使用记录">使用记录</span></a>
 <a class="nav-link" data-section="llmtest"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2L3 14h7l-1 8 10-12h-7z"/></svg><span data-i18n="LLM 测试">LLM 测试</span></a>
@@ -83,13 +84,16 @@
 
 <!-- 仪表盘 -->
 <div class="section active" id="section-dashboard">
-<div class="stats-bar" style="grid-template-columns:repeat(6,1fr)">
+<div class="stats-bar" style="grid-template-columns:repeat(9,1fr)">
 <div class="stat-card blue"><div class="stat-body"><div class="label" data-i18n="总账号数">总账号数</div><div class="value" id="statTotal">-</div></div></div>
 <div class="stat-card green"><div class="stat-body"><div class="label" data-i18n="可用账号">可用账号</div><div class="value" id="statSelectable">-</div></div></div>
 <div class="stat-card orange"><div class="stat-body"><div class="label" data-i18n="总剩余额度">总剩余额度</div><div class="value" id="statRemaining">-</div></div></div>
 <div class="stat-card blue"><div class="stat-body"><div class="label" data-i18n="7日请求数">7日请求数</div><div class="value" id="statRequests">-</div></div></div>
 <div class="stat-card blue"><div class="stat-body"><div class="label" data-i18n="7日 Tokens">7日 Tokens</div><div class="value" id="statTokens">-</div></div></div>
 <div class="stat-card green"><div class="stat-body"><div class="label" data-i18n="平均首字延迟">平均首字延迟</div><div class="value" id="statTtft">-</div></div></div>
+<div class="stat-card green"><div class="stat-body"><div class="label" data-i18n="成功率">成功率</div><div class="value" id="statSuccess">-</div></div></div>
+<div class="stat-card purple"><div class="stat-body"><div class="label" data-i18n="缓存命中率">缓存命中率</div><div class="value" id="statCacheHit">-</div></div></div>
+<div class="stat-card blue"><div class="stat-body"><div class="label" data-i18n="TTFT P50 / P95">TTFT P50 / P95</div><div class="value" id="statTtftP" style="font-size:17px">-</div></div></div>
 </div>
 <div class="card">
 <div class="card-header"><h2 data-i18n="系统状态">系统状态</h2><button class="btn btn-sm btn-secondary" onclick="loadDashboard()" data-i18n="刷新">刷新</button></div>
@@ -118,6 +122,18 @@
 </div>
 </div>
 
+<!-- 网关 Key -->
+<div class="section" id="section-keys">
+<div class="toolbar">
+<button class="btn btn-sm btn-primary" onclick="showKeyModal()" data-i18n="+ 新建 Key">+ 新建 Key</button>
+<button class="btn btn-sm btn-secondary" onclick="loadKeys()" data-i18n="刷新">刷新</button>
+</div>
+<div class="card">
+<div class="card-header"><h2 data-i18n="网关 Key / API Keys">网关 Key / API Keys</h2></div>
+<div id="keysTable"><div class="empty"><p data-i18n="加载中…">加载中…</p></div></div>
+</div>
+</div>
+
 <!-- 活动任务 -->
 <div class="section" id="section-activity">
 <div id="planRunningBar"></div>
@@ -137,16 +153,23 @@
 
 <!-- 使用记录 -->
 <div class="section" id="section-usage">
-<div class="stats-bar" style="grid-template-columns:repeat(5,1fr)">
+<div class="stats-bar" style="grid-template-columns:repeat(7,1fr)">
 <div class="stat-card blue"><div class="stat-body"><div class="label" data-i18n="7日请求">7日请求</div><div class="value" id="uStatReq">-</div></div></div>
 <div class="stat-card green"><div class="stat-body"><div class="label" data-i18n="输入 Tokens">输入 Tokens</div><div class="value" id="uStatIn">-</div></div></div>
 <div class="stat-card orange"><div class="stat-body"><div class="label" data-i18n="输出 Tokens">输出 Tokens</div><div class="value" id="uStatOut">-</div></div></div>
 <div class="stat-card purple"><div class="stat-body"><div class="label" data-i18n="平均耗时">平均耗时</div><div class="value" id="uStatDur">-</div></div></div>
 <div class="stat-card blue"><div class="stat-body"><div class="label" data-i18n="平均 TTFT">平均 TTFT</div><div class="value" id="uStatTtft">-</div></div></div>
+<div class="stat-card green"><div class="stat-body"><div class="label" data-i18n="成功率">成功率</div><div class="value" id="uStatSuccess">-</div></div></div>
+<div class="stat-card purple"><div class="stat-body"><div class="label" data-i18n="缓存命中率">缓存命中率</div><div class="value" id="uStatCacheHit">-</div></div></div>
 </div>
 <div class="card">
 <div class="card-header"><h2 data-i18n="使用记录">使用记录</h2><button class="btn btn-sm btn-secondary" onclick="loadUsageRecords()" data-i18n="刷新">刷新</button></div>
 <div id="usageTable"><div class="empty"><p data-i18n="暂无使用记录">暂无使用记录</p></div></div>
+</div>
+<div class="card">
+<div class="card-header"><h2 data-i18n="按网关 Key 与按天统计（7 日）">按网关 Key 与按天统计（7 日）</h2><button class="btn btn-sm btn-secondary" onclick="loadUsageStats()" data-i18n="刷新">刷新</button></div>
+<div style="padding:20px" id="byKeyStats"><div class="empty"><p data-i18n="加载中…">加载中…</p></div></div>
+<div style="padding:0 20px 20px" id="dailyStats"></div>
 </div>
 </div>
 
@@ -252,6 +275,10 @@
 <div class="form-group" style="margin-bottom:16px">
 <label class="form-label" data-i18n="会话粘滞">会话粘滞</label>
 <div><label style="display:inline-flex;align-items:center;gap:6px;font-size:13px"><input type="checkbox" id="setSticky" style="width:auto" checked data-i18n="同一会话固定同一账号（保住上游 prompt 缓存，更省额度）">同一会话固定同一账号（保住上游 prompt 缓存，更省额度）</label></div>
+</div>
+<div class="form-group" style="margin-bottom:16px">
+<label class="form-label" data-i18n="系统提示词缓存断点">系统提示词缓存断点</label>
+<div><label style="display:inline-flex;align-items:center;gap:6px;font-size:13px"><input type="checkbox" id="setPromptCacheBreakpoint" style="width:auto"><span data-i18n="在 system 末块标记 cache_control，命中上游提示缓存后按缓存价计费；上游不支持时可关闭">在 system 末块标记 cache_control，命中上游提示缓存后按缓存价计费；上游不支持时可关闭</span></label></div>
 </div>
 <div class="form-group" style="margin-bottom:16px">
 <label class="form-label" data-i18n="额度自动刷新间隔（秒，0=关闭）">额度自动刷新间隔（秒，0=关闭）</label>

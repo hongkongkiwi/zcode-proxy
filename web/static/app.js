@@ -62,6 +62,11 @@ function fmtNum(n) {
   return String(Math.round(n));
 }
 
+// pctText 比例（0~1）转百分比文案；后端未返回（无样本/旧数据）时显示 -
+function pctText(v) {
+  return (v === null || v === undefined || isNaN(v)) ? '-' : (v * 100).toFixed(1) + '%';
+}
+
 function fmtEpoch(sec) {
   if (!sec) return '-';
   const d = new Date(sec * 1000);
@@ -164,6 +169,7 @@ function switchSection(name) {
   document.querySelectorAll('.section').forEach(s => s.classList.toggle('active', s.id === 'section-' + name));
   if (name === 'dashboard') loadDashboard();
   if (name === 'accounts') { loadGroups(); loadAccounts(); }
+  if (name === 'keys') loadKeys();
   if (name === 'activity') { loadPlans(); loadClaimRecords(); loadPlanRuns(); }
   if (name === 'usage') { loadUsageStats(); loadUsageRecords(); }
   if (name === 'llmtest') { loadLlmKey(); initLlmPlaceholders(); }
@@ -203,6 +209,10 @@ async function loadDashboard() {
     document.getElementById('statRequests').textContent = fmtNum(u.requests);
     document.getElementById('statTokens').textContent = fmtNum(u.total_tokens);
     document.getElementById('statTtft').textContent = (u.avg_ttft_ms || 0) + 'ms';
+    document.getElementById('statSuccess').textContent = pctText(u.success_rate);
+    document.getElementById('statCacheHit').textContent = pctText(u.cache_hit_rate);
+    document.getElementById('statTtftP').textContent = u.p50_ttft_ms != null
+      ? (u.p50_ttft_ms || 0) + '/' + (u.p95_ttft_ms || 0) + 'ms' : '-';
 
     const cap = d.captcha || {};
     document.getElementById('dashStatus').innerHTML = `
@@ -696,6 +706,115 @@ function cancelOAuth() {
   closeModal();
 }
 
+// ---- 网关 Key ----
+
+let keysCache = [];
+
+async function loadKeys() {
+  try {
+    const d = await api('/api/keys');
+    keysCache = d.keys || [];
+    renderKeys();
+  } catch (e) { toast(e.message, 'error'); }
+}
+
+// keyQuotaCell 配额列：quota_total=0 不限（不画进度条），否则 已用/总量 + 进度条
+function keyQuotaCell(k) {
+  if (!k.quota_total) return `<span style="color:var(--c-text-lighter)">${t('不限')}</span>`;
+  const pct = Math.min(100, (k.quota_used || 0) / k.quota_total * 100);
+  return `<div class="quota-bar"><div class="progress-track" style="flex:1"><div class="progress-fill" style="width:${pct}%"></div></div>
+    <span class="quota-num">${fmtNum(k.quota_used)} / ${fmtNum(k.quota_total)}</span></div>`;
+}
+
+function renderKeys() {
+  const el = document.getElementById('keysTable');
+  if (!el) return;
+  if (!keysCache.length) {
+    el.innerHTML = `<div class="empty"><p>${t('暂无网关 Key，点击「+ 新建 Key」创建')}</p></div>`;
+    return;
+  }
+  el.innerHTML = `<div class="table-wrap"><table>
+    <thead><tr><th>${t('名称')}</th><th>${t('Key 前缀')}</th><th>${t('状态')}</th><th>RPM</th><th>${t('配额')}</th><th>${t('模型')}</th><th>${t('最近使用')}</th><th style="width:190px">${t('操作')}</th></tr></thead>
+    <tbody>${keysCache.map(k => `
+      <tr>
+        <td style="font-weight:700">${esc(k.name)}</td>
+        <td class="mono">${esc(k.key_prefix || '-')}</td>
+        <td>${k.enabled ? `<span class="badge badge-success">${t('启用')}</span>` : `<span class="badge badge-secondary">${t('停用')}</span>`}</td>
+        <td>${k.rpm_limit ? k.rpm_limit : `<span style="color:var(--c-text-lighter)">${t('不限')}</span>`}</td>
+        <td style="min-width:150px">${keyQuotaCell(k)}</td>
+        <td style="max-width:160px" title="${esc(k.models || '')}">${k.models ? `<span class="mono">${esc(k.models)}</span>` : `<span style="color:var(--c-text-lighter)">${t('全部')}</span>`}</td>
+        <td style="font-size:12px">${fmtAgo(k.last_used_at)}</td>
+        <td class="actions-cell">
+          <button class="btn btn-sm ${k.enabled ? 'btn-secondary' : 'btn-primary'}" onclick="toggleKey(${k.id})">${k.enabled ? t('停用') : t('启用')}</button>
+          <button class="btn btn-sm btn-secondary" onclick="showKeyModal(${k.id})">${t('编辑')}</button>
+          <button class="btn btn-sm btn-danger" onclick="deleteKey(${k.id})">${t('删除')}</button>
+        </td>
+      </tr>`).join('')}</tbody></table></div>`;
+}
+
+function showKeyModal(id) {
+  const k = keysCache.find(x => x.id === id) || {};
+  openModal(`<h3>${id ? t('编辑网关 Key') : t('新建网关 Key')}</h3>
+    <div class="form-group"><label>${t('名称')}</label><input type="text" id="keyName" value="${esc(k.name || '')}" placeholder="${t('例如：ci-机器人')}"></div>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px">
+      <div class="form-group"><label>${t('RPM 限制（0=不限）')}</label><input type="number" id="keyRpm" class="form-input" min="0" max="100000" value="${k.rpm_limit ?? ''}" placeholder="${t('0=不限')}"></div>
+      <div class="form-group"><label>${t('总配额（tokens，0=不限）')}</label><input type="number" id="keyQuota" class="form-input" min="0" value="${k.quota_total ?? ''}" placeholder="${t('0=不限')}"></div>
+    </div>
+    <div class="form-group"><label>${t('模型白名单（逗号分隔，留空=全部）')}</label><input type="text" id="keyModels" class="form-input mono" value="${esc(k.models || '')}" placeholder="${t('glm-5.3,glm-5.2 留空=全部')}"></div>
+    <div class="actions"><button class="btn btn-secondary" onclick="closeModal()">${t('取消')}</button>
+    <button class="btn btn-primary" onclick="saveKey(${id || 0})">${t('保存')}</button></div>`);
+}
+
+async function saveKey(id) {
+  const name = document.getElementById('keyName').value.trim();
+  if (!name) return toast(t('请填写名称'), 'error');
+  const body = {
+    name,
+    rpm_limit: Number(document.getElementById('keyRpm').value || 0),
+    quota_total: Number(document.getElementById('keyQuota').value || 0),
+    models: document.getElementById('keyModels').value.trim(),
+  };
+  try {
+    if (id) {
+      await api('/api/keys/' + id, { method: 'PUT', body });
+      closeModal(); toast(t('已保存'));
+    } else {
+      const r = await api('/api/keys', { method: 'POST', body });
+      showCreatedKey((r && r.key) || {});
+    }
+    loadKeys();
+  } catch (e) { toast(e.message, 'error'); }
+}
+
+// showCreatedKey 明文 Key 仅创建响应返回一次：模态突出展示 + 复制按钮 + 不再显示警告
+function showCreatedKey(k) {
+  openModal(`<h3>${t('网关 Key 已创建')}</h3>
+    <div class="warn-box">${t('请立即保存明文 Key，关闭后不再显示！')}</div>
+    <div style="display:flex;gap:8px;align-items:center;margin-bottom:12px">
+      <code id="newKeyPlain" style="flex:1;padding:10px 12px;font-size:13px;word-break:break-all;white-space:normal">${esc(k.key || '')}</code>
+      <button class="btn btn-secondary" onclick="copyToClipboard(document.getElementById('newKeyPlain').textContent)">${t('复制')}</button>
+    </div>
+    <div class="hint">${t('Key 前缀')}: <span class="mono">${esc(k.key_prefix || '-')}</span></div>
+    <div class="actions"><button class="btn btn-primary" onclick="closeModal()">${t('我已保存，关闭')}</button></div>`);
+}
+
+async function toggleKey(id) {
+  const k = keysCache.find(x => x.id === id);
+  if (!k) return;
+  try {
+    await api('/api/keys/' + id, { method: 'PUT', body: { enabled: !k.enabled } });
+    toast(k.enabled ? t('已停用') : t('已启用'));
+    loadKeys();
+  } catch (e) { toast(e.message, 'error'); }
+}
+
+async function deleteKey(id) {
+  const k = keysCache.find(x => x.id === id);
+  if (!confirm(tf('确认删除网关 Key %s？此操作不可恢复。', k ? k.name : '#' + id))) return;
+  try { await api('/api/keys/' + id, { method: 'DELETE' }); toast(t('已删除')); loadKeys(); }
+  catch (e) { toast(e.message, 'error'); }
+}
+
 // ---- 活动计划 ----
 
 let plansCache = [];
@@ -891,6 +1010,17 @@ async function loadPlanRuns() {
 
 // ---- 使用记录 ----
 
+// dailySparkline 按天请求数的纯字符串 SVG 折线（无依赖；不足两个点不画）
+function dailySparkline(daily) {
+  const vals = (daily || []).map(d => Number(d.requests || 0));
+  if (vals.length < 2) return '';
+  const max = Math.max(...vals, 1);
+  const W = 560, H = 40;
+  const step = W / (vals.length - 1);
+  const pts = vals.map((v, i) => (i * step).toFixed(1) + ',' + (H - 4 - v / max * (H - 8)).toFixed(1)).join(' ');
+  return `<svg width="${W}" height="${H}" viewBox="0 0 ${W} ${H}" style="max-width:100%;display:block"><defs><linearGradient id="sparkGrad" x1="0" y1="0" x2="1" y2="0"><stop stop-color="#6366f1"/><stop offset="1" stop-color="#ec4899"/></linearGradient></defs><polyline points="${pts}" fill="none" stroke="url(#sparkGrad)" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/></svg>`;
+}
+
 async function loadUsageStats() {
   try {
     const u = await api('/api/stats?days=7');
@@ -899,6 +1029,33 @@ async function loadUsageStats() {
     document.getElementById('uStatOut').textContent = fmtNum(u.completion_tokens);
     document.getElementById('uStatDur').textContent = (u.avg_duration_ms || 0) + 'ms';
     document.getElementById('uStatTtft').textContent = (u.avg_ttft_ms || 0) + 'ms';
+    document.getElementById('uStatSuccess').textContent = pctText(u.success_rate);
+    document.getElementById('uStatCacheHit').textContent = pctText(u.cache_hit_rate);
+
+    // 按下游网关 Key 分布（root 请求的 key_name 为空，后端已归并为 "(root)"）
+    const byKey = Object.entries(u.by_gateway_key || {}).sort((a, b) => (b[1].requests || 0) - (a[1].requests || 0));
+    document.getElementById('byKeyStats').innerHTML = byKey.length ? `<div class="table-wrap"><table>
+      <thead><tr><th>${t('网关 Key')}</th><th>${t('请求数')}</th><th>Tokens</th></tr></thead>
+      <tbody>${byKey.map(([id, v]) => `<tr>
+        <td>${esc(v.name || ('#' + id))}${id !== '0' ? ` <span class="mono" style="color:var(--c-text-lighter)">#${esc(id)}</span>` : ''}</td>
+        <td>${fmtNum(v.requests)}</td>
+        <td>${fmtNum(v.tokens)}</td>
+      </tr>`).join('')}</tbody></table></div>` : `<div class="empty"><p>${t('暂无数据')}</p></div>`;
+
+    // 按天趋势：sparkline + 明细表
+    const daily = u.daily || [];
+    const dayEl = document.getElementById('dailyStats');
+    if (!dayEl) return;
+    if (!daily.length) { dayEl.innerHTML = `<div class="empty"><p>${t('暂无数据')}</p></div>`; return; }
+    dayEl.innerHTML = `<div style="margin-bottom:10px">${dailySparkline(daily)}</div>
+      <div class="table-wrap"><table>
+      <thead><tr><th>${t('日期')}</th><th>${t('请求数')}</th><th>Tokens</th><th>${t('缓存命中')}</th></tr></thead>
+      <tbody>${daily.map(d => `<tr>
+        <td style="font-size:12px">${esc(d.day)}</td>
+        <td>${fmtNum(d.requests)}</td>
+        <td>${fmtNum(d.tokens)}</td>
+        <td>${d.cache_read_tokens ? fmtNum(d.cache_read_tokens) : '-'}</td>
+      </tr>`).join('')}</tbody></table></div>`;
   } catch (e) { /* ignore */ }
 }
 
@@ -909,14 +1066,16 @@ async function loadUsageRecords() {
     const recs = d.records || [];
     if (!recs.length) { el.innerHTML = `<div class="empty"><p>${t('暂无使用记录')}</p></div>`; return; }
     el.innerHTML = `<div class="table-wrap"><table>
-      <thead><tr><th>${t('时间')}</th><th>${t('账号')}</th><th>${t('模型')}</th><th>${t('输入')}</th><th>${t('输出')}</th><th>${t('合计')}</th><th>${t('流式')}</th><th>${t('状态')}</th><th>${t('耗时')}</th><th>TTFT</th></tr></thead>
+      <thead><tr><th>${t('时间')}</th><th>${t('账号')}</th><th>Key</th><th>${t('模型')}</th><th>${t('输入')}</th><th>${t('输出')}</th><th>${t('合计')}</th><th>${t('缓存命中')}</th><th>${t('流式')}</th><th>${t('状态')}</th><th>${t('耗时')}</th><th>TTFT</th></tr></thead>
       <tbody>${recs.map(r => `<tr>
         <td style="font-size:12px">${esc(r.created_at)}</td>
         <td>${esc(r.email || ('#' + r.account_id))}</td>
+        <td>${r.key_name ? esc(r.key_name) : '<span style="color:var(--c-text-lighter)">-</span>'}</td>
         <td>${esc(r.model)}</td>
         <td>${fmtNum(r.prompt_tokens)}</td>
         <td>${fmtNum(r.completion_tokens)}</td>
         <td><b>${fmtNum(r.total_tokens)}</b></td>
+        <td>${r.cache_read_tokens ? fmtNum(r.cache_read_tokens) : '-'}</td>
         <td>${r.stream ? '✓' : '-'}</td>
         <td>${r.status_code === 200 ? '<span class="badge badge-success">200</span>' : `<span class="badge badge-danger">${r.status_code}</span>`}</td>
         <td>${(r.duration_ms / 1000).toFixed(1)}s</td>
@@ -936,6 +1095,7 @@ async function loadSettings() {
     document.getElementById('setCaptchaMode').value = s.captcha_mode || 'auto';
     document.getElementById('setGatewayModels').value = s.gateway_models || '';
     document.getElementById('setSticky').checked = !(s.sticky_sessions === '0' || s.sticky_sessions === 'false');
+    document.getElementById('setPromptCacheBreakpoint').checked = s.prompt_cache_breakpoint === '1';
     document.getElementById('setMaxConcurrent').value = s.max_concurrent_per_account || '3';
     window._fpCurrent = s.fingerprint || 'chrome';
     window._ja3Current = s.custom_ja3 || '';
@@ -989,6 +1149,7 @@ async function saveStrategySettings() {
       selection_strategy: document.getElementById('setStrategy').value,
       quota_refresh_interval: document.getElementById('setQuotaInterval').value,
       sticky_sessions: document.getElementById('setSticky').checked ? '1' : '0',
+      prompt_cache_breakpoint: document.getElementById('setPromptCacheBreakpoint').checked ? '1' : '0',
       max_concurrent_per_account: document.getElementById('setMaxConcurrent').value || '3',
     }});
     toast(t('策略已保存'));

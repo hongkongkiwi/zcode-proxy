@@ -387,6 +387,8 @@ func (db *DB) initSchema() error {
 		"custom_ja3":             "",
 		"captcha_mode":           "auto",
 		"gateway_models":         "",
+		// R5 prompt-cache 断点默认关闭（上游各通道对 cache_control 支持未全量实测）
+		"prompt_cache_breakpoint": "0",
 	}
 	for k, v := range defaults {
 		if _, err := db.conn.Exec(
