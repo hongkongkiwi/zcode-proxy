@@ -845,6 +845,7 @@ var settingsWhitelist = map[string]bool{
 	"captcha_prewarm":         true,
 	"auto_claim_promos":       true, "auto_claim_interval_minutes": true, "auto_claim_delay_seconds": true,
 	"auto_reset_enabled": true, "auto_reset_min_wait_minutes": true, "auto_reset_min_wait_week_hours": true,
+	"auto_reset_expiry_spend_minutes": true,
 	"max_concurrent_per_account": true,
 	// 免费优先 / 付费回退策略
 	"paid_fallback_mode": true, "paid_daily_token_cap": true,
