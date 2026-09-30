@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -102,7 +103,14 @@ func NewAuthManager(db *DB, password string) *AuthManager {
 				} else {
 					db.SetDefaultPasswordFlag(true)
 				}
-				log.Printf("[auth] initial admin password: %s (change it in the web UI)", pw)
+				// 口令明文不再进日志（Docker 里日志长期留存等于永久泄露）：
+				// 写入数据目录 0600 文件，日志只给路径。尽力而为——文件写不了
+				// 时必须回落日志明文，宁可泄露也不能把全新安装静默锁在门外
+				if path, ok := writeInitialAdminPasswordFile(db, pw); ok {
+					log.Printf("[auth] initial admin password written to %s (0600; change it in the web UI)", path)
+				} else {
+					log.Printf("[auth] initial admin password: %s (change it in the web UI)", pw)
+				}
 			} else {
 				log.Printf("[auth] generate admin password failed: %v", err)
 			}
@@ -119,6 +127,27 @@ func NewAuthManager(db *DB, password string) *AuthManager {
 // maxPasswordBytes bcrypt 只取前 72 字节，超长口令在 x/crypto 中直接报错；
 // 请求路径上必须在哈希前拒绝，而不是让服务进程退出
 const maxPasswordBytes = 72
+
+// initialAdminPasswordFile 引导口令落盘文件名（数据目录内，0600）
+const initialAdminPasswordFile = "initial_admin_password"
+
+// writeInitialAdminPasswordFile 把引导管理口令写入数据目录（vault.key 同目录）。
+// 返回 (文件路径, true)；数据目录不可定位/写入失败返回 false（调用方回落日志明文）。
+// 已有同名文件（如上次安装残留）直接覆盖：里面是旧库的失效口令，保留只会误导。
+func writeInitialAdminPasswordFile(db *DB, pw string) (string, bool) {
+	dir := vaultDataDir(db)
+	if dir == "" {
+		return "", false
+	}
+	path := filepath.Join(dir, initialAdminPasswordFile)
+	if err := os.WriteFile(path, []byte(pw+"\n"), 0600); err != nil {
+		log.Printf("[auth] WARNING: write %s failed: %v", path, err)
+		return "", false
+	}
+	// umask 可能放宽权限，显式收紧（与 writeVaultKeyFile 同一处理）
+	os.Chmod(path, 0600)
+	return path, true
+}
 
 // hashPassword bcrypt 哈希（新口令）；输入超长返回错误而非崩溃
 func hashPassword(pwd string) (string, error) {
@@ -283,18 +312,25 @@ func (am *AuthManager) Login(username, password, clientIP string) (string, bool,
 	// 假登录把管理员的导出/改密 step-up 锁死
 	rateKey := "login|" + clientIP + "|" + username
 	if wait := am.checkLoginRate(rateKey); wait > 0 {
-		return "", false, wait
-	}
-
-	// 口令验证（bcrypt 比较耗时数十至百毫秒）放在会话锁外，
-	// 避免登录风暴期间阻塞所有持读锁的 /api 请求
-	if username != am.adminUser() {
-		am.recordLoginFail(rateKey)
-		return "", false, 0
-	}
-	if !am.verifyPassword(password) {
-		am.recordLoginFail(rateKey)
-		return "", false, 0
+		// 治疗性旁路：锁定中仍执行完整口令验证，口令正确即清除失败状态并正常登录。
+		// 锁定器防的是噪音爆破（20 位随机口令不可穷举），不该变成同 IP 攻击者
+		// 5 次假登录就能对真实管理员无限续期的自我拒绝服务。口令错误时按原样
+		// 返回锁定等待，且不记新失败（不续期锁定，与原短路行为一致）
+		if username != am.adminUser() || !am.verifyPassword(password) {
+			return "", false, wait
+		}
+		// 走到下方正常登录路径：clearLoginFail 会摘除失败状态
+	} else {
+		// 口令验证（bcrypt 比较耗时数十至百毫秒）放在会话锁外，
+		// 避免登录风暴期间阻塞所有持读锁的 /api 请求
+		if username != am.adminUser() {
+			am.recordLoginFail(rateKey)
+			return "", false, 0
+		}
+		if !am.verifyPassword(password) {
+			am.recordLoginFail(rateKey)
+			return "", false, 0
+		}
 	}
 
 	am.mu.Lock()
@@ -545,12 +581,57 @@ func (am *AuthManager) HandleChangePassword(w http.ResponseWriter, r *http.Reque
 }
 
 // HandleGetAPIKey GET /api/settings/api-key
+// 只回存在性与脱敏形状，绝不回明文：GET 端点仅凭 session 即可访问，
+// 明文返回等于 stolen session（XSS/失窃 cookie）直接拿走根 Key。
+// 明文经 POST /api/settings/api-key/reveal 的口令步进重认证获取（对齐导出）。
 func (am *AuthManager) HandleGetAPIKey(w http.ResponseWriter, r *http.Request) {
 	key, err := am.db.GetAPIKey()
 	if err != nil {
 		writeAPIError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	resp := map[string]interface{}{"has_api_key": key != ""}
+	if key != "" {
+		masked := "****"
+		if len(key) > 12 {
+			masked = key[:8] + "…" + key[len(key)-4:]
+		}
+		resp["api_key_masked"] = masked
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// HandleRevealAPIKey POST /api/settings/api-key/reveal
+// 步进重认证展示根 Key 明文：需再次提供当前管理口令。独立限速键 ip|api-key-reveal
+// （与登录的 ip|user 分开计数），同样指数退避——stolen session 无法无节流爆破
+// 管理员口令。与导出（handleExportBundle）同一模式，无治疗性旁路：
+// 展示不是登录，锁死只影响这次主动操作。
+func (am *AuthManager) HandleRevealAPIKey(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		VerifyPassword string `json:"verify_password"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeAPIError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	rateKey := clientIP(r) + "|api-key-reveal"
+	if wait := am.checkLoginRate(rateKey); wait > 0 {
+		writeAPIError(w, http.StatusTooManyRequests,
+			fmt.Sprintf("尝试过于频繁，请 %d 秒后再试", int(wait.Seconds())+1))
+		return
+	}
+	if !am.verifyPassword(body.VerifyPassword) {
+		am.recordLoginFail(rateKey)
+		writeAPIError(w, http.StatusUnauthorized, "管理员密码验证失败，请输入当前管理员密码")
+		return
+	}
+	am.clearLoginFail(rateKey)
+	key, err := am.db.GetAPIKey()
+	if err != nil {
+		writeAPIError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	log.Printf("[auth] API key revealed after password step-up")
 	writeJSON(w, http.StatusOK, map[string]interface{}{"api_key": key, "has_api_key": key != ""})
 }
 

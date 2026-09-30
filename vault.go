@@ -843,5 +843,34 @@ func (db *DB) MigrateVault() error {
 	return nil
 }
 
-// vaultSecretSettings 需要静态加密的设置键
-var vaultSecretSettings = []string{"api_key", "password_hash"}
+// vaultSecretSettings 需要静态加密的设置键。
+// upstream_proxy 形如 socks5://user:pass@host:port——内嵌的代理凭据与账号列
+// 同一威胁模型：stolen zcode.db 不得直接读出出口代理凭据。加入本表后
+// SetSetting/GetSetting 透明加解密，MigrateVault 启动时会把存量明文值
+// 一次性加密（encrypt-if-plaintext，幂等），盘点/轮换/合并范围自动覆盖。
+var vaultSecretSettings = []string{"api_key", "password_hash", "upstream_proxy"}
+
+// vaultDataDir 返回 DB 文件所在目录（= vault.key 同目录 = 数据目录）。
+// 调用方（NewAuthManager 的引导逻辑）只持有 *DB、拿不到 dbPath，
+// 从连接本身的 PRAGMA database_list 取主库文件路径；拿不到（内存库/未挂载）返回 ""。
+func vaultDataDir(db *DB) string {
+	if db == nil || db.conn == nil {
+		return ""
+	}
+	rows, err := db.conn.Query(`PRAGMA database_list`)
+	if err != nil {
+		return ""
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var seq int
+		var name, file string
+		if rows.Scan(&seq, &name, &file) != nil {
+			continue
+		}
+		if name == "main" && file != "" {
+			return filepath.Dir(file)
+		}
+	}
+	return ""
+}

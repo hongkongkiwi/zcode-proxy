@@ -43,6 +43,7 @@ func (s *APIServer) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/auth/check", s.auth.HandleCheckAuth)
 	mux.HandleFunc("POST /api/auth/password", s.auth.HandleChangePassword)
 	mux.HandleFunc("GET /api/settings/api-key", s.auth.HandleGetAPIKey)
+	mux.HandleFunc("POST /api/settings/api-key/reveal", s.auth.HandleRevealAPIKey)
 	mux.HandleFunc("POST /api/settings/api-key/generate", s.auth.HandleGenerateAPIKey)
 
 	// 仪表盘
@@ -863,6 +864,16 @@ func (s *APIServer) handleGetSettings(w http.ResponseWriter, r *http.Request) {
 	if k, ok := all["api_key"]; ok && k != "" {
 		all["has_api_key"] = "1"
 		delete(all, "api_key")
+	}
+	// upstream_proxy 已入 vault 机密表：AllSettings 返回的是原始密文。
+	// UI 需要可编辑的明文回填，用 GetSetting（透明解密）替换；读取出错时
+	// 删键而非回传密文——密文被 UI 原样回写虽幂等，但会把乱码当配置展示
+	if _, ok := all["upstream_proxy"]; ok {
+		if v, err := s.db.GetSetting("upstream_proxy"); err == nil {
+			all["upstream_proxy"] = v
+		} else {
+			delete(all, "upstream_proxy")
+		}
 	}
 	all["app_version"] = s.zapi.appVersion
 	all["listen_addr"] = s.cfg.GetListenAddr()

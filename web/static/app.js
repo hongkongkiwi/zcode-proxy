@@ -1273,10 +1273,61 @@ async function applyCatalogToGateway() {
   } catch (e) { toast(e.message, 'error'); }
 }
 
+// ---- 网关根 Key：GET 只回存在性/脱敏形状，明文需口令步进重认证 ----
+// 与导出账号包同一威胁模型：stolen session 不得直接读走根 Key，
+// 显示明文必须先过 POST /api/settings/api-key/reveal 的管理员密码验证
+
+let gatewayKeyHas = false; // 最近一次 GET /api/settings/api-key 的存在性（安全页）
+let llmKeyHas = false;     // LLM 测试页同一份远端事实，两处各自显示
+
+// applyKeyDisplay 只读输入框统一渲染：未揭示显示占位提示，揭示后填明文
+function applyKeyDisplay(inputId, hasKey, revealed) {
+  const el = document.getElementById(inputId);
+  if (!el) return;
+  el.value = revealed || '';
+  el.placeholder = hasKey ? t('已设置（点「显示 Key」验证管理员密码后查看）') : t('尚未生成');
+}
+
+// ensureRevealKeyBtn 在只读输入框旁注入「显示 Key」按钮（index.html 静态结构不含
+// 此按钮，由 JS 补齐；幂等）。data-i18n + applyI18n 让语言切换时文案跟随。
+function ensureRevealKeyBtn(inputId, target) {
+  const el = document.getElementById(inputId);
+  if (!el || document.getElementById('revealKeyBtn-' + target)) return;
+  const btn = document.createElement('button');
+  btn.id = 'revealKeyBtn-' + target;
+  btn.className = 'btn btn-secondary';
+  btn.setAttribute('data-i18n', '显示 Key');
+  btn.onclick = () => showRevealKeyModal(target);
+  el.parentElement.appendChild(btn);
+  if (typeof applyI18n === 'function') applyI18n();
+}
+
+function showRevealKeyModal(target) {
+  openModal(`<h3>${t('显示网关 Key')}</h3>
+    <p style="font-size:13px;color:var(--c-text-light);margin-bottom:12px">${t('为防止会话被窃取后直接拿到根 Key，显示前需再次验证管理员密码。')}</p>
+    <div class="form-group"><label>${t('管理员密码（确认身份）')}</label><input type="password" id="revealKeyPass" autocomplete="current-password"></div>
+    <div class="actions"><button class="btn btn-secondary" onclick="closeModal()">${t('取消')}</button>
+    <button class="btn btn-primary" onclick="doRevealKey('${target}')">${t('显示 Key')}</button></div>`);
+}
+
+async function doRevealKey(target) {
+  const pw = document.getElementById('revealKeyPass').value;
+  if (!pw) return toast(t('请输入管理员密码'), 'error');
+  try {
+    const d = await api('/api/settings/api-key/reveal', { method: 'POST', body: { verify_password: pw } });
+    closeModal();
+    if (target === 'llm') { llmKeyHas = !!d.has_api_key; applyKeyDisplay('llmKey', llmKeyHas, d.api_key || ''); }
+    else { gatewayKeyHas = !!d.has_api_key; applyKeyDisplay('gatewayKeyDisplay', gatewayKeyHas, d.api_key || ''); }
+    toast(t('已显示网关 Key'));
+  } catch (e) { toast(e.message, 'error'); }
+}
+
 async function loadGatewayKey() {
   try {
     const d = await api('/api/settings/api-key');
-    document.getElementById('gatewayKeyDisplay').value = d.api_key || '';
+    gatewayKeyHas = !!d.has_api_key;
+    applyKeyDisplay('gatewayKeyDisplay', gatewayKeyHas, '');
+    ensureRevealKeyBtn('gatewayKeyDisplay', 'gateway');
   } catch (e) { reportLoadError(e); }
 }
 
@@ -1284,14 +1335,16 @@ async function generateAPIKey() {
   if (!confirm(t('重新生成后旧 Key 立即失效，确认？'))) return;
   try {
     const d = await api('/api/settings/api-key/generate', { method: 'POST' });
-    document.getElementById('gatewayKeyDisplay').value = d.api_key;
+    // 新建即展示一次（与命名网关 Key 的「立即保存」同一模型）
+    gatewayKeyHas = true;
+    applyKeyDisplay('gatewayKeyDisplay', true, d.api_key || '');
     toast(t('已生成新 API Key'));
   } catch (e) { toast(e.message, 'error'); }
 }
 
 function copyGatewayKey() {
   const v = document.getElementById('gatewayKeyDisplay').value;
-  if (!v) return toast(t('尚未生成'), 'error');
+  if (!v) return toast(t(gatewayKeyHas ? 'Key 已设置，请先「显示 Key」' : '尚未生成'), 'error');
   copyToClipboard(v);
 }
 
@@ -1538,8 +1591,9 @@ let llmHistory = [];
 async function loadLlmKey() {
   try {
     const d = await api('/api/settings/api-key');
-    const el = document.getElementById('llmKey');
-    if (el) el.value = d.api_key || '';
+    llmKeyHas = !!d.has_api_key;
+    applyKeyDisplay('llmKey', llmKeyHas, '');
+    ensureRevealKeyBtn('llmKey', 'llm');
   } catch (e) { reportLoadError(e); }
 }
 
@@ -1601,7 +1655,10 @@ async function runLlmTest() {
   const btn = document.getElementById('llmRunBtn');
   const resultEl = document.getElementById('llmResult');
   const contentEl = document.getElementById('llmContent');
-  if (!key) { toast(t('缺少网关 Key，点击「刷新 Key」'), 'error'); return; }
+  if (!key) {
+    toast(t(llmKeyHas ? 'Key 已设置，请先「显示 Key」' : '缺少网关 Key，点击「刷新 Key」'), 'error');
+    return;
+  }
 
   const path = proto === 'messages' ? '/v1/messages' : proto === 'chat' ? '/v1/chat/completions' : '/v1/responses';
   let body;
