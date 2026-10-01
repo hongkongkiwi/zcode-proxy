@@ -49,7 +49,7 @@ const (
 // 数值与主集错开：二者只做等值比较，不进 switch。
 const (
 	outcomeTicketRetry     relayOutcome = 101 // 429/3105：票仍有效，同票稍后重试（未写响应）
-	outcomeTicketReclaimed relayOutcome = 102 // 400/3102：票被回收，同 task_id 重取（未写响应）
+	outcomeTicketReclaimed relayOutcome = 102 // 400/3102/3001：票被回收，同 task_id 重取（未写响应）
 )
 
 // offPeakBodyCode 解析上游 JSON 信封的业务码（非 JSON/缺失返回 0）
@@ -617,6 +617,7 @@ func (z *ZCodeAPI) offPeakBridge(w http.ResponseWriter, r *http.Request, a *Acco
 	pollFailures := 0
 	nextKeepalive := time.Time{} // 跨轮询迭代持有：保活到期不因每次调用重派而失效
 	unknownStates := 0           // 连续未知状态计数（≥2 视同 expired，防无限轮询）
+	lastReclaimCode := 0         // 最近一次票回收的业务码（offPeakForward 落笔，诊断串用）
 	for attempt := 0; ; attempt++ {
 		// WAIT：票未就绪时轮询 + 保活
 		for !offPeakStateReady(ticket.State) && !offPeakStateTerminal(ticket.State) {
@@ -686,7 +687,7 @@ func (z *ZCodeAPI) offPeakBridge(w http.ResponseWriter, r *http.Request, a *Acco
 			pollFailures = 0
 			continue
 		}
-		out := z.offPeakForward(w, r, a, ticket, opts)
+		out := z.offPeakForward(w, r, a, ticket, opts, &lastReclaimCode)
 		if out == outcomeTicketRetry {
 			// 429/3105：票仍有效，同票稍后重试（不关票）。
 			// 预算在此强制执行——attempt 随循环增长但 retake 不经过此路径，
@@ -699,8 +700,10 @@ func (z *ZCodeAPI) offPeakBridge(w http.ResponseWriter, r *http.Request, a *Acco
 			continue
 		}
 		if out == outcomeTicketReclaimed {
-			// 400/3102：票被上游回收但任务有效——同 task_id 重取续跑
-			next, rout := retake(attempt, "票被上游回收（3102）")
+			// 400/3102/3001：票被上游回收但任务有效——同 task_id 重取续跑。
+			// lastReclaimCode 由 offPeakForward 落笔（顺序循环，无竞争），
+			// 诊断串带真实业务码而不是硬编码 3102
+			next, rout := retake(attempt, fmt.Sprintf("票被上游回收（%d）", lastReclaimCode))
 			if next == nil {
 				settleCur()
 				return rout
@@ -762,8 +765,9 @@ func offPeakWait(ctx context.Context, sleep, keepalive time.Duration, emitKeepal
 	}
 }
 
-// offPeakForward READY → 带票调用上游闲时消息端点并透传响应（协议两侧同为 Anthropic）
-func (z *ZCodeAPI) offPeakForward(w http.ResponseWriter, r *http.Request, a *Account, ticket *offTicket, opts offPeakRunOpts) relayOutcome {
+// offPeakForward READY → 带票调用上游闲时消息端点并透传响应（协议两侧同为 Anthropic）。
+// reclaimCode 非 nil 时回写票回收的业务码（3102/3001），供调用方诊断串使用
+func (z *ZCodeAPI) offPeakForward(w http.ResponseWriter, r *http.Request, a *Account, ticket *offTicket, opts offPeakRunOpts, reclaimCode *int) relayOutcome {
 	start := time.Now()
 
 	// metadata.user_id：桌面端所有 Anthropic 调用都携带（JSON 字符串形式的
@@ -866,6 +870,9 @@ func (z *ZCodeAPI) offPeakForward(w http.ResponseWriter, r *http.Request, a *Acc
 			// 官方契约：400/3102 = 票已被回收但任务有效 → 同 task_id 重新取票续跑
 			// （3001 为滚动发布期旧语义，官方适配器同样按票过期处理），
 			// 而不是把整段排队等待作废成硬 400
+			if reclaimCode != nil {
+				*reclaimCode = code
+			}
 			log.Printf("[async] %d: ticket reclaimed upstream; retaking with same task_id", code)
 			return outcomeTicketReclaimed
 		}
@@ -941,8 +948,13 @@ func (z *ZCodeAPI) offPeakForward(w http.ResponseWriter, r *http.Request, a *Acc
 		z.recordUsage(a, r, opts.payload, recStatus, start, ttft, sniffed, opts.clientStream)
 		return outcomeWritten
 	}
-	// 非流式客户端：上游强制流式返回，网关聚合成完整 Anthropic message
-	aggregated, usage, aerr := aggregateAnthropicStream(resp.Body)
+	// 非流式客户端：上游强制流式返回，网关聚合成完整 Anthropic message。
+	// 64MB 上限与 relay 非流式路径同规：多读 1 字节判定超限——不设界时
+	// 超长生成 × 并发请求会无界吃内存
+	aggregated, usage, aerr := aggregateAnthropicStream(io.LimitReader(resp.Body, (64<<20)+1))
+	if aerr == nil && len(aggregated) > 64<<20 {
+		aerr = fmt.Errorf("上游响应超过 64MB 上限")
+	}
 	if aerr != nil {
 		// 聚合失败也要落已提取的部分用量，不得整条丢失
 		z.recordUsage(a, r, opts.payload, http.StatusBadGateway, start, 0, usage, false)
@@ -970,6 +982,7 @@ type anthropicAgg struct {
 	stopSequence             interface{} // message_delta.stop_sequence 回显（客户端需要知道哪条命中）
 	sawMessageDelta          bool        // message_delta 到达过（干净的完整流必有；缺失 = 中途截断）
 	streamError              string      // 上游内联错误帧（独立于 stop_reason，不被后续 delta 掩盖）
+	toolTruncated            bool        // 不可解析的非空工具参数缓冲（评审 F7：截断，不得洗成空参成功）
 	in, out                  int
 	cacheRead, cacheCreation int
 	toolJSON                 map[int]*strings.Builder
@@ -1074,9 +1087,13 @@ func aggregateAnthropicStream(r io.Reader) ([]byte, *StreamUsage, error) {
 				if raw := b.String(); raw != "" {
 					var parsed interface{}
 					if err := json.Unmarshal([]byte(raw), &parsed); err != nil || parsed == nil {
-						// 解析失败或字面量 "null"（Unmarshal 成功但得 nil）：一律空对象，
-						// 客户端工具执行器期待 input 为对象
-						parsed = map[string]interface{}{}
+						// 字面量 "null"（Unmarshal 成功但得 nil）：空对象容忍；
+						// 解析失败 = 参数中途断流（评审 F7）：置位，聚合末尾按失败处理
+						if parsed == nil {
+							parsed = map[string]interface{}{}
+						} else {
+							agg.toolTruncated = true
+						}
 					}
 					agg.blocks[idx]["input"] = parsed
 				}
@@ -1154,11 +1171,16 @@ func aggregateAnthropicStream(r io.Reader) ([]byte, *StreamUsage, error) {
 					delete(agg.toolJSON, idx)
 					continue
 				}
-				// 同 content_block_stop：空缓冲不覆盖 start 帧自带的合法 input
+				// 同 content_block_stop：空缓冲不覆盖 start 帧自带的合法 input；
+				// 解析失败 = 截断置位（评审 F7）
 				if raw := b.String(); raw != "" {
 					var parsed interface{}
 					if err := json.Unmarshal([]byte(raw), &parsed); err != nil || parsed == nil {
-						parsed = map[string]interface{}{}
+						if parsed == nil {
+							parsed = map[string]interface{}{}
+						} else {
+							agg.toolTruncated = true
+						}
 					}
 					agg.blocks[idx]["input"] = parsed
 				}
@@ -1174,6 +1196,11 @@ func aggregateAnthropicStream(r io.Reader) ([]byte, *StreamUsage, error) {
 	}
 	if agg.streamError != "" {
 		return nil, partialUsage(agg), fmt.Errorf("%s", agg.streamError)
+	}
+	// 工具参数截断（评审 F7）：聚合出 input:{} 的 tool_use 会让客户端空参执行
+	// 工具——与中途断流同规按失败处理，不产出"成功"message
+	if agg.toolTruncated {
+		return nil, partialUsage(agg), fmt.Errorf("upstream tool arguments truncated")
 	}
 	// 零事件的干净 EOF（裸注释帧后直接关闭）：聚合成 200 空 message 同样是
 	// "把死流伪装成成功"——不满足 message_start 必至的一律按失败处理

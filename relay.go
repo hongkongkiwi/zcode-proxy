@@ -1318,6 +1318,8 @@ func (z *ZCodeAPI) recordUsage(a *Account, r *http.Request, payload []byte, stat
 		log.Printf("[usage] insert: %v", err)
 	}
 	if rec.GatewayKeyID > 0 {
-		z.db.BumpGatewayKeyUsage(rec.GatewayKeyID, rec.TotalTokens)
+		// 配额按计费口径折算（含缓存 token，见 gatewayKeyQuotaCharge），
+		// usage_records 落库口径不变
+		z.db.BumpGatewayKeyUsage(rec.GatewayKeyID, gatewayKeyQuotaCharge(usage))
 	}
 }

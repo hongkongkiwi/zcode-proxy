@@ -35,6 +35,18 @@ func HashGatewayKey(key string) string {
 	return hex.EncodeToString(sum[:])
 }
 
+// gatewayKeyQuotaCharge 网关 Key 配额计费口径：input+output 全价，
+// cache_creation 全价（上游按 ≥1x 计费），cache_read 按 1/10 折算（上游缓存
+// 命中约 0.1x 计费，整数除法近似）。usage_records.total_tokens 维持纯
+// input+output 口径（报表语义不变），仅配额拦截走此口径——忽略缓存 token
+// 会让重缓存客户端在 quota_total 之外烧掉大量真实计费 token（评审 F9）
+func gatewayKeyQuotaCharge(u *StreamUsage) int {
+	if u == nil {
+		return 0
+	}
+	return u.InputTokens + u.OutputTokens + u.CacheCreationTokens + u.CacheReadTokens/10
+}
+
 // resolveGatewayKey 中间件解析：返回 nil,nil = 根 Key（或未配置命名 Key 场景直接放行）；
 // 非 nil errResp = 认证/限流失败，已构造好响应。
 // RPM 命中时 errResp.status = 429，调用方应带 Retry-After 回写。

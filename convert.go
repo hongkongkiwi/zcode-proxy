@@ -28,6 +28,7 @@ type StreamUsage struct {
 	StopReason          string
 	ToolCalls           []map[string]interface{}
 	StreamError         string                   // 上游 SSE error 事件（overloaded_error 等）
+	ToolTruncated       bool                     // 工具参数截断：不可解析的非空 partial_json（评审 F7，不得洗成空参成功）
 	ThinkingBlocks      []thinkingBlock          // R6：本响应收集到的已签名思考块（重放缓存）
 	sigByBlock          map[int]string           // content_block index → signature（逐块捕获态）
 	thinkBufs           map[int]*strings.Builder // content_block index → thinking 文本缓冲
@@ -315,6 +316,11 @@ func finalizeToolCalls(usage *StreamUsage) {
 					parsed = map[string]interface{}{}
 				}
 				call["input"] = parsed
+			} else {
+				// 不可解析的非空缓冲 = 上游在参数中途断流（评审 F7）：置位交由
+				// 各路径按流失败处理。input 仍补 {} 保持结构合法，但响应绝不能
+				// 以成功状态出门——客户端会拿空参去执行工具
+				usage.ToolTruncated = true
 			}
 		}
 		if _, ok := call["input"]; !ok {
@@ -499,9 +505,17 @@ func streamProtocolResponse(w http.ResponseWriter, rc *relayCtx, resp *http.Resp
 			// 让 SDK 能区分"干净结束"与"上游中断"
 			writeSSEErrorEvent(w, fmt.Sprintf("upstream stream interrupted: %v", readErr))
 		}
+		if usage.ToolTruncated {
+			// 参数中途断流（评审 F7）：透传体已含半截 tool_use，补错误帧让 SDK
+			// 不把半截流当干净结束、拿空参去执行工具
+			writeSSEErrorEvent(w, "upstream tool arguments truncated")
+		}
 		// 透传路径错误事件已原样转发给客户端；此处仅修正用量记录语义并告警
 		recStatus := resp.StatusCode
-		if usage.StreamError != "" {
+		if usage.ToolTruncated {
+			recStatus = 502
+			log.Printf("[relay] upstream tool arguments truncated (passthrough)")
+		} else if usage.StreamError != "" {
 			recStatus = 502
 			log.Printf("[relay] upstream stream error event (passthrough): %s", usage.StreamError)
 		} else if readErr != nil && readErr != io.EOF {
@@ -537,8 +551,12 @@ func streamProtocolResponse(w http.ResponseWriter, rc *relayCtx, resp *http.Resp
 	default:
 		// 客户端要非流式，但上游是流式：聚合后写单个 JSON
 		if proto == protocolAnthropic {
-			// Anthropic 客户端：聚合回完整 message（与闲时通道同一聚合器）
-			aggregated, aggUsage, aerr := aggregateAnthropicStream(resp.Body)
+			// Anthropic 客户端：聚合回完整 message（与闲时通道同一聚合器）。
+			// 64MB 上限与 relay 非流式路径同规：多读 1 字节判定超限防静默截断
+			aggregated, aggUsage, aerr := aggregateAnthropicStream(io.LimitReader(resp.Body, (64<<20)+1))
+			if aerr == nil && len(aggregated) > 64<<20 {
+				aerr = fmt.Errorf("上游响应超过 64MB 上限")
+			}
 			if aerr != nil {
 				z.recordUsage(a, r, payload, 502, start, 0, aggUsage, false)
 				writeJSON(w, http.StatusBadGateway, map[string]interface{}{
@@ -559,9 +577,13 @@ func streamProtocolResponse(w http.ResponseWriter, rc *relayCtx, resp *http.Resp
 		var texts, thinks []string
 		sawStart := false
 		parser := &sseParser{}
+		sawMessageDelta := false // message_delta 到达过：干净完整流的标志（缺失 = 中途截断）
 		feedFn := func(ev sseEvent) {
 			if ev.Event == "message_start" {
 				sawStart = true
+			}
+			if ev.Event == "message_delta" {
+				sawMessageDelta = true
 			}
 			applyEventToUsage(ev, &usage, &activeTool, &texts, &thinks)
 		}
@@ -571,9 +593,12 @@ func streamProtocolResponse(w http.ResponseWriter, rc *relayCtx, resp *http.Resp
 		parser.flush(feedFn)
 		finalizeToolCalls(&usage)
 		cacheThinkingForOutput(strings.Join(texts, ""), &usage)
-		// 上游流内错误或中途断流：不得伪装成成功空响应
-		if usage.StreamError != "" || (readErr != nil && readErr != io.EOF) {
+		// 上游流内错误、中途断流或工具参数截断：不得伪装成成功空响应
+		if usage.StreamError != "" || usage.ToolTruncated || (readErr != nil && readErr != io.EOF) {
 			msg := usage.StreamError
+			if msg == "" && usage.ToolTruncated {
+				msg = "upstream tool arguments truncated"
+			}
 			if msg == "" {
 				msg = fmt.Sprintf("upstream stream interrupted: %v", readErr)
 			}
@@ -589,6 +614,16 @@ func streamProtocolResponse(w http.ResponseWriter, rc *relayCtx, resp *http.Resp
 			z.recordUsage(a, r, payload, 502, start, 0, &usage, rc.clientStream)
 			writeJSON(w, http.StatusBadGateway, map[string]interface{}{
 				"error": map[string]string{"message": "upstream stream ended without any events", "type": "upstream_error"},
+			})
+			return
+		}
+		// 内容已出但没等到 message_delta（干净截断）：合成完整 message 会把
+		// 半截回答/截断 tool_use 伪装成成功——与聚合路径同规按失败处理
+		// （流式路径保留对缺 message_delta 的容忍，见 openaiFinish 契约）
+		if !sawMessageDelta && usage.StopReason == "" {
+			z.recordUsage(a, r, payload, 502, start, 0, &usage, rc.clientStream)
+			writeJSON(w, http.StatusBadGateway, map[string]interface{}{
+				"error": map[string]string{"message": "upstream stream truncated before message_delta", "type": "upstream_error"},
 			})
 			return
 		}
@@ -758,10 +793,14 @@ func (z *ZCodeAPI) streamOpenAI(w http.ResponseWriter, flusher http.Flusher, res
 	//（零事件判定与聚合路径同规：不得合成 200 空助手回合）
 	interrupted := readErr != nil && readErr != io.EOF
 	zeroEvents := !sawStart && len(texts) == 0 && len(usage.ToolCalls) == 0
-	if usage.StreamError != "" || interrupted || zeroEvents {
+	if usage.StreamError != "" || interrupted || zeroEvents || usage.ToolTruncated {
 		msg := usage.StreamError
 		if msg == "" && interrupted {
 			msg = fmt.Sprintf("upstream stream interrupted: %v", readErr)
+		}
+		if msg == "" && usage.ToolTruncated {
+			// 参数中途断流（评审 F7）：不得以 tool_calls + 空参数收尾洗成成功
+			msg = "upstream tool arguments truncated"
 		}
 		if msg == "" {
 			msg = "upstream stream ended without any events"
@@ -1201,10 +1240,14 @@ func (z *ZCodeAPI) streamResponses(w http.ResponseWriter, flusher http.Flusher, 
 	//（零事件判定与聚合路径同规：不得合成空 message 项 + completed）
 	interrupted := readErr != nil && readErr != io.EOF
 	zeroEvents := !sawStart && len(texts) == 0 && len(usage.ToolCalls) == 0
-	if usage.StreamError != "" || interrupted || zeroEvents {
+	if usage.StreamError != "" || interrupted || zeroEvents || usage.ToolTruncated {
 		msg := usage.StreamError
 		if msg == "" && interrupted {
 			msg = fmt.Sprintf("upstream stream interrupted: %v", readErr)
+		}
+		if msg == "" && usage.ToolTruncated {
+			// 参数中途断流（评审 F7）：不得以 tool_calls + 空参数收尾洗成成功
+			msg = "upstream tool arguments truncated"
 		}
 		if msg == "" {
 			msg = "upstream stream ended without any events"
@@ -1494,10 +1537,14 @@ func (z *ZCodeAPI) streamCompletions(w http.ResponseWriter, flusher http.Flusher
 	//（零事件判定与聚合路径同规：不得合成 200 空助手回合）
 	interrupted := readErr != nil && readErr != io.EOF
 	zeroEvents := !sawStart && len(texts) == 0 && len(usage.ToolCalls) == 0
-	if usage.StreamError != "" || interrupted || zeroEvents {
+	if usage.StreamError != "" || interrupted || zeroEvents || usage.ToolTruncated {
 		msg := usage.StreamError
 		if msg == "" && interrupted {
 			msg = fmt.Sprintf("upstream stream interrupted: %v", readErr)
+		}
+		if msg == "" && usage.ToolTruncated {
+			// 参数中途断流（评审 F7）：不得以 tool_calls + 空参数收尾洗成成功
+			msg = "upstream tool arguments truncated"
 		}
 		if msg == "" {
 			msg = "upstream stream ended without any events"
