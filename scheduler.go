@@ -260,23 +260,36 @@ func (s *CronScheduler) runPlan(plan *ClaimPlan, triggered time.Time) {
 		log.Printf("[scheduler] plan #%d write last_run_at: %v（写失败可能导致同分钟重复触发）", plan.ID, err)
 	}
 
+	taskType := plan.TaskType
+	if taskType == "" {
+		taskType = "claim"
+	}
+	// insertRunRecord 落运行台账：终态分支必须留下痕迹——claim_plans.last_run_msg
+	// 会被下次运行覆盖，运行历史页看不到"为什么没跑"正是审计最需要的行
+	insertRunRecord := func(status, message string, total, success, fail int, durMs int) {
+		if err := s.db.InsertPlanRunRecord(&PlanRunRecord{
+			PlanID: plan.ID, PlanName: plan.PlanName, TaskType: taskType,
+			TargetType: plan.TargetType, RunAt: runAt, Status: status, Message: message,
+			Total: total, SuccessCount: success, FailCount: fail, DurationMs: durMs,
+		}); err != nil {
+			log.Printf("[scheduler] plan #%d insert run record: %v", plan.ID, err)
+		}
+	}
+
 	targets, err := s.resolveTargets(plan)
 	if err != nil {
 		if err := s.db.UpdateClaimPlanRunAt(plan.ID, "failed", err.Error(), runAt); err != nil {
 			log.Printf("[scheduler] plan #%d write run state: %v", plan.ID, err)
 		}
+		insertRunRecord("failed", err.Error(), 0, 0, 0, 0)
 		return
 	}
 	if len(targets) == 0 {
 		if err := s.db.UpdateClaimPlanRunAt(plan.ID, "failed", "没有符合条件的账号", runAt); err != nil {
 			log.Printf("[scheduler] plan #%d write run state: %v", plan.ID, err)
 		}
+		insertRunRecord("failed", "没有符合条件的账号", 0, 0, 0, 0)
 		return
-	}
-
-	taskType := plan.TaskType
-	if taskType == "" {
-		taskType = "claim"
 	}
 	log.Printf("[scheduler] plan #%d %s (%s) start, %d accounts, delay=%ds",
 		plan.ID, plan.PlanName, taskType, len(targets), plan.DelaySeconds)
@@ -327,9 +340,11 @@ func (s *CronScheduler) runPlan(plan *ClaimPlan, triggered time.Time) {
 
 	// 服务停机中断：写终态避免计划卡在 running，且不把半程结果记成 success
 	if aborted {
-		if err := s.db.UpdateClaimPlanRunAt(plan.ID, "failed", "服务停机中断，本次未完成全部账号", runAt); err != nil {
+		const abortMsg = "服务停机中断，本次未完成全部账号"
+		if err := s.db.UpdateClaimPlanRunAt(plan.ID, "failed", abortMsg, runAt); err != nil {
 			log.Printf("[scheduler] plan #%d write run state: %v", plan.ID, err)
 		}
+		insertRunRecord("failed", abortMsg, len(targets), successCount, failCount, int(time.Since(start).Milliseconds()))
 		return
 	}
 
@@ -344,14 +359,7 @@ func (s *CronScheduler) runPlan(plan *ClaimPlan, triggered time.Time) {
 	if err := s.db.UpdateClaimPlanRunAt(plan.ID, status, summary, runAt); err != nil {
 		log.Printf("[scheduler] plan #%d write run state: %v", plan.ID, err)
 	}
-	if err := s.db.InsertPlanRunRecord(&PlanRunRecord{
-		PlanID: plan.ID, PlanName: plan.PlanName, TaskType: taskType,
-		TargetType: plan.TargetType, RunAt: runAt, Status: status, Message: summary,
-		Total: len(targets), SuccessCount: successCount, FailCount: failCount,
-		DurationMs: duration,
-	}); err != nil {
-		log.Printf("[scheduler] plan #%d insert run record: %v", plan.ID, err)
-	}
+	insertRunRecord(status, summary, len(targets), successCount, failCount, duration)
 	log.Printf("[scheduler] plan #%d done: %s", plan.ID, status)
 }
 

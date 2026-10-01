@@ -153,6 +153,10 @@ func ResolveVaultSeed(db *DB, dbPath string) {
 	}
 	keyFile := vaultKeyFile(dbPath)
 	legacy := legacyVaultSeed()
+	// keyFileInvalid：vault.key 存在但格式非法（截断/同步工具损坏）。降级消息
+	// 必须点名这个真实病因——报"修数据目录权限"会让操作员在错误方向上打转，
+	// 真正的解法是删除或替换该文件
+	keyFileInvalid := false
 
 	// 1. 已有 keyfile：先按其种子全量验证再采用
 	if keyFile != "" {
@@ -216,7 +220,8 @@ func ResolveVaultSeed(db *DB, dbPath string) {
 				return
 			}
 		} else if _, statErr := os.Stat(keyFile); statErr == nil {
-			log.Printf("[vault] WARNING: key file %s 存在但格式非法，忽略（如需重置请手动删除）", keyFile)
+			keyFileInvalid = true
+			log.Printf("[vault] WARNING: key file %s 存在但格式非法，忽略（如需重置请手动删除该文件）", keyFile)
 		}
 	}
 
@@ -239,6 +244,14 @@ func ResolveVaultSeed(db *DB, dbPath string) {
 				setVaultSeedOverride(seed)
 				return
 			}
+		}
+		if keyFileInvalid {
+			// 病因是残留的坏 keyfile（writeVaultKeyFile 拒绝覆盖既有文件），与权限无关：
+			// 指向唯一有效解法，否则操作员修完权限重启仍在降级态
+			log.Printf("[vault] WARNING: %s exists but is not a valid key file, so a fresh key cannot be written — "+
+				"entering degraded derived-key state where credential WRITES ARE REFUSED. "+
+				"Remediation: delete or replace %s and restart.", keyFile, keyFile)
+			return
 		}
 		// 生成/落盘失败：进入派生种子降级态——凭证加密写入将被拒绝，
 		// 恢复数据目录权限后重启即可重新生成

@@ -208,6 +208,19 @@ func (db *DB) ListUsageRecords(limit int) ([]*UsageRecord, error) {
 func (db *DB) UsageStats(days int) (map[string]interface{}, error) {
 	since := time.Now().AddDate(0, 0, -days).Format("2006-01-02 15:04:05")
 	out := map[string]interface{}{}
+	// 分节失败不得静默洗成空数据（如大清库 DELETE 持连接期间的 SQLITE_BUSY
+	// 会把整个趋势图渲染成"零用量"）：逐节收集错误，返回首个失败供上层警示
+	sectionErrs := map[string]string{}
+	var firstErr error
+	noteErr := func(section string, err error) {
+		if err == nil {
+			return
+		}
+		sectionErrs[section] = err.Error()
+		if firstErr == nil {
+			firstErr = fmt.Errorf("usage stats section %s: %w", section, err)
+		}
+	}
 	row := db.conn.QueryRow(`
 		SELECT COUNT(*), COALESCE(SUM(prompt_tokens),0), COALESCE(SUM(completion_tokens),0),
 		       COALESCE(SUM(total_tokens),0), COALESCE(SUM(cache_read_tokens),0),
@@ -242,12 +255,16 @@ func (db *DB) UsageStats(days int) (map[string]interface{}, error) {
 	if ttfts, err := db.ttftSamples(since, 100000); err == nil && len(ttfts) > 0 {
 		out["p50_ttft_ms"] = percentile(ttfts, 0.5)
 		out["p95_ttft_ms"] = percentile(ttfts, 0.95)
+	} else {
+		noteErr("ttft", err)
 	}
 
 	// 按模型分布
 	models := map[string]int{}
 	rows, err := db.conn.Query(`SELECT model, COUNT(*) FROM usage_records WHERE created_at >= ? GROUP BY model`, since)
-	if err == nil {
+	if err != nil {
+		noteErr("by_model", err)
+	} else {
 		defer rows.Close()
 		for rows.Next() {
 			var m string
@@ -262,7 +279,9 @@ func (db *DB) UsageStats(days int) (map[string]interface{}, error) {
 	// 按账号分布
 	accounts := map[string]int{}
 	rows2, err := db.conn.Query(`SELECT MAX(email), COUNT(*) FROM usage_records WHERE created_at >= ? GROUP BY account_id`, since)
-	if err == nil {
+	if err != nil {
+		noteErr("by_account", err)
+	} else {
 		defer rows2.Close()
 		for rows2.Next() {
 			var e string
@@ -287,7 +306,9 @@ func (db *DB) UsageStats(days int) (map[string]interface{}, error) {
 	rows3, err := db.conn.Query(`
 		SELECT COALESCE(NULLIF(key_name,''),'(root)'), gateway_key_id, COUNT(*), COALESCE(SUM(total_tokens),0)
 		FROM usage_records WHERE created_at >= ? GROUP BY gateway_key_id`, since)
-	if err == nil {
+	if err != nil {
+		noteErr("by_gateway_key", err)
+	} else {
 		defer rows3.Close()
 		for rows3.Next() {
 			var name string
@@ -318,7 +339,9 @@ func (db *DB) UsageStats(days int) (map[string]interface{}, error) {
 	rows4, err := db.conn.Query(`
 		SELECT date(created_at), COUNT(*), COALESCE(SUM(total_tokens),0), COALESCE(SUM(cache_read_tokens),0)
 		FROM usage_records WHERE created_at >= ? GROUP BY date(created_at) ORDER BY date(created_at)`, since)
-	if err == nil {
+	if err != nil {
+		noteErr("daily", err)
+	} else {
 		defer rows4.Close()
 		for rows4.Next() {
 			var d dayTrend
@@ -330,6 +353,12 @@ func (db *DB) UsageStats(days int) (map[string]interface{}, error) {
 		}
 	}
 	out["daily"] = trend
+	if firstErr != nil {
+		// 部分成功：保留已取到的分节数据，附 stats_errors 供上层区分
+		// "零用量"与"查询失败"，并返回首个失败让调用方决定如何告警
+		out["stats_errors"] = sectionErrs
+		return out, firstErr
+	}
 	return out, nil
 }
 
