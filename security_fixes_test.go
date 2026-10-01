@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // ---- FIX 1：upstream_proxy 凭据静态加密 ----
@@ -77,9 +78,44 @@ func TestUpstreamProxyPlaintextMigratedOnUpgrade(t *testing.T) {
 	}
 }
 
-// TestHandleGetSettingsDecryptsUpstreamProxy settings API 对 upstream_proxy
-// 返回可回填编辑的明文（GetSetting 解密），对其余机密键保持脱敏
-func TestHandleGetSettingsDecryptsUpstreamProxy(t *testing.T) {
+// TestPutSettingsMaskedProxyRoundTripPreservesAuth PUT 的脱敏回写保护：GET 回的
+// 剥离形状被原样回传时不得当作新值落库（会静默抹掉已存 user:pass）；真正的
+// 新值（含新凭据）照常替换
+func TestPutSettingsMaskedProxyRoundTripPreservesAuth(t *testing.T) {
+	db, _ := newVaultTestDB(t)
+	const stored = "socks5://alice:s3cret@proxy.example:1080"
+	if err := db.SetSetting("upstream_proxy", stored); err != nil {
+		t.Fatalf("set: %v", err)
+	}
+	s := &APIServer{db: db, zapi: &ZCodeAPI{appVersion: "test"}, cfg: &FileConfig{}}
+
+	put := func(v string) {
+		t.Helper()
+		body, _ := json.Marshal(map[string]string{"upstream_proxy": v})
+		w := httptest.NewRecorder()
+		r := httptest.NewRequest(http.MethodPut, "/api/settings", strings.NewReader(string(body)))
+		s.handlePutSettings(w, r)
+		if w.Code != http.StatusOK {
+			t.Fatalf("PUT %q: status = %d body = %s", v, w.Code, w.Body.String())
+		}
+	}
+
+	// 剥离形状回传 = "没改"：库存值必须原样保留（含凭据）
+	put("socks5://proxy.example:1080")
+	if got, _ := db.GetSetting("upstream_proxy"); got != stored {
+		t.Fatalf("masked round-trip destroyed stored credentials: %q", got)
+	}
+	// 全新值照常替换
+	put("http://dave:newpw@proxy2.example:8080")
+	if got, _ := db.GetSetting("upstream_proxy"); got != "http://dave:newpw@proxy2.example:8080" {
+		t.Fatalf("genuine new value not stored: %q", got)
+	}
+}
+
+// TestHandleGetSettingsMasksUpstreamProxyAuth settings API 对 upstream_proxy
+// 只回剥离凭据的显示形状（host:port + has_auth 标记）：内嵌 user:pass 是凭据，
+// 纯 session 不得读到（F6 契约）；对其余机密键保持脱敏
+func TestHandleGetSettingsMasksUpstreamProxyAuth(t *testing.T) {
 	db, _ := newVaultTestDB(t)
 	const proxyURL = "http://carol:pw@proxy.example:8080"
 	if err := db.SetSetting("upstream_proxy", proxyURL); err != nil {
@@ -98,8 +134,14 @@ func TestHandleGetSettingsDecryptsUpstreamProxy(t *testing.T) {
 	if err := json.Unmarshal(w.Body.Bytes(), &out); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	if out["upstream_proxy"] != proxyURL {
-		t.Fatalf("upstream_proxy = %q, want decrypted %q", out["upstream_proxy"], proxyURL)
+	if out["upstream_proxy"] != "http://proxy.example:8080" {
+		t.Fatalf("upstream_proxy = %q, want stripped %q", out["upstream_proxy"], "http://proxy.example:8080")
+	}
+	if out["upstream_proxy_has_auth"] != "1" {
+		t.Fatalf("upstream_proxy_has_auth = %q, want 1", out["upstream_proxy_has_auth"])
+	}
+	if strings.Contains(w.Body.String(), "carol") || strings.Contains(w.Body.String(), "pw@") {
+		t.Fatal("proxy credentials leaked into settings response")
 	}
 	if _, ok := out["password_hash"]; ok {
 		t.Fatal("password_hash must not appear in settings response")
@@ -292,6 +334,11 @@ func TestInitialAdminPasswordWrittenToFile(t *testing.T) {
 // TestLoginLockoutTherapeuticBypass 锁定中正确口令仍可登录并清除失败状态；
 // 错误口令按原样返回锁定等待且不续期锁定
 func TestLoginLockoutTherapeuticBypass(t *testing.T) {
+	// 收缩验证冷却：锁定中错误猜测会消耗一次验证预算，正确口令紧随其后
+	// 本应等满冷却（生产 30s）；测试用 10ms 冷却有界等待即可观察到放行
+	origCooldown := loginBypassCooldown
+	loginBypassCooldown = 10 * time.Millisecond
+	defer func() { loginBypassCooldown = origCooldown }()
 	am, db := newAuthFixtures(t)
 	hash, err := hashPassword("correct-horse-battery")
 	if err != nil {
@@ -314,19 +361,30 @@ func TestLoginLockoutTherapeuticBypass(t *testing.T) {
 		t.Fatal("account not locked after 5 failures")
 	}
 
-	// 锁定中错误口令：返回锁定等待，且不续期锁定
-	lockedUntil := am.failures[rateKey].lockedUntil
+	// 锁定中错误口令：返回锁定等待；被验证的猜测必须计入失败并续期锁定（F2 契约：
+	// 否则锁定窗口内可无限爆破）。验证次数受 loginBypassCooldown 约束
+	oldCount := am.failures[rateKey].count
 	_, ok, wait := am.Login(user, "still-wrong", ip)
 	if ok || wait <= 0 {
 		t.Fatalf("locked wrong login: ok=%v wait=%v, want ok=false wait>0", ok, wait)
 	}
-	if !am.failures[rateKey].lockedUntil.Equal(lockedUntil) {
-		t.Fatal("wrong guess during lock extended the lock")
+	if am.failures[rateKey].count <= oldCount {
+		t.Fatalf("verified wrong guess during lock not counted: count %d→%d, want growth", oldCount, am.failures[rateKey].count)
 	}
 
-	// 锁定中正确口令：正常登录（治疗性旁路），失败状态被清除
-	token, ok, wait := am.Login(user, "correct-horse-battery", ip)
-	if !ok || token == "" || wait != 0 {
+	// 锁定中正确口令：正常登录（治疗性旁路）。刚被验证过一次错误猜测时，
+	// 验证预算冷却可能要求重试——收缩冷却后有界重试，仍须登录成功
+	token, ok, wait := "", false, time.Duration(1)
+	for attempt := 0; attempt < 3 && !ok; attempt++ {
+		token, ok, wait = am.Login(user, "correct-horse-battery", ip)
+		if !ok {
+			if wait <= 0 {
+				t.Fatalf("therapeutic attempt %d: not ok but wait=%v", attempt+1, wait)
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+	if !ok || token == "" {
 		t.Fatalf("therapeutic login failed: ok=%v token-empty=%v wait=%v", ok, token == "", wait)
 	}
 	if !am.IsValid(token) {

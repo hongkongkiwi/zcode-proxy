@@ -45,8 +45,18 @@ type AuthManager struct {
 	failMu   sync.Mutex
 	failures map[string]*loginFail // 登录失败限速：key = ip|user
 
+	// 锁定旁路验证冷却：key = rateKey → 上次真实口令验证时刻。锁定中每次
+	// 都跑 bcrypt 等于把猜测速率拉到 bcrypt 吞吐（无上限爆破），冷却把它压回
+	// 每窗口一次；正确口令在冷却过后的首个验证即放行（治疗性旁路保留）
+	bypassMu        sync.Mutex
+	lastBypassCheck map[string]time.Time
+
 	gwRPM gwRPMTracker // 命名网关 Key 的 RPM 滑动窗口（R1）
 }
+
+// loginBypassCooldown 锁定中两次真实口令验证之间的最小间隔（打包级变量便于
+// 测试收缩）。只挡验证次数，不挡正确口令最终登录
+var loginBypassCooldown = 30 * time.Second
 
 type loginFail struct {
 	count       int
@@ -240,6 +250,10 @@ func (am *AuthManager) recordLoginFail(key string) {
 	f := am.failures[key]
 	if f == nil {
 		f = &loginFail{}
+		if am.failures == nil {
+			// 裸 &AuthManager{db:...}（如 handleCreateKey 的步进验证）也要能用
+			am.failures = make(map[string]*loginFail)
+		}
 		am.failures[key] = f
 	}
 	f.count++
@@ -263,6 +277,25 @@ func (am *AuthManager) clearLoginFail(key string) {
 	am.failMu.Lock()
 	delete(am.failures, key)
 	am.failMu.Unlock()
+	am.bypassMu.Lock()
+	delete(am.lastBypassCheck, key)
+	am.bypassMu.Unlock()
+}
+
+// allowBypassCheck 锁定旁路的验证预算：距上次真实验证 < loginBypassCooldown
+// 时拒绝（不跑 bcrypt、不计失败——那是限速拒绝而非一次猜测），否则盖章放行
+func (am *AuthManager) allowBypassCheck(key string) bool {
+	am.bypassMu.Lock()
+	defer am.bypassMu.Unlock()
+	if am.lastBypassCheck == nil {
+		am.lastBypassCheck = make(map[string]time.Time)
+	}
+	now := time.Now()
+	if t, ok := am.lastBypassCheck[key]; ok && now.Sub(t) < loginBypassCooldown {
+		return false
+	}
+	am.lastBypassCheck[key] = now
+	return true
 }
 
 func (am *AuthManager) adminUser() string {
@@ -312,11 +345,19 @@ func (am *AuthManager) Login(username, password, clientIP string) (string, bool,
 	// 假登录把管理员的导出/改密 step-up 锁死
 	rateKey := "login|" + clientIP + "|" + username
 	if wait := am.checkLoginRate(rateKey); wait > 0 {
-		// 治疗性旁路：锁定中仍执行完整口令验证，口令正确即清除失败状态并正常登录。
-		// 锁定器防的是噪音爆破（20 位随机口令不可穷举），不该变成同 IP 攻击者
-		// 5 次假登录就能对真实管理员无限续期的自我拒绝服务。口令错误时按原样
-		// 返回锁定等待，且不记新失败（不续期锁定，与原短路行为一致）
-		if username != am.adminUser() || !am.verifyPassword(password) {
+		// 治疗性旁路：锁定中仍允许真实口令登录（锁定器防的是噪音爆破，
+		// 不该变成同 IP 攻击者 5 次假登录就能对真实管理员无限续期的自我拒绝服务），
+		// 但猜测必须有界：每 loginBypassCooldown 只做一次真实验证（其余直接
+		// 按锁定等待拒绝，不烧 bcrypt），且被验证过的错误口令照常计入失败
+		// （续期锁定）——否则锁定窗口内可无限爆破，把锁定器变成摆设
+		if username != am.adminUser() {
+			return "", false, wait
+		}
+		if !am.allowBypassCheck(rateKey) {
+			return "", false, wait
+		}
+		if !am.verifyPassword(password) {
+			am.recordLoginFail(rateKey)
 			return "", false, wait
 		}
 		// 走到下方正常登录路径：clearLoginFail 会摘除失败状态
@@ -636,7 +677,29 @@ func (am *AuthManager) HandleRevealAPIKey(w http.ResponseWriter, r *http.Request
 }
 
 // HandleGenerateAPIKey POST /api/settings/api-key/generate
+// 与 reveal 同规的口令步进：生成即轮换并回明文，纯 session 可调等于 stolen
+// session 直接铸新根 Key（还顺带作废所有 /v1 客户端的旧 Key）。独立限速键
+// ip|api-key-generate（与登录/reveal 分开计数）。
 func (am *AuthManager) HandleGenerateAPIKey(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		VerifyPassword string `json:"verify_password"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeAPIError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	rateKey := clientIP(r) + "|api-key-generate"
+	if wait := am.checkLoginRate(rateKey); wait > 0 {
+		writeAPIError(w, http.StatusTooManyRequests,
+			fmt.Sprintf("尝试过于频繁，请 %d 秒后再试", int(wait.Seconds())+1))
+		return
+	}
+	if !am.verifyPassword(body.VerifyPassword) {
+		am.recordLoginFail(rateKey)
+		writeAPIError(w, http.StatusUnauthorized, "管理员密码验证失败，请输入当前管理员密码")
+		return
+	}
+	am.clearLoginFail(rateKey)
 	newKey := GenerateAPIKey()
 	if err := am.db.SetAPIKey(newKey); err != nil {
 		writeAPIError(w, http.StatusInternalServerError, err.Error())

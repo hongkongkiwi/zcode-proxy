@@ -43,7 +43,9 @@ services:
       - ./config:/app/config:ro   # config.json — secrets stay out of the image
     environment:
       # Web UI login password (main.go: os.Getenv("ZCODE_WEB_PASS")).
-      # Empty means auth is effectively unset — set a strong password.
+      # Empty is safe: a random 20-char admin password is generated and persisted
+      # to /app/data/initial_admin_password (0600) on first start — read it there;
+      # auth is never unset. Set this explicitly to choose your own password.
       ZCODE_WEB_PASS: ${ZCODE_WEB_PASS:-}
       # Vault seed override (vault.go: os.Getenv("ZCODE_PROXY_VAULT_SECRET")).
       # If unset, a random vault.key is generated in /app/data on first run.

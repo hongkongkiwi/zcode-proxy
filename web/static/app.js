@@ -809,6 +809,7 @@ function showKeyModal(id) {
       <div class="form-group"><label>${t('总配额（tokens，0=不限）')}</label><input type="number" id="keyQuota" class="form-input" min="0" value="${k.quota_total ?? ''}" placeholder="${t('0=不限')}"></div>
     </div>
     <div class="form-group"><label>${t('模型白名单（逗号分隔，留空=全部）')}</label><input type="text" id="keyModels" class="form-input mono" value="${esc(k.models || '')}" placeholder="${t('glm-5.3,glm-5.2 留空=全部')}"></div>
+    ${id ? '' : `<div class="form-group"><label>${t('管理员密码（创建需口令验证）')}</label><input type="password" id="keyVerifyPwd" class="form-input" autocomplete="off"></div>`}
     <div class="actions"><button class="btn btn-secondary" onclick="closeModal()">${t('取消')}</button>
     <button class="btn btn-primary" onclick="saveKey(${id || 0})">${t('保存')}</button></div>`);
 }
@@ -822,6 +823,11 @@ async function saveKey(id) {
     quota_total: Number(document.getElementById('keyQuota').value || 0),
     models: document.getElementById('keyModels').value.trim(),
   };
+  if (!id) {
+    // 创建即回明文：服务端要求口令步进（ stolen session 不得铸无限制 Key）
+    body.verify_password = document.getElementById('keyVerifyPwd').value;
+    if (!body.verify_password) return toast(t('需要管理员密码'), 'error');
+  }
   try {
     if (id) {
       await api('/api/keys/' + id, { method: 'PUT', body });
@@ -1332,9 +1338,12 @@ async function loadGatewayKey() {
 }
 
 async function generateAPIKey() {
-  if (!confirm(t('重新生成后旧 Key 立即失效，确认？'))) return;
+  // 生成即轮换并回明文：服务端要求管理员口令步进（纯 session 不得铸新根 Key）
+  const pw = prompt(t('重新生成后旧 Key 立即失效；请输入管理员密码确认'));
+  if (pw === null) return;
+  if (!pw) return toast(t('需要管理员密码'), 'error');
   try {
-    const d = await api('/api/settings/api-key/generate', { method: 'POST' });
+    const d = await api('/api/settings/api-key/generate', { method: 'POST', body: { verify_password: pw } });
     // 新建即展示一次（与命名网关 Key 的「立即保存」同一模型）
     gatewayKeyHas = true;
     applyKeyDisplay('gatewayKeyDisplay', true, d.api_key || '');

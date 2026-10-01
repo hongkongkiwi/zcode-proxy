@@ -486,6 +486,9 @@ const I18N_EN = {
   '重新生成': 'Regenerate',
   '客户端配置：base_url=http://127.0.0.1:8687/v1，api-key 填此 Key': 'Client config: base_url=http://127.0.0.1:8687/v1 with api-key set to this key',
   '重新生成后旧 Key 立即失效，确认？': 'Regenerating invalidates the old key immediately. Continue?',
+  '重新生成后旧 Key 立即失效；请输入管理员密码确认': 'Regenerating invalidates the old key immediately. Enter the admin password to confirm:',
+  '需要管理员密码': 'Admin password required',
+  '管理员密码（创建需口令验证）': 'Admin password (required to create)',
   '已生成新 API Key': 'New API key generated',
   '密码已修改，请重新登录': 'Password changed — please sign in again',
 

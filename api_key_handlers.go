@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -25,16 +26,37 @@ func (s *APIServer) handleListKeys(w http.ResponseWriter, r *http.Request) {
 
 func (s *APIServer) handleCreateKey(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		Name       string `json:"name"`
-		RPMLimit   int    `json:"rpm_limit"`
-		QuotaTotal int64  `json:"quota_total"`
-		Models     string `json:"models"`
-		Enabled    *bool  `json:"enabled"`
+		Name           string `json:"name"`
+		RPMLimit       int    `json:"rpm_limit"`
+		QuotaTotal     int64  `json:"quota_total"`
+		Models         string `json:"models"`
+		Enabled        *bool  `json:"enabled"`
+		VerifyPassword string `json:"verify_password"`
 	}
 	if err := jsonDecodeBody(r, &body); err != nil {
 		writeAPIError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	// 口令步进（与根 Key generate/reveal 同规）：创建即回一次明文，纯 session
+	// 可调等于 stolen session 铸无限制命名 Key（空 models + 0 限额）。独立限速键
+	// ip|api-key-create，与登录/根 Key 步进分桶计数
+	am := s.auth
+	if am == nil {
+		// 防御：auth 未装配时也要能验证（对库校验），不得退化成免验证
+		am = &AuthManager{db: s.db}
+	}
+	rateKey := clientIP(r) + "|api-key-create"
+	if wait := am.checkLoginRate(rateKey); wait > 0 {
+		writeAPIError(w, http.StatusTooManyRequests,
+			fmt.Sprintf("尝试过于频繁，请 %d 秒后再试", int(wait.Seconds())+1))
+		return
+	}
+	if !am.verifyPassword(body.VerifyPassword) {
+		am.recordLoginFail(rateKey)
+		writeAPIError(w, http.StatusUnauthorized, "管理员密码验证失败，请输入当前管理员密码")
+		return
+	}
+	am.clearLoginFail(rateKey)
 	name := strings.TrimSpace(body.Name)
 	if name == "" || len(name) > 64 {
 		writeAPIError(w, http.StatusBadRequest, "name 必填且不超过 64 字符")
