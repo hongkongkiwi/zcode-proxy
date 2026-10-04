@@ -432,7 +432,9 @@ func (db *DB) ListProxyNodes() ([]*ProxyNode, error) {
 		// 密码静态加密读回明文（vault1: 前缀才解；历史明文行原样透传，
 		// 下次保存时加密迁移）。解不开标记 PasswordBroken——静默变空串
 		// 会让带用户名的节点用空密码拨号、整组账号连环冷却
-		n.Password, n.PasswordBroken = vaultDecryptOK(n.Password)
+		var ok bool
+		n.Password, ok = vaultDecryptOK(n.Password)
+		n.PasswordBroken = !ok
 		n.IsDefault = isDef == 1
 		n.Enabled = enabled == 1
 		out = append(out, &n)

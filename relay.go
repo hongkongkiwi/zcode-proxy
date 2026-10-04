@@ -157,17 +157,7 @@ func (z *ZCodeAPI) relay(w http.ResponseWriter, r *http.Request, rc *relayCtx) {
 	// paidDailyTokenCap 是计费通道（channel=paid）唯一的消费闸：对 never 模式的
 	// keyonly 循环同样生效（纯 API Key 账号的流量全走 paid 归因，不设闸即失控）。
 	// 查询失败按已达上限处理（fail closed）——静默放行会在存储故障期间持续产生计费流量
-	paidCapReason := ""
-	if cap := z.pool.paidDailyTokenCap(); cap > 0 {
-		used, err := z.db.PaidTokensToday()
-		switch {
-		case err != nil:
-			log.Printf("[relay] paid tokens today: %v; treating daily cap as exceeded", err)
-			paidCapReason = "付费通道当日 token 上限状态不可知（fail closed）"
-		case used >= cap:
-			paidCapReason = fmt.Sprintf("付费通道已达当日 token 上限（%s）", truncate(strconv.FormatInt(cap, 10), 20))
-		}
-	}
+	paidCapReason := z.paidDailyCapReason()
 
 	// never 策略不进付费阶段，但纯 API Key 账号（无 JWT，付费是唯一通道）仍须可服务
 	if policy == PaidModeNever && paidCapReason == "" {
@@ -397,6 +387,25 @@ func (z *ZCodeAPI) tryAccount(w http.ResponseWriter, r *http.Request, a *Account
 	return outcomeNextAccount
 }
 
+// paidDailyCapReason is shared by phase selection and every paid dispatch.
+func (z *ZCodeAPI) paidDailyCapReason() string {
+	cap := z.pool.paidDailyTokenCap()
+	if cap < 0 {
+		return "付费通道当日 token 上限状态不可知（fail closed）"
+	}
+	if cap > 0 {
+		used, err := z.db.PaidTokensToday()
+		if err != nil {
+			log.Printf("[relay] paid tokens today: %v; treating daily cap as exceeded", err)
+			return "付费通道当日 token 上限状态不可知（fail closed）"
+		}
+		if used >= cap {
+			return fmt.Sprintf("付费通道已达当日 token 上限（%s）", truncate(strconv.FormatInt(cap, 10), 20))
+		}
+	}
+	return ""
+}
+
 // tryPaidChannel 付费阶段单账号：仅 API Key 通道。
 // 免费侧状态（exhausted/cooling/invalid）的账号也会被选进来——那正是付费回退要兜底的场景。
 func (z *ZCodeAPI) tryPaidChannel(w http.ResponseWriter, r *http.Request, a *Account,
@@ -431,7 +440,7 @@ func (z *ZCodeAPI) forwardOnce(w http.ResponseWriter, r *http.Request, a *Accoun
 
 	// 每（账号×通道）并发闸门：排队而非打满并发（上游 1302 并发超限的根治手段）。
 	// 排队 45s 仍无名额或客户端已断开 → 让位下一候选（10s 短冷却，很快回来）。
-	// release 绑定获取时的闸门对象：设置变更重建闸门后旧持有者不会错放新闸门
+	// release 绑定同一闸门：上限变更仍保留全部在途占用
 	release, ok := z.pool.AcquireAccountSlot(r.Context(), a, channel, 45*time.Second)
 	if !ok {
 		// 客户端已断开（ctx 取消/超时）：与下方 client.Do 的取消处理同规——
@@ -449,13 +458,30 @@ func (z *ZCodeAPI) forwardOnce(w http.ResponseWriter, r *http.Request, a *Accoun
 	}
 	defer release()
 
-	// 用量按实际通道归因（付费通道按量计费，paid_daily_token_cap 依赖此标记）
-	a.setUsageChannel(channel)
-
 	// 内部对 OpenAI/Responses 协议一律流式请求上游，便于聚合与转换
 	upstreamStream := rc.clientStream || rc.proto != protocolAnthropic
 
 	for attempt := 0; attempt < retries; attempt++ {
+		if channel == ChannelPaid {
+			// Reload after queueing and before every retry; use one current snapshot.
+			current, err := z.db.GetAccount(a.ID)
+			if err != nil {
+				log.Printf("[relay] paid account reload failed: %v", err)
+				return outcomeNextAccount
+			}
+			// Only sole-channel accounts bypass the fallback toggle, not cooldowns.
+			now := time.Now().Unix()
+			if !channelSelectable(current, ChannelPaidOnly, now) && !paidChannelAvailable(current, now) {
+				return outcomeNextAccount
+			}
+			if reason := z.paidDailyCapReason(); reason != "" {
+				log.Printf("[relay] paid dispatch blocked: %s", reason)
+				return outcomeNextAccount
+			}
+			a = current
+		}
+		// 用量按实际通道归因（付费通道按量计费，paid_daily_token_cap 依赖此标记）
+		a.setUsageChannel(channel)
 		urlStr, headers := z.buildUpstreamRequest(a, verifyParam, region, useFallback, r, upstreamStream)
 		req, err := http.NewRequestWithContext(r.Context(), "POST", urlStr, bytes.NewReader(payload))
 		if err != nil {

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -314,7 +315,10 @@ func (s *APIServer) handleImportBundle(w http.ResponseWriter, r *http.Request) {
 	}
 	count, err := s.acctMgr.ImportBundle(body.Password, body.Bundle)
 	if err != nil {
-		writeAPIError(w, http.StatusBadRequest, err.Error())
+		writeJSON(w, http.StatusBadRequest, map[string]interface{}{
+			"success": false, "imported": count,
+			"error": map[string]string{"message": err.Error(), "type": "api_error"},
+		})
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{"success": true, "imported": count})
@@ -709,7 +713,10 @@ func (s *APIServer) handleSavePlan(w http.ResponseWriter, r *http.Request) {
 		p.TaskType = "claim"
 	}
 	switch p.TaskType {
-	case "claim", "detect", "activate", "reset":
+	case "claim", "detect", "activate":
+	case "reset":
+		writeAPIError(w, http.StatusBadRequest, "重置仅支持在账号页面手动执行，不支持计划任务")
+		return
 	default:
 		writeAPIError(w, http.StatusBadRequest, "无效任务类型: "+p.TaskType)
 		return
@@ -762,6 +769,19 @@ func (s *APIServer) handleRunPlan(w http.ResponseWriter, r *http.Request) {
 	id, err := pathID(r)
 	if err != nil {
 		writeAPIError(w, http.StatusBadRequest, "invalid id")
+		return
+	}
+	plan, err := s.db.GetClaimPlan(id)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			writeAPIError(w, http.StatusNotFound, "计划不存在")
+		} else {
+			writeAPIError(w, http.StatusInternalServerError, "计划查询失败")
+		}
+		return
+	}
+	if plan.TaskType == "reset" {
+		writeAPIError(w, http.StatusBadRequest, "重置仅支持在账号页面手动执行，不支持计划任务")
 		return
 	}
 	if err := s.scheduler.RunPlanNow(id); err != nil {

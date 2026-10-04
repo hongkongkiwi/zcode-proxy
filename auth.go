@@ -37,10 +37,11 @@ type sessionEntry struct {
 
 // AuthManager 认证管理器
 type AuthManager struct {
-	mu          sync.RWMutex
-	sessions    map[string]*sessionEntry
-	fallbackPwd string
-	db          *DB
+	mu              sync.RWMutex
+	sessions        map[string]*sessionEntry
+	fallbackPwd     string
+	passwordVersion uint64 // mu 保护；改密成功后递增，拒绝在途旧口令验证
+	db              *DB
 
 	failMu   sync.Mutex
 	failures map[string]*loginFail // 登录失败限速：key = ip|user
@@ -185,7 +186,15 @@ func cookieSecureOverride() bool {
 }
 
 // verifyPassword 校验口令；旧 SHA-256 哈希命中后透明升级为 bcrypt
-func (am *AuthManager) verifyPassword(pwd string) bool {
+func (am *AuthManager) verifyPassword(pwd string) (valid bool) {
+	am.mu.RLock()
+	version, fallback := am.passwordVersion, am.fallbackPwd
+	am.mu.RUnlock()
+	defer func() {
+		am.mu.RLock()
+		valid = valid && version == am.passwordVersion
+		am.mu.RUnlock()
+	}()
 	stored := ""
 	if am.db != nil {
 		stored, _ = am.db.GetPasswordHash()
@@ -199,12 +208,21 @@ func (am *AuthManager) verifyPassword(pwd string) bool {
 			// 透明升级为 bcrypt；超长口令无法哈希时保持旧哈希（下次登录再试），
 			// 登录本身仍以 legacy 比对结果为准
 			if hash, err := hashPassword(pwd); err == nil {
-				am.db.SetPasswordHash(hash)
-				// 仍是缺省口令（admin/admin 老库）：标记之，UI 会提示修改
-				if pwd == "admin" {
-					am.db.SetDefaultPasswordFlag(true)
+				am.mu.Lock()
+				if version != am.passwordVersion {
+					am.mu.Unlock()
+					return false
 				}
-				log.Printf("[auth] password hash migrated to bcrypt")
+				if err := am.db.SetPasswordHash(hash); err != nil {
+					log.Printf("[auth] bcrypt migration failed: %v", err)
+				} else {
+					// 仍是缺省口令（admin/admin 老库）：标记之，UI 会提示修改
+					if pwd == "admin" {
+						am.db.SetDefaultPasswordFlag(true)
+					}
+					log.Printf("[auth] password hash migrated to bcrypt")
+				}
+				am.mu.Unlock()
 			} else {
 				log.Printf("[auth] bcrypt migration skipped: %v", err)
 			}
@@ -213,10 +231,10 @@ func (am *AuthManager) verifyPassword(pwd string) bool {
 		return false
 	}
 	// 兜底：环境变量口令（常数时间比较，长度不等直接拒绝）
-	if am.fallbackPwd == "" || len(pwd) != len(am.fallbackPwd) {
+	if fallback == "" || len(pwd) != len(fallback) {
 		return false
 	}
-	return subtle.ConstantTimeCompare([]byte(pwd), []byte(am.fallbackPwd)) == 1
+	return subtle.ConstantTimeCompare([]byte(pwd), []byte(fallback)) == 1
 }
 
 // checkLoginRate 登录限速：锁定中返回剩余时长
@@ -318,6 +336,8 @@ func (am *AuthManager) isDefaultPassword() bool {
 		}
 		return false
 	}
+	am.mu.RLock()
+	defer am.mu.RUnlock()
 	return am.fallbackPwd == "admin"
 }
 
@@ -340,6 +360,9 @@ func GenerateAPIKey() string {
 
 // Login 验证用户名密码，创建会话（带 IP+用户名 限速）
 func (am *AuthManager) Login(username, password, clientIP string) (string, bool, time.Duration) {
+	am.mu.RLock()
+	version := am.passwordVersion
+	am.mu.RUnlock()
 	// "login|" 命名空间隔离：username 全客户端可控，裸拼会与 step-up 端点的
 	// "IP|export"/"IP|password-change" 键碰撞——同出口 IP 的攻击者可用 5 次
 	// 假登录把管理员的导出/改密 step-up 锁死
@@ -375,8 +398,10 @@ func (am *AuthManager) Login(username, password, clientIP string) (string, bool,
 	}
 
 	am.mu.Lock()
-	// 极小窗口：验证通过后、拿锁前口令被修改，会签出一个旧口令会话；
-	// 下次登录即失效，可接受
+	if version != am.passwordVersion {
+		am.mu.Unlock()
+		return "", false, 0
+	}
 	am.clearLoginFail(rateKey)
 
 	now := time.Now()
@@ -592,30 +617,40 @@ func (am *AuthManager) HandleChangePassword(w http.ResponseWriter, r *http.Reque
 			fmt.Sprintf("尝试过于频繁，请 %d 秒后再试", int(wait.Seconds())+1))
 		return
 	}
-	// 旧口令验证（bcrypt 耗时）放在会话锁外，与 Login 同一设计——
-	// 否则改密风暴会以 ~100ms/次的速度冻结整个 /api 面
+	// 旧口令验证与新口令哈希均放在会话锁外，写入前复核版本。
+	am.mu.RLock()
+	version := am.passwordVersion
+	am.mu.RUnlock()
 	if !am.verifyPassword(body.OldPassword) {
 		am.recordLoginFail(rateKey)
 		writeAPIError(w, http.StatusUnauthorized, "old password incorrect")
 		return
 	}
-	am.clearLoginFail(rateKey)
+	hash, err := hashPassword(body.NewPassword)
+	if err != nil {
+		writeAPIError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 
 	am.mu.Lock()
 	defer am.mu.Unlock()
+	if version != am.passwordVersion {
+		writeAPIError(w, http.StatusUnauthorized, "password changed; verify current password and retry")
+		return
+	}
 
 	if am.db != nil {
-		hash, err := hashPassword(body.NewPassword)
-		if err != nil {
-			writeAPIError(w, http.StatusBadRequest, err.Error())
-			return
-		}
 		if err := am.db.SetPasswordHash(hash); err != nil {
 			writeAPIError(w, http.StatusInternalServerError, "failed to save password")
 			return
 		}
 		am.db.SetDefaultPasswordFlag(false)
+		am.fallbackPwd = ""
+	} else {
+		am.fallbackPwd = body.NewPassword
 	}
+	am.passwordVersion++
+	am.clearLoginFail(rateKey)
 	am.sessions = make(map[string]*sessionEntry)
 	log.Printf("[auth] password changed, all sessions invalidated")
 	writeJSON(w, http.StatusOK, map[string]string{"message": "password changed, please re-login"})

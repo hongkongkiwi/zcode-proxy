@@ -405,16 +405,34 @@ func (m *AccountManager) SwitchBackToLocal(accountID int64, killClient bool) err
 			if err := os.Chmod(bak, 0600); err != nil {
 				return fmt.Errorf("收紧备份权限失败: %w", err)
 			}
+		} else if !os.IsNotExist(err) {
+			return fmt.Errorf("读取 %s 备份失败: %w", filepath.Base(p), err)
 		}
 	}
 
 	// 2. 重建 credentials.json：保留无关键（bot/web-remote-control 等），只替换登录态
 	var creds map[string]string
 	if data, err := os.ReadFile(f.credentials); err == nil {
-		json.Unmarshal(data, &creds)
+		if err := json.Unmarshal(data, &creds); err != nil {
+			return fmt.Errorf("解析 credentials.json 失败: %w", err)
+		}
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("读取 credentials.json 失败: %w", err)
 	}
 	if creds == nil {
 		creds = map[string]string{}
+	}
+	// 配置也先读完校验，避免解析失败后已经切换部分身份。
+	var cfg map[string]interface{}
+	if data, err := os.ReadFile(f.config); err == nil {
+		if err := json.Unmarshal(data, &cfg); err != nil {
+			return fmt.Errorf("解析 config.json 失败: %w", err)
+		}
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("读取 config.json 失败: %w", err)
+	}
+	if cfg == nil {
+		cfg = map[string]interface{}{}
 	}
 	provider := a.Provider
 	if provider == "" {
@@ -445,9 +463,13 @@ func (m *AccountManager) SwitchBackToLocal(accountID int64, killClient bool) err
 	creds["zcodejwttoken"] = zcodeEnc
 	if accessEnc != "" {
 		creds["oauth:"+provider+":access_token"] = accessEnc
+	} else {
+		delete(creds, "oauth:"+provider+":access_token")
 	}
 	if userEnc != "" {
 		creds["oauth:"+provider+":user_info"] = userEnc
+	} else {
+		delete(creds, "oauth:"+provider+":user_info")
 	}
 	creds["oauth:active_provider"] = providerEnc
 	if err := atomicWriteJSON(f.credentials, creds); err != nil {
@@ -455,15 +477,6 @@ func (m *AccountManager) SwitchBackToLocal(accountID int64, killClient bool) err
 	}
 
 	// 3. 更新 config.json provider
-	var cfg map[string]interface{}
-	if data, err := os.ReadFile(f.config); err == nil {
-		if json.Unmarshal(data, &cfg) != nil {
-			cfg = nil
-		}
-	}
-	if cfg == nil {
-		cfg = map[string]interface{}{}
-	}
 	providers, _ := cfg["provider"].(map[string]interface{})
 	if providers == nil {
 		providers = map[string]interface{}{}
@@ -484,9 +497,7 @@ func (m *AccountManager) SwitchBackToLocal(accountID int64, killClient bool) err
 		p["enabled"] = enable
 	}
 	setProviderKey("builtin:"+provider+"-start-plan", a.ZCodeJWT, true)
-	if a.APIKey != "" {
-		setProviderKey("builtin:"+provider+"-coding-plan", a.APIKey, true)
-	}
+	setProviderKey("builtin:"+provider+"-coding-plan", a.APIKey, a.APIKey != "")
 	if err := atomicWriteJSON(f.config, cfg); err != nil {
 		return fmt.Errorf("写回 config.json 失败: %w", err)
 	}

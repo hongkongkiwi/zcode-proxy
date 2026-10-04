@@ -282,7 +282,9 @@ func offPeakStateTerminal(s string) bool { return s == "settled" || offPeakState
 
 // offPeakStateKnown 上游已知的全部票状态。未知串（上游新增/改名状态）不得
 // 无限占坑轮询——async_max_wait_sec=0 时那是唯一的终止路径
-func offPeakStateKnown(s string) bool { return offPeakStateReady(s) || offPeakStateTerminal(s) }
+func offPeakStateKnown(s string) bool {
+	return s == "queued" || offPeakStateReady(s) || offPeakStateTerminal(s)
+}
 
 // ---- 网关入口 ----
 
@@ -616,9 +618,9 @@ func (z *ZCodeAPI) offPeakBridge(w http.ResponseWriter, r *http.Request, a *Acco
 
 	pollFailures := 0
 	nextKeepalive := time.Time{} // 跨轮询迭代持有：保活到期不因每次调用重派而失效
-	unknownStates := 0           // 连续未知状态计数（≥2 视同 expired，防无限轮询）
 	lastReclaimCode := 0         // 最近一次票回收的业务码（offPeakForward 落笔，诊断串用）
 	for attempt := 0; ; attempt++ {
+		unknownStates := 0 // 每张新票独立计数（≥2 视同 expired，防无限轮询）
 		// WAIT：票未就绪时轮询 + 保活
 		for !offPeakStateReady(ticket.State) && !offPeakStateTerminal(ticket.State) {
 			if ctx.Err() != nil {

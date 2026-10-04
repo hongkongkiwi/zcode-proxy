@@ -39,7 +39,12 @@ func (db *DB) UpsertAccount(a *Account) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
-	if _, err := db.conn.Exec(`
+	tx, err := db.conn.Begin()
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(`
 		INSERT INTO accounts (
 			user_id, email, display_name, provider, auth_type,
 			access_token, refresh_token, zcode_jwt, api_key, user_info,
@@ -71,8 +76,11 @@ func (db *DB) UpsertAccount(a *Account) (int64, error) {
 	// 冲突更新分支不会推进 last_insert_rowid，驱动返回的是连接上一次
 	// INSERT 的残留值——用它会给错误账户写额度/状态。按自然键回查真实 ID。
 	var id int64
-	row := db.conn.QueryRow(`SELECT id FROM accounts WHERE user_id = ?`, a.UserID)
+	row := tx.QueryRow(`SELECT id FROM accounts WHERE user_id = ?`, a.UserID)
 	if err := row.Scan(&id); err != nil {
+		return 0, err
+	}
+	if err := tx.Commit(); err != nil {
 		return 0, err
 	}
 	return id, nil

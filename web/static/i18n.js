@@ -356,7 +356,7 @@ const I18N_EN = {
   '一键领取（检测+验证码+领取）': 'One-click claim (detect + captcha + claim)',
   '仅检测活动': 'Detect campaigns only',
   '激活套餐（上报激活事件）': 'Activate plan (report activation event)',
-  '配额重置（耗尽时恢复窗口配额）': 'Quota reset (restore window quota when exhausted)',
+  '重置仅支持手动执行，请删除此计划': 'Resets are manual-only. Delete this legacy plan.',
   'cron 表达式（分 时 日 月 周）': 'cron expression (min hour day month weekday)',
   '示例：0 9 * * * = 每天 09:00；*/30 * * * * = 每 30 分钟': 'Examples: 0 9 * * * = daily at 09:00; */30 * * * * = every 30 minutes',
   '全部可用账号': 'All available accounts',

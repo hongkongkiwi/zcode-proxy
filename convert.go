@@ -1032,9 +1032,13 @@ func (z *ZCodeAPI) streamResponses(w http.ResponseWriter, flusher http.Flusher, 
 			arguments = "{}"
 		}
 		var parsed map[string]interface{}
-		if err := json.Unmarshal([]byte(arguments), &parsed); err != nil || parsed == nil {
-			// 解析失败或字面量 "null"（Unmarshal 成功但得 nil）：一律空对象，
-			// 客户端工具执行器期待 input 为对象
+		if err := json.Unmarshal([]byte(arguments), &parsed); err != nil {
+			usage.ToolTruncated = true
+			delete(blocks, idx)
+			return // Do not emit successful tool terminal events for invalid arguments.
+		}
+		if parsed == nil {
+			// Preserve normalization of valid JSON null to an empty object.
 			parsed = map[string]interface{}{}
 		}
 		usage.ToolCalls = append(usage.ToolCalls, map[string]interface{}{

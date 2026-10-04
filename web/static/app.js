@@ -899,13 +899,13 @@ function renderPlans() {
         <td class="mono">${esc(p.cron_expr)}</td>
         <td>${p.target_type === 'single_account' ? tf('账号#%s', p.account_id) : p.target_type === 'group' ? tf('分组: %s', esc(p.account_group)) : t('全部账号')}</td>
         <td>${p.delay_seconds}s</td>
-        <td style="font-size:12px">${esc(p.next_run_at || '-')}</td>
+        <td style="font-size:12px">${p.task_type === 'reset' ? '-' : esc(p.next_run_at || '-')}</td>
         <td style="font-size:12px">${esc(p.last_run_at || '-')}<div style="color:var(--c-text-lighter);font-size:11px;max-width:200px;overflow:hidden;text-overflow:ellipsis" title="${esc(p.last_run_msg || '')}">${esc(p.last_run_msg || '')}</div></td>
-        <td>${p.is_active ? `<span class="badge badge-success">${t('启用')}</span>` : `<span class="badge badge-secondary">${t('停用')}</span>`}
+        <td>${p.task_type === 'reset' ? `<span class="badge badge-warning">${t('重置仅支持手动执行，请删除此计划')}</span>` : p.is_active ? `<span class="badge badge-success">${t('启用')}</span>` : `<span class="badge badge-secondary">${t('停用')}</span>`}
             ${p.last_run_status ? `<div style="margin-top:3px">${p.last_run_status === 'success' ? '✅' : '❌'}</div>` : ''}</td>
         <td class="actions-cell">
-          <button class="btn btn-sm btn-primary" onclick="runPlan(${p.id})">${t('立即运行')}</button>
-          <button class="btn btn-sm btn-secondary" onclick="showPlanModal(${p.id})">${t('编辑')}</button>
+          <button class="btn btn-sm btn-primary" onclick="runPlan(${p.id})" ${p.task_type === 'reset' ? 'disabled' : ''}>${t('立即运行')}</button>
+          <button class="btn btn-sm btn-secondary" onclick="showPlanModal(${p.id})" ${p.task_type === 'reset' ? 'disabled' : ''}>${t('编辑')}</button>
           <button class="btn btn-sm btn-danger" onclick="deletePlan(${p.id})">${t('删除')}</button>
         </td>
       </tr>`).join('')}</tbody></table></div>`;
@@ -913,6 +913,7 @@ function renderPlans() {
 
 async function showPlanModal(id) {
   const p = plansCache.find(x => x.id === id) || {};
+  if (p.task_type === 'reset') { toast(t('重置仅支持手动执行，请删除此计划'), 'error'); return; }
   // 账号缓存为空（如启动后直接进入活动页）、或缓存带着分组筛选而当前计划的
   // 目标账号不在其中时，拉取全量列表：否则 single_account 计划编辑时看不到
   // 真实目标，保存也会被拒
@@ -938,7 +939,6 @@ async function showPlanModal(id) {
         <option value="claim" ${p.task_type === 'claim' ? 'selected' : ''}>${t('一键领取（检测+验证码+领取）')}</option>
         <option value="detect" ${p.task_type === 'detect' ? 'selected' : ''}>${t('仅检测活动')}</option>
         <option value="activate" ${p.task_type === 'activate' ? 'selected' : ''}>${t('激活套餐（上报激活事件）')}</option>
-        <option value="reset" ${p.task_type === 'reset' ? 'selected' : ''}>${t('配额重置（耗尽时恢复窗口配额）')}</option>
       </select></div>
     <div class="form-group"><label>${t('cron 表达式（分 时 日 月 周）')}</label>
       <input type="text" id="planCron" class="mono" value="${esc(p.cron_expr || '0 9 * * *')}" placeholder="0 9 * * *">
@@ -1003,6 +1003,7 @@ async function deletePlan(id) {
 }
 
 async function runPlan(id) {
+  if (plansCache.find(p => p.id === id)?.task_type === 'reset') { toast(t('重置仅支持手动执行，请删除此计划'), 'error'); return; }
   try { await api(`/api/plans/${id}/run`, { method: 'POST' }); toast(t('已开始执行，见顶部进度'), 'info'); }
   catch (e) { toast(e.message, 'error'); }
 }
