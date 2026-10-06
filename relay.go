@@ -521,7 +521,16 @@ func (z *ZCodeAPI) forwardOnce(w http.ResponseWriter, r *http.Request, a *Accoun
 			req.Header.Set(k, v)
 		}
 
-		client := ClientForURL(z.egress.ProxyURLForAccount(a), urlStr, 0) // 流式无总超时，靠 context
+		// 流式无总超时，靠 context；非流式走慢速 TTFB transport：GLM 思考型
+		// 非流式调用（客户端验证/compaction 回退）首字节可达分钟级，复用流式
+		// 的 60s ResponseHeaderTimeout 会在思考中途杀请求 → 客户端整单重试烧账号
+		proxyURL := z.egress.ProxyURLForAccount(a)
+		var client *http.Client
+		if upstreamStream {
+			client = ClientForURL(proxyURL, urlStr, 0)
+		} else {
+			client = ClientForURLSlowTTFB(proxyURL, urlStr)
+		}
 		resp, err := client.Do(req)
 		if err != nil {
 			// 客户端断连/取消：不动账号状态，直接终止（不写响应，对端已走）
@@ -724,6 +733,13 @@ func (z *ZCodeAPI) forwardOnce(w http.ResponseWriter, r *http.Request, a *Accoun
 				return outcomeUpstreamError
 			}
 			usage := parseAnthropicUsageJSON(body)
+			// 客户端遥测按 x-request-id → request-id 顺序读取（runner-telemetry）：
+			// 与流式透传、错误路径同规转发
+			for _, k := range []string{"x-request-id", "request-id"} {
+				if v := resp.Header.Get(k); v != "" {
+					w.Header().Set(k, v)
+				}
+			}
 			z.recordUsage(a, r, payload, resp.StatusCode, start, 0, usage, rc.clientStream)
 			writeProtocolResponse(w, rc, resp.StatusCode, contentType, body, usage)
 			return outcomeWritten

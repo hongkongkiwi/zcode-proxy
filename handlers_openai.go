@@ -418,10 +418,28 @@ func openaiToAnthropic(body map[string]interface{}) (map[string]interface{}, err
 			out["stop_sequences"] = []interface{}{s}
 		}
 	}
-	// 透传 reasoning_effort：fixThinking 依赖它推导 output_config.effort，
-	// 丢弃会导致 GLM-5.3 恒定以 high 档运行（low/max 请求被静默降级/升级）
+	// 推理控制透传：zai-org/ZCode 的 option-map 会给 openai-compat 请求注入
+	// thinking / enable_thinking / reasoning.effort / reasoning_effort 多种形状，
+	// 全部归一到 Anthropic 侧字段；随后 normalizeBody→fixThinking 按模型再归一化
+	// （丢弃会导致 GLM-5.3 恒定以 high 档运行，low/max 请求被静默降级/升级）
 	if e, ok := body["reasoning_effort"]; ok && e != nil {
 		out["reasoning_effort"] = e
+	}
+	if re, ok := body["reasoning"].(map[string]interface{}); ok {
+		if e, ok := re["effort"].(string); ok && e != "" {
+			if _, exists := out["reasoning_effort"]; !exists {
+				out["reasoning_effort"] = e
+			}
+		}
+	}
+	if th, ok := body["thinking"].(map[string]interface{}); ok {
+		out["thinking"] = th
+	} else if et, ok := body["enable_thinking"].(bool); ok {
+		if et {
+			out["thinking"] = map[string]interface{}{"type": "enabled"}
+		} else {
+			out["thinking"] = map[string]interface{}{"type": "disabled"}
+		}
 	}
 
 	// tools 转换

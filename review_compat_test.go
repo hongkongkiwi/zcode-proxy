@@ -135,17 +135,35 @@ func TestRelayRateLimitExhaustionReturns529(t *testing.T) {
 
 // ---- F3 ----
 
+// flushSignalRecorder 在代理 Flush 时发信号：测试据此得知 chunk1 已被消费，
+// 静默窗口从这一刻起算——否则上游的 sleep 会与客户端建立/读取的耗时赛跑
+//（-race 下首读可慢 100ms+，两个 chunk 在 socket 里合拢，代理根本没有
+// 静默窗口可注入 ping，测试纯属掷硬币）
+type flushSignalRecorder struct {
+	*httptest.ResponseRecorder
+	flushed chan struct{}
+}
+
+func (r *flushSignalRecorder) Flush() {
+	r.ResponseRecorder.Flush()
+	select {
+	case r.flushed <- struct{}{}:
+	default:
+	}
+}
+
 func TestSSEPassthroughInjectsPingDuringSilence(t *testing.T) {
 	old := ssePingInterval
 	ssePingInterval = 20 * time.Millisecond
 	defer func() { ssePingInterval = old }()
 
+	writeSecond := make(chan struct{})
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.WriteHeader(http.StatusOK)
 		io.WriteString(w, "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":1}}}\n\n")
 		w.(http.Flusher).Flush()
-		time.Sleep(120 * time.Millisecond) // 静默窗口：必须注入 ping
+		<-writeSecond // 静默窗口由测试精确控制（见上），不与读取耗时赛跑
 		io.WriteString(w, "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n")
 	}))
 	defer srv.Close()
@@ -157,10 +175,18 @@ func TestSSEPassthroughInjectsPingDuringSilence(t *testing.T) {
 
 	db := newCompletionsTestDB(t)
 	z := &ZCodeAPI{db: db}
-	w := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
-	streamProtocolResponse(w, &relayCtx{proto: protocolAnthropic, clientStream: true, clientModel: "my-model"},
-		resp, &Account{}, req, []byte(`{}`), z, time.Now())
+	w := &flushSignalRecorder{ResponseRecorder: httptest.NewRecorder(), flushed: make(chan struct{}, 8)}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		streamProtocolResponse(w, &relayCtx{proto: protocolAnthropic, clientStream: true, clientModel: "my-model"},
+			resp, &Account{}, httptest.NewRequest(http.MethodPost, "/v1/messages", nil), []byte(`{}`), z, time.Now())
+	}()
+
+	<-w.flushed                    // chunk1 已消费：代理此刻必然空闲在 select 上
+	time.Sleep(4 * ssePingInterval) // 真实静默 ≥4 个 tick，ping 必须注入
+	close(writeSecond)
+	<-done
 
 	out := w.Body.String()
 	if !strings.Contains(out, "event: ping") || !strings.Contains(out, `{"type":"ping"}`) {
@@ -270,5 +296,127 @@ func TestImageURLPrivateAddressBlocked(t *testing.T) {
 	err := validateMessagesBody(body)
 	if err == nil || !strings.Contains(err.Error(), "image url fetch failed") || !strings.Contains(err.Error(), "local/private") {
 		t.Fatalf("loopback fetch must be refused by SSRF guard, got: %v", err)
+	}
+}
+
+// ---- R2 轮（openai 兼容模式 + 非流式 TTFB + request-id 遥测）----
+
+// 非流式转发的 transport 首字节上限必须放宽到 10min；流式保持 60s 黑洞防护
+func TestSlowTTFBClientsUseLongerHeaderTimeout(t *testing.T) {
+	slow := ClientForURLSlowTTFB("", "https://api.z.ai/v1/messages")
+	tr, ok := slow.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("slow client transport type %T", slow.Transport)
+	}
+	if tr.ResponseHeaderTimeout != slowTTFBHeaderTimeout {
+		t.Fatalf("slow std ResponseHeaderTimeout = %v, want %v", tr.ResponseHeaderTimeout, slowTTFBHeaderTimeout)
+	}
+	if slow.Timeout != 0 {
+		t.Fatalf("slow client Timeout = %v, want 0", slow.Timeout)
+	}
+	slowFP := ClientForURLSlowTTFB("", "https://zcode.z.ai/api/v1/x")
+	trFP, ok := slowFP.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("slow fingerprint transport type %T", slowFP.Transport)
+	}
+	if trFP.ResponseHeaderTimeout != slowTTFBHeaderTimeout {
+		t.Fatalf("slow fp ResponseHeaderTimeout = %v", trFP.ResponseHeaderTimeout)
+	}
+	fast := ClientForURL("", "https://api.z.ai/v1/messages", 0)
+	trFast := fast.Transport.(*http.Transport)
+	if trFast.ResponseHeaderTimeout != upstreamHeaderTimeout {
+		t.Fatalf("fast ResponseHeaderTimeout = %v, want %v", trFast.ResponseHeaderTimeout, upstreamHeaderTimeout)
+	}
+}
+
+// ZCode option-map 给 openai-compat 请求注入四种推理控制形状：全部归一
+func TestOpenAIThinkingControlPassthrough(t *testing.T) {
+	db := newCompletionsTestDB(t)
+	z := &ZCodeAPI{db: db, cfg: &FileConfig{}}
+	conv := func(extra map[string]interface{}) map[string]interface{} {
+		body := map[string]interface{}{
+			"model":    "GLM-5.3",
+			"messages": []interface{}{map[string]interface{}{"role": "user", "content": "hi"}},
+		}
+		for k, v := range extra {
+			body[k] = v
+		}
+		out, err := openaiToAnthropic(body)
+		if err != nil {
+			t.Fatalf("convert: %v", err)
+		}
+		if err := normalizeBody(out, z); err != nil {
+			t.Fatalf("normalize: %v", err)
+		}
+		return out
+	}
+	assertEffort := func(t *testing.T, out map[string]interface{}, want string) {
+		t.Helper()
+		th, _ := out["thinking"].(map[string]interface{})
+		if th["type"] != "adaptive" {
+			t.Fatalf("thinking = %v, want adaptive", out["thinking"])
+		}
+		oc, _ := out["output_config"].(map[string]interface{})
+		if oc["effort"] != want {
+			t.Fatalf("effort = %v, want %q", oc["effort"], want)
+		}
+	}
+	t.Run("reasoning.effort max", func(t *testing.T) {
+		out := conv(map[string]interface{}{"reasoning": map[string]interface{}{"effort": "max"}})
+		assertEffort(t, out, "max")
+	})
+	t.Run("reasoning_effort low", func(t *testing.T) {
+		out := conv(map[string]interface{}{"reasoning_effort": "low"})
+		assertEffort(t, out, "low")
+	})
+	t.Run("enable_thinking false", func(t *testing.T) {
+		out := conv(map[string]interface{}{"enable_thinking": false})
+		if th, _ := out["thinking"].(map[string]interface{}); th["type"] != "disabled" {
+			t.Fatalf("thinking = %v, want disabled", out["thinking"])
+		}
+	})
+	t.Run("thinking budget 1024", func(t *testing.T) {
+		out := conv(map[string]interface{}{"thinking": map[string]interface{}{"type": "enabled", "budget_tokens": float64(1024)}})
+		assertEffort(t, out, "low")
+	})
+	t.Run("reasoning.effort yields to reasoning_effort", func(t *testing.T) {
+		out := conv(map[string]interface{}{
+			"reasoning":        map[string]interface{}{"effort": "low"},
+			"reasoning_effort": "high",
+		})
+		assertEffort(t, out, "high")
+	})
+}
+
+// 非流式成功响应也要转发上游 request-id（客户端遥测按 x-request-id → request-id 读取）
+func TestRelayNonStreamForwardsRequestID(t *testing.T) {
+	p, db := newPaidTestPool(t)
+	if err := db.SetSetting("captcha_mode", "off"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.UpsertAccount(mkDualAccount("reqid", StatusActive)); err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("X-Request-Id", "req-abc123")
+		io.WriteString(w, `{"type":"message","id":"msg_1","role":"assistant","content":[{"type":"text","text":"ok"}],"model":"GLM-5.3","stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}`)
+	}))
+	defer server.Close()
+	cfg := &FileConfig{Upstream: UpstreamURLs{Zai: server.URL, ZaiFallback: server.URL, Bigmodel: server.URL}}
+	z := &ZCodeAPI{cfg: cfg, db: db, pool: p, egress: NewEgressProxy(db),
+		captcha: NewCaptchaService(cfg, db, "3.14.4"),
+		routing: &EndpointRouter{snapshot: &routingSnapshot{expiresAt: time.Now().Add(time.Hour)}},
+	}
+	w := httptest.NewRecorder()
+	z.relay(w, httptest.NewRequest(http.MethodPost, "/v1/messages", nil), &relayCtx{
+		provider: "zai", proto: protocolAnthropic, clientStream: false,
+		body: map[string]interface{}{"model": "GLM-5.3", "messages": []interface{}{map[string]interface{}{"role": "user", "content": "hello"}}},
+	})
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", w.Code, w.Body.String())
+	}
+	if got := w.Header().Get("X-Request-Id"); got != "req-abc123" {
+		t.Fatalf("X-Request-Id = %q, want req-abc123", got)
 	}
 }
