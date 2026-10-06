@@ -52,7 +52,7 @@ Go 单二进制实现的 **ZCode（Z.AI / GLM Coding Plan）多账号管理 + OA
 | 模块 | 说明 |
 |---|---|
 | 多账号管理 | 本地客户端一键导入 / OAuth 登录（免回调 CLI 轮询为主，手动粘贴备用）/ 粘贴 JWT·API Key；分组、启用策略（random / round_robin / best_quota / **priority 级联**）、状态机、**免费/付费双通道**（free_first 回退模式 + 每日付费 token 上限）、单账号并发上限（账号×通道隔离）、**会话粘滞**（保住上游 prompt 缓存）、耗尽窗口重置时间提示 |
-| 2API 网关 | `/v1/messages`（Anthropic 原生）、`/v1/chat/completions`、`/v1/completions`（文本补全 shim）、`/v1/responses`、`/v1/models` + `GET /v1/models/{id}`、`/v1/messages/count_tokens`（内容感知估算）；SSE 流式 + 用量/TTFT/缓存 token 记录；上游端点按服务端 `agent/configs` 路由表自动重写（fail-open） |
+| 2API 网关 | `/v1/messages`（Anthropic 原生）、`/v1/chat/completions`、`/v1/completions`（文本补全 shim）、`/v1/responses`、`/v1/models` + `GET /v1/models/{id}`、`/v1/messages/count_tokens`（内容感知估算）、**`/api/v1/ultra[|-zai]/anthropic/v1/messages`（官方编码计划网关改写别名：客户端 `ZCODE_BASE_URL` 指向本代理即可承接 OAuth 编码计划流量）**；SSE 流式 + 用量/TTFT/缓存 token 记录；上游端点按服务端 `agent/configs` 路由表自动重写（fail-open） |
 | 网关 Key | 根 Key 之外按客户端签发命名 `sk-` Key：每 Key 独立 RPM 上限 / 总 token 配额（缓存感知计费）/ 模型白名单（联动 `/v1/models` 过滤）；库内仅存哈希，签发需密码步升 |
 | 闲时通道 | `/async/v1/messages`（Anthropic 原生）经上游 **off-peak 免费算力队列**：取票排队、SSE 注释帧保活、`X-Off-Peak-Ticket-ID` 调用、幂等关票、票回收自动重取；设置 `async_enabled` 开启（默认关） |
 | 额度监控 | 后台周期刷新；账号页额度条**可点开**查看分套餐槽位与逐模型额度构成；驱动状态机；JWT 通道（Start Plan 计费）报耗尽而账号带 API Key 时自动交叉核对 monitor 通道（individual coding plan 额度），有余量则以 monitor 为准 |
@@ -194,7 +194,7 @@ Go 单二进制实现的 **ZCode（Z.AI / GLM Coding Plan）多账号管理 + OA
    - 付费路径：`x-api-key` → `api.z.ai/api/anthropic/v1/messages`（无需验证码；balanced 模式下软失败立即级联同账号付费）。
 5. **上游错误分类**：`401/403→invalid`（先试 refresh_token 刷新；付费通道仅冷却付费 1h，不判死账号）；`429→请求内退避重试一次(尊重 Retry-After 1-5s，缺省 2s)，仍失败按梯度 cooling 30s→120s→300s（免费/付费独立记忆，成功清零；业务码 1302/1303 同按限流）`；`402/余额短语→exhausted（付费侧冷却 6h）`；`3012 unusual activity→风控（优先于 401/403 判定），试其余路径，全败按风控梯度 120s→30min→24h（24h 窗口内累进）`；`3xx→cooling 120s(WAF 挑战)`；`2xx 但非 json/sse→cooling 120s`；HTML 挑战/拦截页→通道冷却 300s；`2xx JSON 错误信封→502 并解除会话粘滞`；其余原样回传。挑战页（3xx / 2xx 非 JSON/SSE）返回客户端时统一为 `502`，不伪装 200。
 6. **成功**：`MarkUsed`（记录使用；cooling 到期后自动重新可选，exhausted 仅由额度刷新确认有余量后恢复）+ 节流额度刷新（30s，进程内单飞）+ 流式透传/转换 + SSE 嗅探写 `usage_records`（含 TTFT 与缓存 token，网关 Key 配额同步记账）；客户端中途取消按 499 落库。
-7. **全败**：503 `no_available_account`，若因冷却则附「约 N 秒后自动恢复」与最近失败原因链。
+7. **全败**：`Anthropic 错误信封 {"type":"error","error":{type,message}}`——全部账号均为限流冷却时回 **529 `overloaded_error` + Retry-After**（客户端有专门过载分类与精确退避）；混合故障（限流+鉴权失效/耗尽/风控等）或付费闸拦截时回 503 `no_available_account`，若因冷却则附「约 N 秒后自动恢复」与最近失败原因链（经出口代理的连接失败只写「代理不可达」，不泄露代理地址）。
 
 ## 3. 并发与锁模型
 
@@ -264,7 +264,7 @@ Go 单二进制实现的 **ZCode（Z.AI / GLM Coding Plan）多账号管理 + OA
 - **Anthropic→Responses**：`response.created/output_item.added/reasoning_summary_part.added/reasoning_summary_text.delta/reasoning_summary_text.done/reasoning_summary_part.done/content_part.added/output_text.delta/function_call_arguments.delta/output_text.done/output_item.done/response.completed`（思考以 `type:reasoning` 输出项流式发出，`response.completed.output` 与事件序列一致）；错误/断流发 `response.failed`。
 - **OpenAI→Anthropic 请求**：system/developer→`system` 串；tool→`tool_result`；assistant.tool_calls→`tool_use`；image_url 仅接受 data: base64（其余形态返回 400，不静默丢弃）；tool_choice auto/required/name 映射。reasoning_effort 透传至 GLM-5.3 思考档位，非 5.3 模型丢弃。 不按助手输出从全局缓存回填签名思考块，避免跨用户/会话泄露；需重放签名思考块的客户端应使用 Anthropic 原生接口并显式携带原始块。
 - **Responses→Anthropic**：instructions→system；input[] 的 message/function_call/function_call_output 映射；reasoning.effort→reasoning_effort。
-- **健壮性**：SSE 解析缓冲上限 16MB（超限按流失败处理，不静默清空）、跨 chunk 断帧兼容 LF/CRLF；命名 `event:error`、匿名 `data:` 错误帧（顶层 `error` 字段或 `type=error`）与 `err!=io.EOF` 均按失败处理（不伪装成功）；非流式响应聚合读取上限 64MB（超限按失败）；工具调用参数中途截断按流失败处理（不静默截断）；上游零事件干净 EOF 按 502 返回；客户端取消按 499 落库。
+- **健壮性**：SSE 解析缓冲上限 16MB（超限按流失败处理，不静默清空）、跨 chunk 断帧兼容 LF/CRLF；命名 `event:error`、匿名 `data:` 错误帧（顶层 `error` 字段或 `type=error`）与 `err!=io.EOF` 均按失败处理（不伪装成功）；非流式响应聚合读取上限 64MB（超限按失败）；工具调用参数中途截断按流失败处理（不静默截断）；上游零事件干净 EOF 按 502 返回；客户端取消按 499 落库；**非流式响应体总读取时限 15 分钟**（超时/中断按 502 + 账号冷却 60s，截断 body 不下传；流式由客户端 600s 空闲超时兜底，静默期注入协议合法 `ping` 帧）；**url 形态图片受控抓取内联**（SSRF 连接前 IP 校验、直连不走代理、5MB/张、单请求 24 张/32MB base64 上限、URL 去重，失败 fail-closed 400）
 
 ## 7. 验证码子系统（阿里云无痕）
 

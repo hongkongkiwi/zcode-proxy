@@ -657,3 +657,36 @@ func TestConnFailReasonSanitized(t *testing.T) {
 		t.Fatalf("direct dial reason should keep errno detail: %s", direct)
 	}
 }
+
+// 官方编码计划网关改写路径别名：路由到 HandleMessages 且被 API Key 中间件覆盖
+func TestGatewayAliasRouting(t *testing.T) {
+	db := newCompletionsTestDB(t)
+	z := &ZCodeAPI{db: db}
+	am := &AuthManager{db: db}
+	mux := http.NewServeMux()
+	registerModelRoutes(mux, z)
+	h := am.Middleware(mux)
+
+	for _, path := range []string{
+		"/api/v1/ultra/anthropic/v1/messages",
+		"/api/v1/ultra-zai/anthropic/v1/messages",
+	} {
+		t.Run(path, func(t *testing.T) {
+			// 无凭证：必须 401（别名路径不得成为未认证模型端点）
+			w := httptest.NewRecorder()
+			h.ServeHTTP(w, httptest.NewRequest(http.MethodPost, path, strings.NewReader(`{}`)))
+			if w.Code != http.StatusUnauthorized {
+				t.Fatalf("unauthenticated status = %d, want 401; body=%s", w.Code, w.Body.String())
+			}
+			// 路由必须落到 HandleMessages（对非法 body 回 400 校验信封，而非 404）
+			w2 := httptest.NewRecorder()
+			mux.ServeHTTP(w2, httptest.NewRequest(http.MethodPost, path, strings.NewReader(`{"model":"GLM-5.3","messages":"x"}`)))
+			if w2.Code != http.StatusBadRequest {
+				t.Fatalf("routed status = %d, want 400 from HandleMessages; body=%s", w2.Code, w2.Body.String())
+			}
+			if !strings.Contains(w2.Body.String(), `"type":"error"`) {
+				t.Fatalf("expected Anthropic error envelope: %s", w2.Body.String())
+			}
+		})
+	}
+}

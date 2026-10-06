@@ -187,18 +187,8 @@ func main() {
 	mux := http.NewServeMux()
 	apiServer.RegisterRoutes(mux)
 
-	// 2API 端点
-	mux.HandleFunc("/v1/messages", zapi.HandleMessages)
-	mux.HandleFunc("/v1/messages/", zapi.HandleMessages)
-	mux.HandleFunc("/v1/messages/count_tokens", zapi.HandleCountTokens)
-	mux.HandleFunc("/v1/chat/completions", zapi.HandleChatCompletions)
-	mux.HandleFunc("/v1/completions", zapi.HandleCompletions)
-	mux.HandleFunc("/v1/responses", zapi.HandleResponses)
-	mux.HandleFunc("/v1/models", zapi.HandleModels)
-	mux.HandleFunc("/v1/models/", zapi.HandleModelRetrieve)
-
-	// 闲时免费通道（off-peak ticket queue；设置 async_enabled 开启）
-	mux.HandleFunc("/async/v1/messages", zapi.HandleAsyncMessages)
+	// 2API 端点（含官方编码计划网关改写别名）
+	registerModelRoutes(mux, zapi)
 
 	// OAuth 环回回调（浏览器授权后跳转，无需认证）
 	mux.HandleFunc("/oauth/callback", oauth.HandleCallback)
@@ -244,7 +234,7 @@ func main() {
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprint(w, `{"service":"zcode-proxy","version":"1.0","endpoints":["/v1/messages","/v1/chat/completions","/v1/completions","/v1/responses","/v1/models","/api/","/web","/health"]}`)
+		fmt.Fprint(w, `{"service":"zcode-proxy","version":"1.0","endpoints":["/v1/messages","/v1/chat/completions","/v1/completions","/v1/responses","/v1/models","/api/v1/ultra/anthropic/v1/messages","/api/","/web","/health"]}`)
 	})
 
 	listenAddr := cfg.GetListenAddr()
@@ -376,5 +366,31 @@ func (wt *writeTracker) Write(b []byte) (int, error) {
 func (wt *writeTracker) Flush() {
 	if f, ok := wt.ResponseWriter.(http.Flusher); ok {
 		f.Flush()
+	}
+}
+
+// registerModelRoutes 模型 API 端点注册（main 的 mux 装配抽出以便路由测试）。
+//
+// /api/v1/ultra[|-zai]/anthropic/v1/messages 是 zai-org/ZCode 官方编码计划网关
+// （official-coding-plan-gateway）的改写形状：客户端把 ZCODE_BASE_URL 指向本代理
+// 时，原本发往 https://api.z.ai/api/anthropic/v1/messages 的请求被改写为
+// {ZCODE_BASE_URL}/api/v1/ultra[|-zai]/anthropic/v1/messages。别名到
+// HandleMessages：认证走同一 API Key 中间件（auth.go 对 /api/v1/ultra 前缀
+// 同样拦截），上游凭证由账号池注入，客户端自带计划凭证仅作本地认证。
+func registerModelRoutes(mux *http.ServeMux, zapi *ZCodeAPI) {
+	mux.HandleFunc("/v1/messages", zapi.HandleMessages)
+	mux.HandleFunc("/v1/messages/", zapi.HandleMessages)
+	mux.HandleFunc("/v1/messages/count_tokens", zapi.HandleCountTokens)
+	mux.HandleFunc("/v1/chat/completions", zapi.HandleChatCompletions)
+	mux.HandleFunc("/v1/completions", zapi.HandleCompletions)
+	mux.HandleFunc("/v1/responses", zapi.HandleResponses)
+	mux.HandleFunc("/v1/models", zapi.HandleModels)
+	mux.HandleFunc("/v1/models/", zapi.HandleModelRetrieve)
+	mux.HandleFunc("/async/v1/messages", zapi.HandleAsyncMessages)
+	for _, p := range []string{
+		"/api/v1/ultra/anthropic/v1/messages",
+		"/api/v1/ultra-zai/anthropic/v1/messages",
+	} {
+		mux.HandleFunc(p, zapi.HandleMessages)
 	}
 }
