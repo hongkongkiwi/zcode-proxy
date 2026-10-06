@@ -81,6 +81,10 @@ type relayCtx struct {
 	includeUsage bool   // OpenAI stream_options.include_usage
 	echo         bool   // /v1/completions echo=true：choices.text 前缀原 prompt
 	prompt       string // /v1/completions 原始 prompt（echo 回显用）
+	// sawRateLimit 本次请求内任一账号/通道撞过上游限流（HTTP 429 或业务码）。
+	// 全部账号耗尽时用于区分"过载"（→ 529 overloaded_error，客户端有专门的
+	// 过载重试分类与文案）与"无可用账号"（→ 503）
+	sawRateLimit bool
 }
 
 // HandleMessages POST /v1/messages — 原生 Anthropic 协议
@@ -220,12 +224,13 @@ func (z *ZCodeAPI) relay(w http.ResponseWriter, r *http.Request, rc *relayCtx) {
 		msg += "；" + paidSkipReason
 	}
 	// 若因冷却导致无可用账号，给出预计恢复时间
+	coolSecs := int64(0)
 	if until, reason := z.pool.CoolingInfo(rc.provider, rc.group, accounts); until > 0 {
-		secs := until - time.Now().Unix()
-		if secs < 0 {
-			secs = 0
+		coolSecs = until - time.Now().Unix()
+		if coolSecs < 0 {
+			coolSecs = 0
 		}
-		msg += fmt.Sprintf("；免费通道冷却中（%s），约 %d 秒后自动恢复重试", firstNonEmpty(reason, "上游限流/风控"), secs)
+		msg += fmt.Sprintf("；免费通道冷却中（%s），约 %d 秒后自动恢复重试", firstNonEmpty(reason, "上游限流/风控"), coolSecs)
 	}
 	// F3：耗尽账号的上游重置时间已知时如实告知（monitor 通道 nextResetTime）。
 	// 不带账号邮箱/展示名：503 体面向命名 Key 持有方（可能发给第三方）
@@ -240,6 +245,28 @@ func (z *ZCodeAPI) relay(w http.ResponseWriter, r *http.Request, rc *relayCtx) {
 		msg += "（最近失败原因: " + detail + "）"
 	}
 	log.Printf("[relay] no available account: %s", detail)
+	writeAllAccountsUnavailable(w, rc, msg, paidSkipReason != "", coolSecs)
+}
+
+// writeAllAccountsUnavailable 终态"无账号可用"响应。Anthropic 协议且本次请求见过
+// 上游限流时按 529 overloaded_error 回报：zai-org/ZCode 客户端对 529 有专门的
+// 过载分类（可重试、文案 "Provider is overloaded"），并对 429/529 解析 Retry-After
+// 精确退避；一律 503 会让它退回通用指数退避。付费闸拦截（paidSkipped）说明根因
+// 含策略/配额而非纯过载，维持 503。错误体用 Anthropic 原生 {"type":"error",...} 形状。
+func writeAllAccountsUnavailable(w http.ResponseWriter, rc *relayCtx, msg string, paidSkipped bool, coolSecs int64) {
+	if rc.proto == protocolAnthropic && rc.sawRateLimit && !paidSkipped {
+		retryAfter := 10
+		if coolSecs >= 1 && coolSecs <= 300 {
+			retryAfter = int(coolSecs)
+		}
+		w.Header().Set("Retry-After", strconv.Itoa(retryAfter))
+		log.Printf("[relay] all accounts rate-limited → 529 overloaded_error (retry-after=%ds)", retryAfter)
+		writeJSON(w, 529, map[string]interface{}{
+			"type":  "error",
+			"error": map[string]string{"type": "overloaded_error", "message": msg},
+		})
+		return
+	}
 	writeJSON(w, http.StatusServiceUnavailable, map[string]interface{}{
 		"error": map[string]string{"message": msg, "type": "no_available_account"},
 	})
@@ -578,7 +605,9 @@ func (z *ZCodeAPI) forwardOnce(w http.ResponseWriter, r *http.Request, a *Accoun
 				return outcomeNextAccount
 			case resp.StatusCode == 429 || isRateLimitBody(resp.StatusCode, text):
 				// 限流（HTTP 429 或业务码 1302/1303 并发超限）：请求内退避重试一次
-				//（尊重 Retry-After），仍失败则按历史冷却时长升级 30s → 120s → 300s
+				//（尊重 Retry-After），仍失败则按历史冷却时长升级 30s → 120s → 300s。
+				// 记录过载信号：全账号耗尽时终态按 529 overloaded_error 回报
+				rc.sawRateLimit = true
 				retryAfter := 2
 				if ra := resp.Header.Get("Retry-After"); ra != "" {
 					if n, err := strconv.Atoi(ra); err == nil && n > 0 && n <= 5 {
@@ -1139,8 +1168,12 @@ func validateMessagesBody(body map[string]interface{}) error {
 			return fmt.Errorf("messages[%d] must be an object", i)
 		}
 		role, _ := mm["role"].(string)
-		if role != "user" && role != "assistant" {
-			return fmt.Errorf("messages[%d].role must be user or assistant", i)
+		// system 放行：zai-org/ZCode 允许 mid-conversation system 消息（硬编码
+		// allowSystemInMessages + anthropic-beta: mid-conversation-system-*），
+		// 一律 400 会把合法客户端流量打成不可重试的 InvalidModelRequest。
+		// 原样透传，由上游判定；仍拒绝其它未知 role
+		if role != "user" && role != "assistant" && role != "system" {
+			return fmt.Errorf("messages[%d].role must be user, assistant or system", i)
 		}
 		switch c := mm["content"].(type) {
 		case string:
@@ -1201,13 +1234,23 @@ func validateMessagesBody(body map[string]interface{}) error {
 						return fmt.Errorf("messages[%d].content[%d]: tool_result references unknown tool_use_id %q (dropped assistant turn?)", i, j, tid)
 					}
 				case "image":
-					// 上游只接受 base64 source：url 形态与缺失/null/非对象 source
-					// 一律本地拒绝（此前 url 形态放行 → 上游 400，健康账号白计一次
-					// MarkFailed）。与 handlers_openai.go 的 image_url fail-closed 同规
+					// 上游只接受 base64 source。url 形态改为受控抓取后内联
+					// （image_fetch.go：SSRF 防护 + 限长限时 + content-type 白名单），
+					// 抓取失败 fail-closed 回 400，与缺失/null/非对象 source 同规——
+					// 放行任何不完整形状只会换来上游 400 + 健康账号白计一次 MarkFailed
 					src, _ := bm["source"].(map[string]interface{})
 					st, _ := src["type"].(string)
 					data, _ := src["data"].(string)
-					if st == "url" || src == nil || data == "" {
+					if st == "url" {
+						u, _ := src["url"].(string)
+						inl, ferr := fetchImageAsBase64(u)
+						if ferr != nil {
+							return fmt.Errorf("messages[%d].content[%d]: image url fetch failed: %v", i, j, ferr)
+						}
+						bm["source"] = map[string]interface{}{"type": "base64", "media_type": inl.mediaType, "data": inl.data}
+						continue
+					}
+					if src == nil || data == "" {
 						return fmt.Errorf("messages[%d].content[%d]: image block must contain base64 data (url sources are not accepted by the upstream)", i, j)
 					}
 				}

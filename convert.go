@@ -446,6 +446,11 @@ func clientGone(r *http.Request) bool {
 	return r != nil && errors.Is(r.Context().Err(), context.Canceled)
 }
 
+// ssePingInterval 上游静默多久后向客户端注入一个协议合法的 ping 帧。
+// zai-org/ZCode 按 chunk 间隔计流空闲超时（超限 abort + 全量重试且每次重试加罚
+// 30s）；长思考/长工具调用间隙注入 ping 可避免误判。var 以便测试缩短间隔。
+var ssePingInterval = 15 * time.Second
+
 // streamProtocolResponse 流式透传/转换 + usage 嗅探 + 用量落库
 func streamProtocolResponse(w http.ResponseWriter, rc *relayCtx, resp *http.Response,
 	a *Account, r *http.Request, payload []byte, z *ZCodeAPI, start time.Time) {
@@ -475,28 +480,81 @@ func streamProtocolResponse(w http.ResponseWriter, rc *relayCtx, resp *http.Resp
 		ttft := 0
 		buf := make([]byte, 32*1024)
 		var readErr error
-		for {
-			n, err := resp.Body.Read(buf)
-			if n > 0 {
-				if ttft == 0 {
-					ttft = int(time.Since(start).Milliseconds())
+		// 上游静默时注入 ping 保活。仅对 200 透传体注入：错误体里混入 ping 会破坏协议。
+		// 上游 Read 是阻塞的，读到单独 goroutine，主循环 select 兼顾 ping 定时器；
+		// readDone 保证提前退出（解析溢出/错误）时生产 goroutine 不永久阻塞在 channel 上
+		pingInterval := time.Duration(0)
+		if resp.StatusCode == http.StatusOK {
+			pingInterval = ssePingInterval
+		}
+		type readResult struct {
+			buf []byte
+			n   int
+			err error
+		}
+		chunks := make(chan readResult)
+		// buf 归还通道：生产端取回处理完的 buf 才发起下一次 Read，否则上游
+		// Read 会覆写消费端仍在解析的上一块数据（-race 实证）
+		bufs := make(chan []byte, 1)
+		bufs <- buf
+		readDone := make(chan struct{})
+		go func() {
+			for {
+				var b []byte
+				select {
+				case b = <-bufs:
+				case <-readDone:
+					return
 				}
-				w.Write(buf[:n])
+				n, err := resp.Body.Read(b)
+				select {
+				case chunks <- readResult{buf: b, n: n, err: err}:
+				case <-readDone:
+					return
+				}
+				if err != nil {
+					return
+				}
+			}
+		}()
+		var pingC <-chan time.Time
+		if pingInterval > 0 {
+			ticker := time.NewTicker(pingInterval)
+			defer ticker.Stop()
+			pingC = ticker.C
+		}
+	readLoop:
+		for {
+			select {
+			case c := <-chunks:
+				if c.n > 0 {
+					if ttft == 0 {
+						ttft = int(time.Since(start).Milliseconds())
+					}
+					w.Write(c.buf[:c.n])
+					if flusher != nil {
+						flusher.Flush()
+					}
+					if ferr := parser.feed(c.buf[:c.n], func(ev sseEvent) {
+						applyEventToUsage(ev, &usage, &activeTool, &texts, &thinks)
+					}); ferr != nil {
+						readErr = ferr
+						break readLoop
+					}
+				}
+				if c.err != nil {
+					readErr = c.err
+					break readLoop
+				}
+				bufs <- c.buf // 处理完毕归还；生产端复用后才发起下一次 Read
+			case <-pingC:
+				w.Write([]byte("event: ping\ndata: {\"type\":\"ping\"}\n\n"))
 				if flusher != nil {
 					flusher.Flush()
 				}
-				if ferr := parser.feed(buf[:n], func(ev sseEvent) {
-					applyEventToUsage(ev, &usage, &activeTool, &texts, &thinks)
-				}); ferr != nil {
-					readErr = ferr
-					break
-				}
-			}
-			if err != nil {
-				readErr = err
-				break
 			}
 		}
+		close(readDone)
 		parser.flush(func(ev sseEvent) { applyEventToUsage(ev, &usage, &activeTool, &texts, &thinks) })
 		finalizeToolCalls(&usage)
 		cacheThinkingForOutput(strings.Join(texts, ""), &usage)
