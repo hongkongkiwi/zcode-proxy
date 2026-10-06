@@ -24,7 +24,10 @@ import (
 const (
 	maxCaptchaRetries  = 3
 	maxAccountAttempts = 5
-	maxRequestBytes    = 8 << 20
+	// 32MB：GLM-5.3 百万 token 上下文 + ~227 个工具 schema + base64 图片的
+	// 合法大请求可能越过 8MB；413 对客户端是不可重试硬失败（轮 7）。
+	// 出站上限仍为 64MB；本地个人代理，JSON 解析的内存尖峰可接受
+	maxRequestBytes = 32 << 20
 )
 
 // modelNameMap 上游模型名大小写敏感，客户端小写别名 → 官方名
@@ -1304,6 +1307,12 @@ func validateMessagesBody(ctx context.Context, body map[string]interface{}) erro
 				// 账号无谓计一次失败（空 text 例外同上：仅末条 assistant 放行）
 				switch btype {
 				case "text":
+					// 长度与 string content 同规（normalizeBody 已把 string 桥接成
+					// text 块，2M 上限不能只挡桥接前的形态）；超长块本地拒绝，
+					// 免得 marshal+转发后才被上游 400 并白计一次账号失败
+					if txt, _ := bm["text"].(string); len(txt) > 2_000_000 {
+						return fmt.Errorf("messages[%d].content[%d]: text block is too long", i, j)
+					}
 					if t, _ := bm["text"].(string); t == "" {
 						if !(i == len(msgs)-1 && role == "assistant") {
 							return fmt.Errorf("messages[%d].content[%d]: text block must contain non-empty text", i, j)

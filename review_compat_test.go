@@ -690,3 +690,31 @@ func TestGatewayAliasRouting(t *testing.T) {
 		})
 	}
 }
+
+// 轮 7：32MB 请求上限——GLM-5.3 百万上下文 + 227 工具 schema + 图片的合法大
+// 请求不得被 413 拒杀（413 对客户端不可重试）；超限仍 413
+func TestRequestSizeCapAcceptsLargeLegalBodies(t *testing.T) {
+	p, db := newPaidTestPool(t)
+	z := &ZCodeAPI{db: db, pool: p, egress: NewEgressProxy(db),
+		cfg: &FileConfig{Upstream: UpstreamURLs{Zai: "http://127.0.0.1:1", ZaiFallback: "http://127.0.0.1:1", Bigmodel: "http://127.0.0.1:1"}}}
+
+	// 9MB（旧 8MB 上限之外、新上限之内）：不得 413；超长文本块在本地校验层
+	// 以 400 明确拒绝（与 string content 同规），不到转发层
+	big := `{"model":"GLM-5.3","messages":[{"role":"user","content":"` + strings.Repeat("x", 9<<20) + `"}]}`
+	w := httptest.NewRecorder()
+	z.HandleMessages(w, httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(big)))
+	if w.Code == http.StatusRequestEntityTooLarge {
+		t.Fatalf("9MB legal body rejected as 413 (cap not raised?)")
+	}
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 (content too long validation)", w.Code)
+	}
+
+	// 超过 32MB：仍按 413 拒绝
+	huge := `{"model":"GLM-5.3","messages":[{"role":"user","content":"` + strings.Repeat("x", 33<<20) + `"}]}`
+	w2 := httptest.NewRecorder()
+	z.HandleMessages(w2, httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(huge)))
+	if w2.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("33MB body status = %d, want 413", w2.Code)
+	}
+}
