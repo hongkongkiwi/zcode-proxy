@@ -1343,9 +1343,13 @@ func (z *ZCodeAPI) streamResponses(w http.ResponseWriter, flusher http.Flusher, 
 		openMessageEvents(emptyIdx)
 		closeMessageEvents(emptyIdx)
 	}
-	writeEvent("response.completed", map[string]interface{}{
-		"response": responsesResponseWithItems(model, responseID, outputItems, fullText, fullThinking, &usage),
-	})
+	// max_tokens 截断 → response.incomplete（协议语义同上），其余 completed
+	responseObj := responsesResponseWithItems(model, responseID, outputItems, fullText, fullThinking, &usage)
+	terminal := "response.completed"
+	if responseObj["status"] == "incomplete" {
+		terminal = "response.incomplete"
+	}
+	writeEvent(terminal, map[string]interface{}{"response": responseObj})
 	if flusher != nil {
 		flusher.Flush()
 	}
@@ -1474,15 +1478,26 @@ func responsesResponseWithItems(model, responseID string, items []map[string]int
 	if usage != nil {
 		in, out = usage.InputTokens, usage.OutputTokens
 	}
-	return map[string]interface{}{
+	// max_tokens 截断按 Responses 协议语义回 status:"incomplete" +
+	// incomplete_details.max_output_tokens（客户端据此映射 finish=length）；
+	// 恒发 completed 会把截断谎报成正常 stop（轮 8）
+	status := "completed"
+	if usage != nil && usage.StopReason == "max_tokens" {
+		status = "incomplete"
+	}
+	out2 := map[string]interface{}{
 		"id": responseID, "object": "response", "created_at": time.Now().Unix(),
-		"status": "completed", "model": model,
+		"status": status, "model": model,
 		"output":      output,
 		"output_text": text,
 		"usage": map[string]interface{}{
 			"input_tokens": in, "output_tokens": out, "total_tokens": in + out,
 		},
 	}
+	if status == "incomplete" {
+		out2["incomplete_details"] = map[string]interface{}{"reason": "max_output_tokens"}
+	}
+	return out2
 }
 
 // ---- OpenAI legacy text_completion 构造（/v1/completions shim）----

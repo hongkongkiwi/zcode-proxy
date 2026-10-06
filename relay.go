@@ -110,6 +110,15 @@ func (z *ZCodeAPI) HandleMessages(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	// 网关 Key 白名单在请求校验前拦截（轮 8）：注定 403 的请求不得先触发
+	// URL 图片抓取等准备工作。RPM/配额仍在 relay 内计数，此处仅白名单
+	if gk := gatewayKeyFromCtx(r.Context()); gk != nil {
+		model, _ := body["model"].(string)
+		if name := canonicalModelName(model); !gatewayKeyModelAllowed(gk, name) {
+			writeAPIError(w, http.StatusForbidden, "model not allowed for this gateway key: "+name)
+			return
+		}
+	}
 	if err := validateMessagesBody(r.Context(), body); err != nil {
 		writeAPIError(w, http.StatusBadRequest, err.Error())
 		return
@@ -285,19 +294,24 @@ func writeAllAccountsUnavailable(w http.ResponseWriter, rc *relayCtx, msg string
 	})
 }
 
-// relayModelName 白名单校验用的规范模型名：去 provider 前缀 + 小写（与 gateway_keys 白名单同规范）
+// canonicalModelName 白名单校验用的规范模型名：去 provider 前缀 + 小写
+//（与 gateway_keys 白名单同规范）
+func canonicalModelName(bodyModel string) string {
+	if i := strings.Index(bodyModel, "/"); i >= 0 {
+		bodyModel = bodyModel[i+1:]
+	}
+	if official, ok := modelNameMap[strings.ToLower(strings.TrimSpace(bodyModel))]; ok {
+		return strings.ToLower(official)
+	}
+	return strings.ToLower(strings.TrimSpace(bodyModel))
+}
+
 func relayModelName(rc *relayCtx) string {
 	model := rc.clientModel
 	if m, ok := rc.body["model"].(string); ok && m != "" {
 		model = m // normalizeBody 已归一化，优先取
 	}
-	if i := strings.Index(model, "/"); i >= 0 {
-		model = model[i+1:]
-	}
-	if official, ok := modelNameMap[strings.ToLower(strings.TrimSpace(model))]; ok {
-		return strings.ToLower(official)
-	}
-	return strings.ToLower(strings.TrimSpace(model))
+	return canonicalModelName(model)
 }
 
 // sessionKey 会话粘滞键（F2）：优先 metadata.user_id（Anthropic 客户端语义），
@@ -551,9 +565,9 @@ func (z *ZCodeAPI) forwardOnce(w http.ResponseWriter, r *http.Request, a *Accoun
 			if r.Context().Err() != nil || errors.Is(err, context.Canceled) {
 				return outcomeUpstreamError
 			}
-			// 完整错误（含出口代理地址）只进服务端日志；客户端可见明细经
-			// connFailReason 脱敏——失败原因会拼进 503/529 body 发给命名 Key 持有方
-			log.Printf("[relay] account %s connect failed via %s: %v", a.DisplayNameOrEmail(), firstNonEmpty(proxyURL, "direct"), err)
+		// 完整错误（含出口代理地址）只进服务端日志；客户端可见明细经
+		// connFailReason 脱敏——失败原因会拼进 503/529 body 发给命名 Key 持有方
+		log.Printf("[relay] account %s connect failed via %s: %v", a.DisplayNameOrEmail(), redactProxyURL(proxyURL), err)
 			z.markChannelFailure(rc, a, channel, connFailReason(proxyURL, err), 60)
 			return outcomeNextAccount
 		}
@@ -791,6 +805,20 @@ func connFailReason(proxyURL string, err error) string {
 		return "连接失败（出口代理不可达）"
 	}
 	return "连接失败: " + truncate(err.Error(), 120)
+}
+
+// redactProxyURL 代理 URL 进日志前抹掉内嵌凭据（ProxyURLForNode 会拼
+// user:pass@ 形态；round-8 自查：connect-failure 日志此前泄露代理密码）
+func redactProxyURL(raw string) string {
+	if raw == "" {
+		return "direct"
+	}
+	if i := strings.Index(raw, "://"); i >= 0 {
+		if at := strings.Index(raw[i+3:], "@"); at >= 0 {
+			return raw[:i+3] + raw[i+4+at:]
+		}
+	}
+	return raw
 }
 
 // nonStreamBodyReadDeadline 非流式响应体总读取时限。var 便于测试缩短。

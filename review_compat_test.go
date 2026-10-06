@@ -718,3 +718,98 @@ func TestRequestSizeCapAcceptsLargeLegalBodies(t *testing.T) {
 		t.Fatalf("33MB body status = %d, want 413", w2.Code)
 	}
 }
+
+// ---- 轮 8 ----
+
+// 代理 URL 进日志前必须抹掉内嵌凭据（round-8 自查：connect-failure 日志
+// 此前经 ProxyURLForNode 泄露 user:pass@）
+func TestRedactProxyURL(t *testing.T) {
+	got := redactProxyURL("socks5://user:secret@10.9.8.7:1080")
+	if strings.Contains(got, "secret") || strings.Contains(got, "@") {
+		t.Fatalf("credentials leaked: %s", got)
+	}
+	if !strings.Contains(got, "10.9.8.7:1080") {
+		t.Fatalf("host:port lost: %s", got)
+	}
+	if redactProxyURL("") != "direct" {
+		t.Fatalf("empty handling: %q", redactProxyURL(""))
+	}
+	if redactProxyURL("socks5://10.9.8.7:1080") != "socks5://10.9.8.7:1080" {
+		t.Fatalf("cred-less URL should pass through")
+	}
+}
+
+// Responses 协议：max_tokens 截断必须回 status:"incomplete" +
+// incomplete_details.max_output_tokens（客户端据此映射 finish=length），
+// 不得谎报 completed/stop
+func TestResponsesIncompleteOnMaxTokens(t *testing.T) {
+	t.Run("non-stream builder", func(t *testing.T) {
+		resp := responsesResponse("GLM-5.3", "resp_1", "partial", "", &StreamUsage{StopReason: "max_tokens", InputTokens: 3, OutputTokens: 4})
+		if resp["status"] != "incomplete" {
+			t.Fatalf("status = %v, want incomplete", resp["status"])
+		}
+		details, _ := resp["incomplete_details"].(map[string]interface{})
+		if details == nil || details["reason"] != "max_output_tokens" {
+			t.Fatalf("incomplete_details missing: %v", resp["incomplete_details"])
+		}
+		ok := responsesResponse("GLM-5.3", "resp_2", "done", "", &StreamUsage{StopReason: "end_turn", InputTokens: 1, OutputTokens: 1})
+		if ok["status"] != "completed" || ok["incomplete_details"] != nil {
+			t.Fatalf("normal completion polluted: %v", ok)
+		}
+	})
+	t.Run("stream terminal event", func(t *testing.T) {
+		_, db := newPaidTestPool(t)
+		stream := "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{}}}\n\n" +
+			"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\"}}\n\n" +
+			"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"par\"}}\n\n" +
+			"event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n" +
+			"event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"max_tokens\"},\"usage\":{\"output_tokens\":4}}\n\n" +
+			"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+		w := httptest.NewRecorder()
+		z := &ZCodeAPI{db: db}
+		z.streamResponses(w, w, &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(stream))}, "GLM-5.3",
+			mkDualAccount("incomplete", StatusActive), httptest.NewRequest(http.MethodPost, "/v1/responses", nil), []byte(`{"model":"GLM-5.3"}`), time.Now())
+		out := w.Body.String()
+		if !strings.Contains(out, "event: response.incomplete") || strings.Contains(out, "event: response.completed") {
+			t.Fatalf("terminal event wrong: %s", out)
+		}
+		if !strings.Contains(out, "max_output_tokens") {
+			t.Fatalf("incomplete_details.reason missing: %s", out)
+		}
+	})
+}
+
+// 网关 Key 白名单在请求校验前拦截：注定 403 的请求不得触发 URL 图片抓取（轮 8）
+func TestGatewayWhitelistHoistBlocksBeforeFetch(t *testing.T) {
+	var fetches atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fetches.Add(1)
+		w.Header().Set("Content-Type", "image/png")
+		w.Write([]byte{0x89, 'P', 'N', 'G'})
+	}))
+	defer srv.Close()
+	old := imageFetchHTTPClient
+	imageFetchHTTPClient = &http.Client{}
+	defer func() { imageFetchHTTPClient = old }()
+
+	db := newCompletionsTestDB(t)
+	z := &ZCodeAPI{db: db}
+	gk := &GatewayKey{Models: "glm-5.3"} // 白名单只有 GLM-5.3
+	body := `{"model":"GLM-4.6","messages":[{"role":"user","content":[
+		{"type":"text","text":"hi"},
+		{"type":"image","source":{"type":"url","url":"` + srv.URL + `/x.png"}}
+	]}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(body))
+	req = req.WithContext(contextWithGatewayKey(req.Context(), gk))
+	w := httptest.NewRecorder()
+	z.HandleMessages(w, req)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403; body=%s", w.Code, w.Body.String())
+	}
+	if fetches.Load() != 0 {
+		t.Fatalf("url image fetched %d times before whitelist rejection", fetches.Load())
+	}
+	if !strings.Contains(w.Body.String(), "model not allowed") {
+		t.Fatalf("unexpected body: %s", w.Body.String())
+	}
+}
