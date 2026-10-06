@@ -9,6 +9,7 @@ package main
 // 任何失败 fail-closed 回 400，与原行为一致。
 
 import (
+	"context"
 	"encoding/base64"
 	"errors"
 	"fmt"
@@ -24,7 +25,22 @@ import (
 const (
 	maxImageFetchBytes = 5 << 20 // 5MB raw ≈ 6.7MB base64，与上游图片上限同量级
 	imageFetchTimeout  = 15 * time.Second
+	// 单请求 URL 图片内联上限（评审轮 3 红队 F1：无上限时 40 个 ~80B 的 url 块
+	// 可放大出 213MB base64 —— 内存放大 68000×，OOM 可达）
+	maxInlineImagesPerRequest      = 24
+	maxInlineBase64BytesPerRequest = 32 << 20
 )
+
+// imageInlineBudget 单请求内联额度；URL 去重缓存让同一 URL 只抓一次
+type imageInlineBudget struct {
+	count int
+	bytes int
+	cache map[string]inlinedImage
+}
+
+func newImageInlineBudget() *imageInlineBudget {
+	return &imageInlineBudget{cache: map[string]inlinedImage{}}
+}
 
 type inlinedImage struct {
 	mediaType string
@@ -84,7 +100,8 @@ func isForbiddenImageHostIP(ip net.IP) bool {
 	return false
 }
 
-func fetchImageAsBase64(rawURL string) (inlinedImage, error) {
+// fetchImageAsBase64 绑定 ctx：客户端断开时抓取随之中止（评审轮 3 红队 F2）
+func fetchImageAsBase64(ctx context.Context, rawURL string) (inlinedImage, error) {
 	if rawURL == "" {
 		return inlinedImage{}, errors.New("empty url")
 	}
@@ -92,7 +109,11 @@ func fetchImageAsBase64(rawURL string) (inlinedImage, error) {
 	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
 		return inlinedImage{}, errors.New("only absolute http(s) urls are supported")
 	}
-	resp, err := imageFetchHTTPClient.Get(rawURL)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
+	if err != nil {
+		return inlinedImage{}, err
+	}
+	resp, err := imageFetchHTTPClient.Do(req)
 	if err != nil {
 		return inlinedImage{}, err
 	}

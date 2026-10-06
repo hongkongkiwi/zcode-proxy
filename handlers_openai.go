@@ -39,7 +39,7 @@ func (z *ZCodeAPI) HandleChatCompletions(w http.ResponseWriter, r *http.Request)
 		writeAPIError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	if err := validateMessagesBody(anth); err != nil {
+	if err := validateMessagesBody(r.Context(), anth); err != nil {
 		writeAPIError(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -94,7 +94,7 @@ func (z *ZCodeAPI) HandleResponses(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	if err := validateMessagesBody(anth); err != nil {
+	if err := validateMessagesBody(r.Context(), anth); err != nil {
 		writeAPIError(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -165,7 +165,7 @@ func (z *ZCodeAPI) HandleCompletions(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	if err := validateMessagesBody(anth); err != nil {
+	if err := validateMessagesBody(r.Context(), anth); err != nil {
 		writeAPIError(w, http.StatusBadRequest, err.Error())
 		return
 	}

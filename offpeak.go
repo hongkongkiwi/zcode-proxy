@@ -345,7 +345,7 @@ func (z *ZCodeAPI) HandleAsyncMessages(w http.ResponseWriter, r *http.Request) {
 			break
 		}
 	}
-	if err := validateMessagesBody(body); err != nil {
+	if err := validateMessagesBody(r.Context(), body); err != nil {
 		writeAPIError(w, http.StatusBadRequest, err.Error())
 		return
 	}

@@ -103,7 +103,7 @@ func (z *ZCodeAPI) HandleMessages(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	if err := validateMessagesBody(body); err != nil {
+	if err := validateMessagesBody(r.Context(), body); err != nil {
 		writeAPIError(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -1086,8 +1086,18 @@ func fixThinking(body map[string]interface{}) {
 	if effort == "" {
 		effort = "high"
 	}
+	oc := map[string]interface{}{"effort": effort}
+	// 保留 output_config 的其余键：ZCode 3.14 SDK 还会挂 format.json_schema
+	//（结构化输出）/ task_budget；整体替换会静默丢功能（评审轮 3）
+	if prev, ok := body["output_config"].(map[string]interface{}); ok {
+		for k, v := range prev {
+			if k != "effort" {
+				oc[k] = v
+			}
+		}
+	}
 	body["thinking"] = map[string]interface{}{"type": "adaptive"}
-	body["output_config"] = map[string]interface{}{"effort": effort}
+	body["output_config"] = oc
 	delete(body, "reasoning_effort")
 }
 
@@ -1113,7 +1123,8 @@ func effortFromBudget(budget int) string {
 	}
 }
 
-func validateMessagesBody(body map[string]interface{}) error {
+func validateMessagesBody(ctx context.Context, body map[string]interface{}) error {
+	inline := newImageInlineBudget() // 单请求 URL 图片内联额度 + 去重（每次调用即一个请求）
 	model, ok := body["model"].(string)
 	if !ok || strings.TrimSpace(model) == "" {
 		return fmt.Errorf("model must be a non-empty string")
@@ -1259,10 +1270,23 @@ func validateMessagesBody(body map[string]interface{}) error {
 					data, _ := src["data"].(string)
 					if st == "url" {
 						u, _ := src["url"].(string)
-						inl, ferr := fetchImageAsBase64(u)
+						if inl, ok := inline.cache[u]; ok {
+							bm["source"] = map[string]interface{}{"type": "base64", "media_type": inl.mediaType, "data": inl.data}
+							continue
+						}
+						if inline.count >= maxInlineImagesPerRequest {
+							return fmt.Errorf("messages[%d].content[%d]: too many url images in one request (limit %d)", i, j, maxInlineImagesPerRequest)
+						}
+						inl, ferr := fetchImageAsBase64(ctx, u)
 						if ferr != nil {
 							return fmt.Errorf("messages[%d].content[%d]: image url fetch failed: %v", i, j, ferr)
 						}
+						inline.count++
+						inline.bytes += len(inl.data)
+						if inline.bytes > maxInlineBase64BytesPerRequest {
+							return fmt.Errorf("messages[%d].content[%d]: inlined image payload exceeds %dMB per request", i, j, maxInlineBase64BytesPerRequest>>20)
+						}
+						inline.cache[u] = inl
 						bm["source"] = map[string]interface{}{"type": "base64", "media_type": inl.mediaType, "data": inl.data}
 						continue
 					}

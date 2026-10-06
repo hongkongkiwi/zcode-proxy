@@ -127,7 +127,7 @@ func TestMessagesImageSourceValidation(t *testing.T) {
 			"source": map[string]interface{}{"type": "base64", "data": ""}}, true},
 	}
 	for _, c := range cases {
-		err := validateMessagesBody(build(c.img))
+		err := validateMessagesBody(context.Background(), build(c.img))
 		if c.wantErr && err == nil {
 			t.Fatalf("%s: expected validation error, got nil", c.name)
 		}

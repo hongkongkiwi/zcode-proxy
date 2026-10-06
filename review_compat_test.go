@@ -7,7 +7,9 @@ package main
 //   F4 image url source 受控抓取内联（SSRF 防护，fail-closed）
 
 import (
+	"context"
 	"encoding/base64"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -34,13 +36,13 @@ func TestMidConversationSystemRoleAccepted(t *testing.T) {
 			map[string]interface{}{"role": "user", "content": "go on"},
 		},
 	}
-	if err := validateMessagesBody(body); err != nil {
+	if err := validateMessagesBody(context.Background(), body); err != nil {
 		t.Fatalf("mid-conversation system role must pass validation, got: %v", err)
 	}
 	body["messages"] = []interface{}{
 		map[string]interface{}{"role": "tool", "content": "x"},
 	}
-	err := validateMessagesBody(body)
+	err := validateMessagesBody(context.Background(), body)
 	if err == nil || !strings.Contains(err.Error(), "must be user, assistant or system") {
 		t.Fatalf("unknown role must still be rejected, got: %v", err)
 	}
@@ -137,7 +139,7 @@ func TestRelayRateLimitExhaustionReturns529(t *testing.T) {
 
 // flushSignalRecorder 在代理 Flush 时发信号：测试据此得知 chunk1 已被消费，
 // 静默窗口从这一刻起算——否则上游的 sleep 会与客户端建立/读取的耗时赛跑
-//（-race 下首读可慢 100ms+，两个 chunk 在 socket 里合拢，代理根本没有
+// （-race 下首读可慢 100ms+，两个 chunk 在 socket 里合拢，代理根本没有
 // 静默窗口可注入 ping，测试纯属掷硬币）
 type flushSignalRecorder struct {
 	*httptest.ResponseRecorder
@@ -183,7 +185,7 @@ func TestSSEPassthroughInjectsPingDuringSilence(t *testing.T) {
 			resp, &Account{}, httptest.NewRequest(http.MethodPost, "/v1/messages", nil), []byte(`{}`), z, time.Now())
 	}()
 
-	<-w.flushed                    // chunk1 已消费：代理此刻必然空闲在 select 上
+	<-w.flushed                     // chunk1 已消费：代理此刻必然空闲在 select 上
 	time.Sleep(4 * ssePingInterval) // 真实静默 ≥4 个 tick，ping 必须注入
 	close(writeSecond)
 	<-done
@@ -239,7 +241,7 @@ func TestImageURLSourceInlined(t *testing.T) {
 		}
 	}
 	body := build(srv.URL)
-	if err := validateMessagesBody(body); err != nil {
+	if err := validateMessagesBody(context.Background(), body); err != nil {
 		t.Fatalf("url image must be inlined and accepted, got: %v", err)
 	}
 	blocks := body["messages"].([]interface{})[0].(map[string]interface{})["content"].([]interface{})
@@ -269,7 +271,7 @@ func TestImageURLSourceInlined(t *testing.T) {
 		t.Run(c.name, func(t *testing.T) {
 			sub := httptest.NewServer(http.HandlerFunc(c.serve))
 			defer sub.Close()
-			err := validateMessagesBody(build(sub.URL))
+			err := validateMessagesBody(context.Background(), build(sub.URL))
 			if err == nil || !strings.Contains(err.Error(), "image url fetch failed") || !strings.Contains(err.Error(), c.wantErr) {
 				t.Fatalf("expected fetch failure (%s), got: %v", c.wantErr, err)
 			}
@@ -293,7 +295,7 @@ func TestImageURLPrivateAddressBlocked(t *testing.T) {
 			},
 		}},
 	}
-	err := validateMessagesBody(body)
+	err := validateMessagesBody(context.Background(), body)
 	if err == nil || !strings.Contains(err.Error(), "image url fetch failed") || !strings.Contains(err.Error(), "local/private") {
 		t.Fatalf("loopback fetch must be refused by SSRF guard, got: %v", err)
 	}
@@ -418,5 +420,133 @@ func TestRelayNonStreamForwardsRequestID(t *testing.T) {
 	}
 	if got := w.Header().Get("X-Request-Id"); got != "req-abc123" {
 		t.Fatalf("X-Request-Id = %q, want req-abc123", got)
+	}
+}
+
+// ---- 轮 3（SDK 闭环清单 + 红队）----
+
+// fixThinking 5.3 重写必须保留 output_config 的其余键（format.json_schema / task_budget）
+func TestFixThinkingPreservesOutputConfigExtras(t *testing.T) {
+	body := map[string]interface{}{
+		"model":    "GLM-5.3",
+		"thinking": map[string]interface{}{"type": "enabled"},
+		"output_config": map[string]interface{}{
+			"effort": "max",
+			"format": map[string]interface{}{"type": "json_schema", "schema": map[string]interface{}{"type": "object"}},
+			"task_budget": map[string]interface{}{
+				"type": "tokens", "total": float64(100000), "remaining": float64(90000),
+			},
+		},
+	}
+	fixThinking(body)
+	oc, _ := body["output_config"].(map[string]interface{})
+	if oc["effort"] != "max" {
+		t.Fatalf("effort = %v, want max", oc["effort"])
+	}
+	if oc["format"] == nil || oc["task_budget"] == nil {
+		t.Fatalf("output_config extras dropped: %v", oc)
+	}
+	if th, _ := body["thinking"].(map[string]interface{}); th["type"] != "adaptive" {
+		t.Fatalf("thinking = %v, want adaptive", body["thinking"])
+	}
+}
+
+// URL 图片内联必须有单请求额度：数量上限、字节上限、同 URL 去重（红队 F1/F2）
+func TestImageInlineBudget(t *testing.T) {
+	old := imageFetchHTTPClient
+	imageFetchHTTPClient = &http.Client{}
+	defer func() { imageFetchHTTPClient = old }()
+
+	var hits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		w.Header().Set("Content-Type", "image/png")
+		w.Write([]byte{0x89, 'P', 'N', 'G', 1, 2, 3, 4})
+	}))
+	defer srv.Close()
+
+	mkBlock := func(url string) map[string]interface{} {
+		return map[string]interface{}{"type": "image", "source": map[string]interface{}{"type": "url", "url": url}}
+	}
+	mkBody := func(blocks ...map[string]interface{}) map[string]interface{} {
+		content := []interface{}{map[string]interface{}{"type": "text", "text": "hi"}}
+		for _, b := range blocks {
+			content = append(content, b)
+		}
+		return map[string]interface{}{"model": "GLM-4.6", "messages": []interface{}{
+			map[string]interface{}{"role": "user", "content": content},
+		}}
+	}
+
+	t.Run("count cap", func(t *testing.T) {
+		blocks := make([]map[string]interface{}, 0, maxInlineImagesPerRequest+1)
+		for i := 0; i <= maxInlineImagesPerRequest; i++ {
+			blocks = append(blocks, mkBlock(fmt.Sprintf("%s/%d.png", srv.URL, i)))
+		}
+		err := validateMessagesBody(context.Background(), mkBody(blocks...))
+		if err == nil || !strings.Contains(err.Error(), "too many url images") {
+			t.Fatalf("expected count-cap error, got: %v", err)
+		}
+	})
+	t.Run("url dedup fetches once", func(t *testing.T) {
+		before := hits.Load()
+		body := mkBody(mkBlock(srv.URL+"/dup.png"), mkBlock(srv.URL+"/dup.png"), mkBlock(srv.URL+"/dup.png"))
+		if err := validateMessagesBody(context.Background(), body); err != nil {
+			t.Fatalf("dedup validate failed: %v", err)
+		}
+		if got := hits.Load() - before; got != 1 {
+			t.Fatalf("same url fetched %d times, want 1", got)
+		}
+	})
+	t.Run("bytes cap", func(t *testing.T) {
+		big := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "image/png")
+			w.Write(make([]byte, maxImageFetchBytes)) // 5MB × 7 = 35MB base64 > 32MB 上限
+		}))
+		defer big.Close()
+		blocks := make([]map[string]interface{}, 0, 7)
+		for i := 0; i < 7; i++ {
+			blocks = append(blocks, mkBlock(fmt.Sprintf("%s/%d.png", big.URL, i)))
+		}
+		err := validateMessagesBody(context.Background(), mkBody(blocks...))
+		if err == nil || !strings.Contains(err.Error(), "exceeds") {
+			t.Fatalf("expected bytes-cap error, got: %v", err)
+		}
+	})
+}
+
+// 抓取必须绑定请求 ctx：客户端断开时中止（红队 F2）
+func TestImageFetchAbortsOnClientDisconnect(t *testing.T) {
+	old := imageFetchHTTPClient
+	imageFetchHTTPClient = &http.Client{}
+	defer func() { imageFetchHTTPClient = old }()
+
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "image/png")
+		w.Write([]byte{0x89, 'P', 'N', 'G'})
+		w.(http.Flusher).Flush()
+		<-release // 挂住响应体
+	}))
+	defer srv.Close()
+	defer close(release)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	body := map[string]interface{}{"model": "GLM-4.6", "messages": []interface{}{
+		map[string]interface{}{"role": "user", "content": []interface{}{
+			map[string]interface{}{"type": "image", "source": map[string]interface{}{"type": "url", "url": srv.URL + "/x.png"}},
+		}},
+	}}
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		cancel()
+	}()
+	start := time.Now()
+	err := validateMessagesBody(ctx, body)
+	if err == nil || !strings.Contains(err.Error(), "image url fetch failed") {
+		t.Fatalf("expected ctx-aborted fetch error, got: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Fatalf("fetch did not abort on cancel: %v", elapsed)
 	}
 }

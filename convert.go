@@ -498,6 +498,9 @@ func streamProtocolResponse(w http.ResponseWriter, rc *relayCtx, resp *http.Resp
 		bufs := make(chan []byte, 1)
 		bufs <- buf
 		readDone := make(chan struct{})
+		// defer 而非循环后裸 close：中途 panic 时生产 goroutine 才不至于
+		// 永久阻塞在发送/等待上（评审轮 3 红队 F7）
+		defer close(readDone)
 		go func() {
 			for {
 				var b []byte
@@ -554,7 +557,6 @@ func streamProtocolResponse(w http.ResponseWriter, rc *relayCtx, resp *http.Resp
 				}
 			}
 		}
-		close(readDone)
 		parser.flush(func(ev sseEvent) { applyEventToUsage(ev, &usage, &activeTool, &texts, &thinks) })
 		finalizeToolCalls(&usage)
 		cacheThinkingForOutput(strings.Join(texts, ""), &usage)
