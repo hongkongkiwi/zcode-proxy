@@ -85,6 +85,10 @@ type relayCtx struct {
 	// 全部账号耗尽时用于区分"过载"（→ 529 overloaded_error，客户端有专门的
 	// 过载重试分类与文案）与"无可用账号"（→ 503）
 	sawRateLimit bool
+	// sawNonRateCooldown 本次请求内出现过非限流类的账号冷却（鉴权失效/额度
+	// 耗尽/风控/连接失败等）。与 sawRateLimit 同时为真 = 混合故障：终态按 503
+	// 如实回报，不得谎报成纯过载（轮 4 红队 F4）
+	sawNonRateCooldown bool
 }
 
 // HandleMessages POST /v1/messages — 原生 Anthropic 协议
@@ -254,7 +258,10 @@ func (z *ZCodeAPI) relay(w http.ResponseWriter, r *http.Request, rc *relayCtx) {
 // 精确退避；一律 503 会让它退回通用指数退避。付费闸拦截（paidSkipped）说明根因
 // 含策略/配额而非纯过载，维持 503。错误体用 Anthropic 原生 {"type":"error",...} 形状。
 func writeAllAccountsUnavailable(w http.ResponseWriter, rc *relayCtx, msg string, paidSkipped bool, coolSecs int64) {
-	if rc.proto == protocolAnthropic && rc.sawRateLimit && !paidSkipped {
+	// 同为 Anthropic 信封：客户端 schema 要求顶层 type:"error"，否则
+	// no_available_account 的明细（冷却/重置时间）到不了用户眼前。
+	// 混合故障（限流+鉴权失效/耗尽等）按 503 如实回报，不谎报纯过载
+	if rc.proto == protocolAnthropic && rc.sawRateLimit && !rc.sawNonRateCooldown && !paidSkipped {
 		retryAfter := 10
 		if coolSecs >= 1 && coolSecs <= 300 {
 			retryAfter = int(coolSecs)
@@ -384,6 +391,7 @@ func (z *ZCodeAPI) tryAccount(w http.ResponseWriter, r *http.Request, a *Account
 	if mode == relayModeFree {
 		if riskBlocked {
 			z.pool.MarkRiskCooling(a, "免费通道风控拦截（unusual activity）")
+			rc.sawNonRateCooldown = true
 		}
 		log.Printf("[relay] account %s free channel failed (paid fallback deferred)", a.Email)
 		return outcomeNextAccount
@@ -540,14 +548,17 @@ func (z *ZCodeAPI) forwardOnce(w http.ResponseWriter, r *http.Request, a *Accoun
 			if r.Context().Err() != nil || errors.Is(err, context.Canceled) {
 				return outcomeUpstreamError
 			}
-			z.markChannelFailure(a, channel, "连接失败: "+truncate(err.Error(), 180), 60)
+			// 完整错误（含出口代理地址）只进服务端日志；客户端可见明细经
+			// connFailReason 脱敏——失败原因会拼进 503/529 body 发给命名 Key 持有方
+			log.Printf("[relay] account %s connect failed via %s: %v", a.DisplayNameOrEmail(), firstNonEmpty(proxyURL, "direct"), err)
+			z.markChannelFailure(rc, a, channel, connFailReason(proxyURL, err), 60)
 			return outcomeNextAccount
 		}
 
 		// 3xx：WAF 挑战/登录页重定向（客户端已禁重定向），视为上游异常
 		if resp.StatusCode >= 300 && resp.StatusCode < 400 {
 			resp.Body.Close()
-			z.markChannelFailure(a, channel, fmt.Sprintf("上游重定向 HTTP %d（疑似 WAF 挑战）", resp.StatusCode), 120)
+			z.markChannelFailure(rc, a, channel, fmt.Sprintf("上游重定向 HTTP %d（疑似 WAF 挑战）", resp.StatusCode), 120)
 			return outcomeNextAccount
 		}
 
@@ -560,7 +571,7 @@ func (z *ZCodeAPI) forwardOnce(w http.ResponseWriter, r *http.Request, a *Accoun
 			// 既不能走下方 401/403 分支误杀账号，也不能当验证码被拒触发重解；
 			// 只冷却本账号该通道（同出口其他账号/路径先顶上）
 			if isCloudflareChallenge(resp.Header, text) {
-				z.markChannelFailure(a, channel, fmt.Sprintf("Cloudflare/WAF 挑战 HTTP %d", resp.StatusCode), 300)
+				z.markChannelFailure(rc, a, channel, fmt.Sprintf("Cloudflare/WAF 挑战 HTTP %d", resp.StatusCode), 300)
 				return outcomeNextAccount
 			}
 
@@ -569,7 +580,7 @@ func (z *ZCodeAPI) forwardOnce(w http.ResponseWriter, r *http.Request, a *Accoun
 			// + HTML 与凭证无关，与上方 CF 分支同待遇：只冷通道，绝不判死账号，
 			// 也不当验证码被拒
 			if strings.Contains(resp.Header.Get("Content-Type"), "text/html") {
-				z.markChannelFailure(a, channel, fmt.Sprintf("上游返回 HTML 拦截/错误页 HTTP %d", resp.StatusCode), 300)
+				z.markChannelFailure(rc, a, channel, fmt.Sprintf("上游返回 HTML 拦截/错误页 HTTP %d", resp.StatusCode), 300)
 				return outcomeNextAccount
 			}
 
@@ -614,6 +625,7 @@ func (z *ZCodeAPI) forwardOnce(w http.ResponseWriter, r *http.Request, a *Accoun
 					return outcomeNextAccount
 				}
 				z.pool.MarkInvalid(a, fmt.Sprintf("鉴权失败 HTTP %d", resp.StatusCode))
+				rc.sawNonRateCooldown = true
 				return outcomeNextAccount
 			case resp.StatusCode == 429 || isRateLimitBody(resp.StatusCode, text):
 				// 限流（HTTP 429 或业务码 1302/1303 并发超限）：请求内退避重试一次
@@ -653,6 +665,7 @@ func (z *ZCodeAPI) forwardOnce(w http.ResponseWriter, r *http.Request, a *Accoun
 					return outcomeNextAccount
 				}
 				z.pool.MarkExhausted(a, "额度已用完")
+				rc.sawNonRateCooldown = true
 				// 后台任务在库内新副本上跑：relay 的账号快照被本请求的 503 提示
 				// 扫描无锁读取，共享实例就地写（setQuota/setRuntime）会与之竞态。
 				// 走节流+单飞版本：并发请求同时撞上同一耗尽账号时只拉一次 billing
@@ -708,14 +721,26 @@ func (z *ZCodeAPI) forwardOnce(w http.ResponseWriter, r *http.Request, a *Accoun
 		if !isStream && !strings.Contains(contentType, "json") {
 			body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 			resp.Body.Close()
-			z.markChannelFailure(a, channel, fmt.Sprintf("上游返回非 JSON 内容（%s）", truncate(contentType, 60)), 120)
+			z.markChannelFailure(rc, a, channel, fmt.Sprintf("上游返回非 JSON 内容（%s）", truncate(contentType, 60)), 120)
 			writeUpstreamErrorForProto(w, resp, string(body), rc.proto)
 			return outcomeUpstreamError
 		}
 
 		if !isStream {
-			body, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<20))
+			// 非流式响应体总读取时限（红队 F3）：客户端对非流式无超时，慢滴上游
+			// 原本可以无限占住账号并发槽。流式不受此限（客户端 600s 空闲超时兜底）
+			resp.Body = newTotalDeadlineBody(resp.Body, nonStreamBodyReadDeadline)
+			body, readErr := io.ReadAll(io.LimitReader(resp.Body, 64<<20))
 			resp.Body.Close()
+			if readErr != nil {
+				// 读取中断/超时：截断的 body 不得洗成成功响应（原代码忽略
+				// readErr，半截 JSON 会原样下传给客户端）
+				log.Printf("[relay] account %s non-stream body read failed: %v", a.DisplayNameOrEmail(), readErr)
+				z.markChannelFailure(rc, a, channel, "上游响应读取中断或超时", 60)
+				z.recordUsage(a, r, payload, http.StatusBadGateway, start, 0, nil, rc.clientStream)
+				writeAPIError(w, http.StatusBadGateway, "upstream response read interrupted or timed out")
+				return outcomeUpstreamError
+			}
 			// 撞到 64MB 上限（LimitReader EOF 与真实 EOF 无法区分）按失败处理：
 			// 静默截断会把截在半截的 input_json_delta 洗成"成功的空参 tool_use"
 			if len(body) == 64<<20 {
@@ -754,9 +779,47 @@ func (z *ZCodeAPI) forwardOnce(w http.ResponseWriter, r *http.Request, a *Accoun
 	return outcomeCaptchaRejected // 验证码重试次数用尽
 }
 
+// connFailReason 连接失败的客户端可见原因：经出口代理时只说明代理不可达，
+// 不泄露代理地址/端口（失败明细会拼进 503/529 body 发给命名 Key 持有方，
+// 可能是第三方）；直连错误的 host 本就是公开的上游地址，可保留。
+// 完整错误由调用方写服务端日志。
+func connFailReason(proxyURL string, err error) string {
+	if proxyURL != "" {
+		return "连接失败（出口代理不可达）"
+	}
+	return "连接失败: " + truncate(err.Error(), 120)
+}
+
+// nonStreamBodyReadDeadline 非流式响应体总读取时限。var 便于测试缩短。
+var nonStreamBodyReadDeadline = 15 * time.Minute
+
+// totalDeadlineBody 非流式响应体总时限包装：deadline 到点关闭底层连接，
+// 阻塞中的 Read 随即报错返回
+type totalDeadlineBody struct {
+	io.ReadCloser
+	stop func()
+}
+
+func newTotalDeadlineBody(rc io.ReadCloser, d time.Duration) io.ReadCloser {
+	if d <= 0 {
+		return rc
+	}
+	timer := time.AfterFunc(d, func() { rc.Close() })
+	return totalDeadlineBody{ReadCloser: rc, stop: func() { timer.Stop() }}
+}
+
+func (b totalDeadlineBody) Close() error {
+	b.stop()
+	return b.ReadCloser.Close()
+}
+
 // markChannelFailure 受限冷却按通道落位：免费侧走账号 status/cooling_until，
-// 付费侧走 paid_cooling_until，两侧互不牵连
-func (z *ZCodeAPI) markChannelFailure(a *Account, channel, reason string, seconds int) {
+// 付费侧走 paid_cooling_until，两侧互不牵连。调用点均为非限流类故障
+// （连接失败/3xx/非 JSON），计入混合故障信号
+func (z *ZCodeAPI) markChannelFailure(rc *relayCtx, a *Account, channel, reason string, seconds int) {
+	if rc != nil {
+		rc.sawNonRateCooldown = true
+	}
 	if channel == ChannelPaid {
 		z.pool.MarkPaidCooling(a, reason, seconds)
 		return

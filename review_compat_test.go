@@ -574,3 +574,86 @@ func TestAnthropicErrorEnvelope(t *testing.T) {
 		t.Fatalf("error.message missing (OpenAI-compat readers): %s", out)
 	}
 }
+
+// ---- 轮 5（红队残留修复）----
+
+// 混合故障（限流 + 鉴权失效/耗尽等）不得谎报 529 纯过载：按 503 如实回报
+func TestMixedFailureStays503(t *testing.T) {
+	cases := []struct {
+		name       string
+		rc         *relayCtx
+		wantStatus int
+	}{
+		{"pure rate-limit → 529", &relayCtx{proto: protocolAnthropic, sawRateLimit: true}, 529},
+		{"mixed with hard failure → 503", &relayCtx{proto: protocolAnthropic, sawRateLimit: true, sawNonRateCooldown: true}, 503},
+		{"hard failure only → 503", &relayCtx{proto: protocolAnthropic, sawNonRateCooldown: true}, 503},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			w := httptest.NewRecorder()
+			writeAllAccountsUnavailable(w, c.rc, "reason detail", false, 0)
+			if w.Code != c.wantStatus {
+				t.Fatalf("status = %d, want %d; body=%s", w.Code, c.wantStatus, w.Body.String())
+			}
+		})
+	}
+}
+
+// 非流式响应体总读取时限：慢滴上游在 deadline 后必须以 502 终止，
+// 不再无限占住账号并发槽；截断的 body 不得下传
+func TestNonStreamBodyDeadlineAborts(t *testing.T) {
+	old := nonStreamBodyReadDeadline
+	nonStreamBodyReadDeadline = 150 * time.Millisecond
+	defer func() { nonStreamBodyReadDeadline = old }()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		io.WriteString(w, `{"type":"mess`) // 半截 JSON 后挂死
+		w.(http.Flusher).Flush()
+		time.Sleep(5 * time.Second)
+	}))
+	defer srv.Close()
+
+	p, db := newPaidTestPool(t)
+	if err := db.SetSetting("captcha_mode", "off"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.UpsertAccount(mkDualAccount("slowdrip", StatusActive)); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &FileConfig{Upstream: UpstreamURLs{Zai: srv.URL, ZaiFallback: srv.URL, Bigmodel: srv.URL}}
+	z := &ZCodeAPI{cfg: cfg, db: db, pool: p, egress: NewEgressProxy(db),
+		captcha: NewCaptchaService(cfg, db, "3.14.4"),
+		routing: &EndpointRouter{snapshot: &routingSnapshot{expiresAt: time.Now().Add(time.Hour)}},
+	}
+	w := httptest.NewRecorder()
+	start := time.Now()
+	z.relay(w, httptest.NewRequest(http.MethodPost, "/v1/messages", nil), &relayCtx{
+		provider: "zai", proto: protocolAnthropic, clientStream: false,
+		body: map[string]interface{}{"model": "GLM-5.3", "messages": []interface{}{map[string]interface{}{"role": "user", "content": "hello"}}},
+	})
+	if elapsed := time.Since(start); elapsed > 3*time.Second {
+		t.Fatalf("deadline not enforced, took %v", elapsed)
+	}
+	if w.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502; body=%s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "read interrupted or timed out") {
+		t.Fatalf("unexpected body: %s", w.Body.String())
+	}
+}
+
+// 经出口代理的连接失败：客户端可见原因不得泄露代理地址（轮 4 红队 F6）
+func TestConnFailReasonSanitized(t *testing.T) {
+	err := fmt.Errorf("proxyconnect tcp: dial tcp 10.9.8.7:1080: connect: connection refused")
+	if got := connFailReason("socks5://10.9.8.7:1080", err); strings.Contains(got, "10.9.8.7") {
+		t.Fatalf("proxy address leaked: %s", got)
+	} else if !strings.Contains(got, "出口代理不可达") {
+		t.Fatalf("unexpected reason: %s", got)
+	}
+	direct := connFailReason("", err)
+	if !strings.Contains(direct, "connection refused") {
+		t.Fatalf("direct dial reason should keep errno detail: %s", direct)
+	}
+}
