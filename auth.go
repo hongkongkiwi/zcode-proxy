@@ -492,6 +492,7 @@ func (am *AuthManager) Middleware(next http.Handler) http.Handler {
 			}
 			if apiKey == "" {
 				writeJSON(w, http.StatusUnauthorized, map[string]interface{}{
+					"type": "error",
 					"error": map[string]string{
 						"message": "API key required. Use 'Authorization: Bearer <key>' or 'x-api-key: <key>'",
 						"type":    "authentication_error",
@@ -505,6 +506,7 @@ func (am *AuthManager) Middleware(next http.Handler) http.Handler {
 					w.Header().Set("Retry-After", "10")
 				}
 				writeJSON(w, errResp.status, map[string]interface{}{
+					"type":  "error",
 					"error": map[string]string{"message": errResp.msg, "type": "authentication_error"},
 				})
 				return
@@ -755,7 +757,11 @@ func writeJSON(w http.ResponseWriter, status int, v interface{}) {
 }
 
 func writeAPIError(w http.ResponseWriter, status int, msg string) {
+	// Anthropic 错误信封：@ai-sdk/anthropic 的错误 schema 要求顶层 type:"error"，
+	// 否则 zod 解析失败、客户端只能显示 response.statusText（"Bad Request"），
+	// 详细的校验/限流原因全部丢失。error.message 同时满足 OpenAI 兼容端读取。
 	writeJSON(w, status, map[string]interface{}{
+		"type":  "error",
 		"error": map[string]string{"message": msg, "type": "api_error"},
 	})
 }

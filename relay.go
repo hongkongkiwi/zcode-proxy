@@ -267,7 +267,10 @@ func writeAllAccountsUnavailable(w http.ResponseWriter, rc *relayCtx, msg string
 		})
 		return
 	}
+	// 同为 Anthropic 信封：客户端 schema 要求顶层 type:"error"，否则
+	// no_available_account 的明细（冷却/重置时间）到不了用户眼前
 	writeJSON(w, http.StatusServiceUnavailable, map[string]interface{}{
+		"type":  "error",
 		"error": map[string]string{"message": msg, "type": "no_available_account"},
 	})
 }
@@ -1376,6 +1379,7 @@ func writeUpstreamErrorForProto(w http.ResponseWriter, resp *http.Response, text
 		return
 	}
 	json.NewEncoder(w).Encode(map[string]interface{}{
+		"type":  "error",
 		"error": map[string]string{"message": truncate(text, 500), "type": "upstream_error"},
 	})
 }

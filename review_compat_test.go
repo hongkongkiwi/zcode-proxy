@@ -550,3 +550,27 @@ func TestImageFetchAbortsOnClientDisconnect(t *testing.T) {
 		t.Fatalf("fetch did not abort on cancel: %v", elapsed)
 	}
 }
+
+// 轮 4：客户端错误 schema 要求顶层 type:"error"，否则 zod 解析失败、
+// 用户只能看到 response.statusText，详细校验原因丢失
+func TestAnthropicErrorEnvelope(t *testing.T) {
+	db := newCompletionsTestDB(t)
+	z := &ZCodeAPI{db: db}
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages",
+		strings.NewReader(`{"model":"GLM-5.3","messages":"not-an-array"}`))
+	z.HandleMessages(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", w.Code)
+	}
+	out := w.Body.String()
+	if !strings.Contains(out, `"type":"error"`) {
+		t.Fatalf("missing top-level type:error envelope: %s", out)
+	}
+	if !strings.Contains(out, "messages must contain at least one message") {
+		t.Fatalf("detailed validation reason lost: %s", out)
+	}
+	if !strings.Contains(out, `"error":{"message"`) {
+		t.Fatalf("error.message missing (OpenAI-compat readers): %s", out)
+	}
+}
