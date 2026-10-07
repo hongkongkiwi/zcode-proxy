@@ -1062,3 +1062,31 @@ func TestUpstreamErrorEnvelopeInjected(t *testing.T) {
 		t.Fatalf("already-enveloped body must pass verbatim: %s", w2.Body.String())
 	}
 }
+
+// 轮 11：3.14.4 起网关改写目标由服务端路由表下发（客户端无内联字面量），
+// 别名改子树模式——查询串、尾斜杠、count_tokens 变体都落到 HandleMessages
+func TestGatewayAliasSubtreeVariants(t *testing.T) {
+	db := newCompletionsTestDB(t)
+	z := &ZCodeAPI{db: db}
+	mux := http.NewServeMux()
+	registerModelRoutes(mux, z)
+
+	for _, path := range []string{
+		"/api/v1/ultra/anthropic/v1/messages",
+		"/api/v1/ultra-zai/anthropic/v1/messages",
+		"/api/v1/ultra-zai/anthropic/v1/messages/count_tokens",
+		"/api/v1/ultra/anthropic/v1/messages/",
+	} {
+		w := httptest.NewRecorder()
+		mux.ServeHTTP(w, httptest.NewRequest(http.MethodPost, path, strings.NewReader(`{"model":"GLM-5.3","messages":"x"}`)))
+		if w.Code != http.StatusBadRequest {
+			t.Fatalf("%s → status %d, want 400 from HandleMessages; body=%s", path, w.Code, w.Body.String())
+		}
+	}
+	// 非 ultra 的 /api/* 仍 404（不得吞掉管理面路由）
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/api/v1/other/thing", strings.NewReader(`{}`)))
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("/api/v1/other → status %d, want 404", w.Code)
+	}
+}

@@ -371,12 +371,13 @@ func (wt *writeTracker) Flush() {
 
 // registerModelRoutes 模型 API 端点注册（main 的 mux 装配抽出以便路由测试）。
 //
-// /api/v1/ultra[|-zai]/anthropic/v1/messages 是 zai-org/ZCode 官方编码计划网关
-// （official-coding-plan-gateway）的改写形状：客户端把 ZCODE_BASE_URL 指向本代理
-// 时，原本发往 https://api.z.ai/api/anthropic/v1/messages 的请求被改写为
-// {ZCODE_BASE_URL}/api/v1/ultra[|-zai]/anthropic/v1/messages。别名到
-// HandleMessages：认证走同一 API Key 中间件（auth.go 对 /api/v1/ultra 前缀
-// 同样拦截），上游凭证由账号池注入，客户端自带计划凭证仅作本地认证。
+// /api/v1/ultra[|-zai]/... 是 zai-org/ZCode 官方编码计划网关的改写形状：客户端把
+// ZCODE_BASE_URL 指向本代理时，原本发往 https://api.z.ai/api/anthropic/v1/messages
+// 的请求被改写为 {ZCODE_BASE_URL}/api/v1/ultra[|-zai]/anthropic/v1/messages。
+// 3.14.4 起改写目标由服务端 agent/configs 路由表下发（客户端不再内联字面量），
+// 故用子树模式覆盖查询串/尾斜杠/count_tokens 等变体，而非仅精确路径。
+// 别名到 HandleMessages：认证走同一 API Key 中间件（auth.go 对 /api/v1/ultra
+// 前缀同样拦截），上游凭证由账号池注入，客户端自带计划凭证仅作本地认证。
 func registerModelRoutes(mux *http.ServeMux, zapi *ZCodeAPI) {
 	mux.HandleFunc("/v1/messages", zapi.HandleMessages)
 	mux.HandleFunc("/v1/messages/", zapi.HandleMessages)
@@ -387,10 +388,6 @@ func registerModelRoutes(mux *http.ServeMux, zapi *ZCodeAPI) {
 	mux.HandleFunc("/v1/models", zapi.HandleModels)
 	mux.HandleFunc("/v1/models/", zapi.HandleModelRetrieve)
 	mux.HandleFunc("/async/v1/messages", zapi.HandleAsyncMessages)
-	for _, p := range []string{
-		"/api/v1/ultra/anthropic/v1/messages",
-		"/api/v1/ultra-zai/anthropic/v1/messages",
-	} {
-		mux.HandleFunc(p, zapi.HandleMessages)
-	}
+	mux.HandleFunc("/api/v1/ultra/", zapi.HandleMessages)
+	mux.HandleFunc("/api/v1/ultra-zai/", zapi.HandleMessages)
 }
