@@ -813,3 +813,100 @@ func TestGatewayWhitelistHoistBlocksBeforeFetch(t *testing.T) {
 		t.Fatalf("unexpected body: %s", w.Body.String())
 	}
 }
+
+// ---- 轮 9（合成层契约审计）----
+
+// OpenAI 模式 usage 携带缓存命中明细（客户端读 prompt_tokens_details.cached_tokens）
+func TestOpenAICacheDetailsInUsage(t *testing.T) {
+	u := &StreamUsage{StopReason: "end_turn", InputTokens: 10, OutputTokens: 5, CacheReadTokens: 7}
+	resp := openaiResponse("GLM-5.3", "ok", "", u)
+	details, _ := resp["usage"].(map[string]interface{})["prompt_tokens_details"].(map[string]interface{})
+	if details == nil || details["cached_tokens"] != 7 {
+		t.Fatalf("non-stream prompt_tokens_details missing: %v", resp["usage"])
+	}
+	nocache := openaiResponse("GLM-5.3", "ok", "", &StreamUsage{StopReason: "end_turn", InputTokens: 1, OutputTokens: 1})
+	if _, exists := nocache["usage"].(map[string]interface{})["prompt_tokens_details"]; exists {
+		t.Fatalf("details must be omitted when no cache hit")
+	}
+	// Responses 模式：input_tokens_details.cached_tokens
+	r := responsesResponse("GLM-5.3", "resp_x", "ok", "", u)
+	rd, _ := r["usage"].(map[string]interface{})["input_tokens_details"].(map[string]interface{})
+	if rd == nil || rd["cached_tokens"] != 7 {
+		t.Fatalf("responses input_tokens_details missing: %v", r["usage"])
+	}
+}
+
+// 客户端非流式 + 上游 SSE 聚合失败：错误体必须带顶层 type:"error" 信封
+func TestAggregationFailureEnvelope(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		// 零事件干净 EOF：聚合器按失败处理
+	}))
+	defer srv.Close()
+	resp, err := http.Get(srv.URL)
+	if err != nil {
+		t.Fatalf("upstream get: %v", err)
+	}
+	defer resp.Body.Close()
+	db := newCompletionsTestDB(t)
+	z := &ZCodeAPI{db: db}
+	w := httptest.NewRecorder()
+	rc := &relayCtx{proto: protocolAnthropic, clientStream: false, clientModel: "my-model"}
+	streamProtocolResponse(w, rc, resp, &Account{}, httptest.NewRequest(http.MethodPost, "/v1/messages", nil), []byte(`{}`), z, time.Now())
+	if w.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502", w.Code)
+	}
+	if !strings.Contains(w.Body.String(), `"type":"error"`) {
+		t.Fatalf("missing Anthropic envelope: %s", w.Body.String())
+	}
+}
+
+// OpenAI 模式流：上游静默期注入空 choices 心跳 chunk（schema 合法、被解析端忽略），
+// 防客户端流空闲超时 abort+重试（轮 9，与 Anthropic ping 同动机）
+func TestStreamOpenAIInjectsHeartbeatDuringSilence(t *testing.T) {
+	old := ssePingInterval
+	ssePingInterval = 20 * time.Millisecond
+	defer func() { ssePingInterval = old }()
+
+	writeSecond := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		io.WriteString(w, "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":1}}}\n\n")
+		io.WriteString(w, "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\"}}\n\n")
+		io.WriteString(w, "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n")
+		w.(http.Flusher).Flush()
+		<-writeSecond // 静默窗口由测试精确控制（flushSignalRecorder 见 Anthropic ping 测试）
+		io.WriteString(w, "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\n")
+		io.WriteString(w, "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n")
+	}))
+	defer srv.Close()
+	resp, err := http.Get(srv.URL)
+	if err != nil {
+		t.Fatalf("upstream get: %v", err)
+	}
+	defer resp.Body.Close()
+
+	db := newCompletionsTestDB(t)
+	z := &ZCodeAPI{db: db}
+	w := &flushSignalRecorder{ResponseRecorder: httptest.NewRecorder(), flushed: make(chan struct{}, 8)}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		z.streamOpenAI(w, w, resp, "my-model", false, &Account{}, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil), []byte(`{}`), time.Now())
+	}()
+
+	<-w.flushed                     // 首个内容 chunk 已消费：代理空闲在 select 上
+	time.Sleep(4 * ssePingInterval) // 真实静默 ≥4 个 tick
+	close(writeSecond)
+	<-done
+
+	out := w.Body.String()
+	if !strings.Contains(out, `"choices":[]`) {
+		t.Fatalf("expected empty-choices heartbeat chunks during silence, got: %q", out)
+	}
+	if !strings.Contains(out, `"finish_reason":"stop"`) {
+		t.Fatalf("terminal finish chunk missing: %q", out)
+	}
+}
