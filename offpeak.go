@@ -387,7 +387,7 @@ func (z *ZCodeAPI) runOffPeak(w http.ResponseWriter, r *http.Request, opts offPe
 	if err != nil {
 		log.Printf("[async] list accounts: %v", err)
 		writeJSON(w, http.StatusInternalServerError, map[string]interface{}{
-			"error": map[string]string{"message": "账号查询失败", "type": "no_available_account"},
+			"type": "error", "error": map[string]string{"message": "账号查询失败", "type": "no_available_account"},
 		})
 		return
 	}
@@ -463,7 +463,7 @@ func (z *ZCodeAPI) runOffPeak(w http.ResponseWriter, r *http.Request, opts offPe
 		return
 	}
 	writeJSON(w, http.StatusServiceUnavailable, map[string]interface{}{
-		"error": map[string]string{"message": msg, "type": "no_available_account"},
+		"type": "error", "error": map[string]string{"message": msg, "type": "no_available_account"},
 	})
 }
 
@@ -545,7 +545,7 @@ func (z *ZCodeAPI) offPeakBridge(w http.ResponseWriter, r *http.Request, a *Acco
 			writeSSEErrorEvent(w, msg)
 		} else {
 			writeJSON(w, status, map[string]interface{}{
-				"error": map[string]string{"message": msg, "type": "async_error"},
+				"type": "error", "error": map[string]string{"message": msg, "type": "async_error"},
 			})
 		}
 		return outcomeWritten
@@ -793,7 +793,7 @@ func (z *ZCodeAPI) offPeakForward(w http.ResponseWriter, r *http.Request, a *Acc
 			writeSSEErrorEvent(w, "上游请求构造失败")
 		} else {
 			writeJSON(w, http.StatusInternalServerError, map[string]interface{}{
-				"error": map[string]string{"message": "上游请求构造失败", "type": "async_error"},
+				"type": "error", "error": map[string]string{"message": "上游请求构造失败", "type": "async_error"},
 			})
 		}
 		return outcomeWritten
@@ -885,7 +885,7 @@ func (z *ZCodeAPI) offPeakForward(w http.ResponseWriter, r *http.Request, a *Acc
 			writeSSEErrorEvent(w, msg)
 		} else {
 			writeJSON(w, resp.StatusCode, map[string]interface{}{
-				"error": map[string]string{"message": msg, "type": "api_error"},
+				"type": "error", "error": map[string]string{"message": msg, "type": "api_error"},
 			})
 		}
 		return outcomeWritten
@@ -904,7 +904,7 @@ func (z *ZCodeAPI) offPeakForward(w http.ResponseWriter, r *http.Request, a *Acc
 			return outcomeWritten
 		}
 		writeJSON(w, http.StatusBadGateway, map[string]interface{}{
-			"error": map[string]string{"message": msg, "type": "api_error"},
+			"type": "error", "error": map[string]string{"message": msg, "type": "api_error"},
 		})
 		return outcomeWritten
 	}
@@ -962,7 +962,7 @@ func (z *ZCodeAPI) offPeakForward(w http.ResponseWriter, r *http.Request, a *Acc
 		z.recordUsage(a, r, opts.payload, http.StatusBadGateway, start, 0, usage, false)
 		msg := "闲时通道响应聚合失败: " + truncate(aerr.Error(), 200)
 		writeJSON(w, http.StatusBadGateway, map[string]interface{}{
-			"error": map[string]string{"message": msg, "type": "api_error"},
+			"type": "error", "error": map[string]string{"message": msg, "type": "api_error"},
 		})
 		return outcomeWritten
 	}

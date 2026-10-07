@@ -910,3 +910,155 @@ func TestStreamOpenAIInjectsHeartbeatDuringSilence(t *testing.T) {
 		t.Fatalf("terminal finish chunk missing: %q", out)
 	}
 }
+
+// ---- 轮 10（全量红队复审修复）----
+
+// 聚合路径（客户端非流式 + 上游 SSE）同样受总读取时限：慢滴/挂死上游 502 终止
+func TestAggregationPathDeadlineAborts(t *testing.T) {
+	old := nonStreamBodyReadDeadline
+	nonStreamBodyReadDeadline = 150 * time.Millisecond
+	defer func() { nonStreamBodyReadDeadline = old }()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		io.WriteString(w, "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":1}}}\n\n")
+		w.(http.Flusher).Flush()
+		time.Sleep(5 * time.Second) // 挂死
+	}))
+	defer srv.Close()
+	resp, err := http.Get(srv.URL)
+	if err != nil {
+		t.Fatalf("upstream get: %v", err)
+	}
+	defer resp.Body.Close()
+	db := newCompletionsTestDB(t)
+	z := &ZCodeAPI{db: db}
+	w := httptest.NewRecorder()
+	start := time.Now()
+	streamProtocolResponse(w, &relayCtx{proto: protocolOpenAI, clientStream: false, clientModel: "my-model"},
+		resp, &Account{}, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil), []byte(`{}`), z, start)
+	if elapsed := time.Since(start); elapsed > 3*time.Second {
+		t.Fatalf("aggregation deadline not enforced: %v", elapsed)
+	}
+	if w.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502", w.Code)
+	}
+}
+
+// pump 的上游静默上限：半死上游必须以错误终止（保活帧不得把挂死变成永远等待）
+func TestPumpSilenceBoundAborts(t *testing.T) {
+	old := upstreamSilenceBound
+	upstreamSilenceBound = 100 * time.Millisecond
+	defer func() { upstreamSilenceBound = old }()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		io.WriteString(w, "event: message_start\ndata: {}\n\n")
+		w.(http.Flusher).Flush()
+		time.Sleep(5 * time.Second)
+	}))
+	defer srv.Close()
+	resp, err := http.Get(srv.URL)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	defer resp.Body.Close()
+	keepalives := 0
+	err = pumpSSEWithKeepalive(resp.Body, 10*time.Millisecond,
+		func([]byte) bool { return true },
+		func() { keepalives++ })
+	if err == nil || !strings.Contains(err.Error(), "stalled") {
+		t.Fatalf("expected stall error, got: %v (keepalives=%d)", err, keepalives)
+	}
+	if keepalives == 0 {
+		t.Fatal("keepalives should have been emitted before the bound fired")
+	}
+}
+
+// 重复 URL 的每个出现处仍计入内联额度（红队 F4：去重只省网络，不豁免上限）
+func TestImageInlineBudgetCountsDuplicates(t *testing.T) {
+	old := imageFetchHTTPClient
+	imageFetchHTTPClient = &http.Client{}
+	defer func() { imageFetchHTTPClient = old }()
+	var hits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		w.Header().Set("Content-Type", "image/png")
+		w.Write([]byte{0x89, 'P', 'N', 'G'})
+	}))
+	defer srv.Close()
+
+	blocks := make([]interface{}, 0, maxInlineImagesPerRequest+2)
+	blocks = append(blocks, map[string]interface{}{"type": "text", "text": "hi"})
+	for i := 0; i <= maxInlineImagesPerRequest; i++ { // 同一 URL 出现 25 次
+		blocks = append(blocks, map[string]interface{}{"type": "image",
+			"source": map[string]interface{}{"type": "url", "url": srv.URL + "/dup.png"}})
+	}
+	body := map[string]interface{}{"model": "GLM-4.6", "messages": []interface{}{
+		map[string]interface{}{"role": "user", "content": blocks},
+	}}
+	err := validateMessagesBody(context.Background(), body)
+	if err == nil || !strings.Contains(err.Error(), "too many url images") {
+		t.Fatalf("expected count-cap error across duplicates, got: %v", err)
+	}
+	if hits.Load() != 1 {
+		t.Fatalf("same url fetched %d times, want 1", hits.Load())
+	}
+}
+
+// fixThinking disabled 分支同样保留 output_config.format（结构化输出与思考正交）
+func TestFixThinkingDisabledPreservesFormat(t *testing.T) {
+	body := map[string]interface{}{
+		"model":    "GLM-5.3",
+		"thinking": map[string]interface{}{"type": "disabled"},
+		"output_config": map[string]interface{}{
+			"format": map[string]interface{}{"type": "json_schema", "schema": map[string]interface{}{"type": "object"}},
+		},
+	}
+	fixThinking(body)
+	if th, _ := body["thinking"].(map[string]interface{}); th["type"] != "disabled" {
+		t.Fatalf("thinking = %v", body["thinking"])
+	}
+	oc, _ := body["output_config"].(map[string]interface{})
+	if oc == nil || oc["format"] == nil {
+		t.Fatalf("format dropped in disabled branch: %v", body["output_config"])
+	}
+	if _, has := oc["effort"]; has {
+		t.Fatalf("stale effort must not survive disabled thinking: %v", oc)
+	}
+}
+
+// 上游错误体缺顶层 type:"error" 时自动补齐（bigmodel {"error":{...}} 形状）
+func TestUpstreamErrorEnvelopeInjected(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		io.WriteString(w, `{"error":{"code":"1211","message":"model not found"}}`)
+	}))
+	defer srv.Close()
+	resp, err := http.Get(srv.URL)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	defer resp.Body.Close()
+	w := httptest.NewRecorder()
+	writeUpstreamErrorForProto(w, resp, `{"error":{"code":"1211","message":"model not found"}}`, protocolAnthropic)
+	out := w.Body.String()
+	if !strings.Contains(out, `"type":"error"`) || !strings.Contains(out, "1211") || !strings.Contains(out, "model not found") {
+		t.Fatalf("envelope injection failed: %s", out)
+	}
+	// 已带信封的上游体原样透传，不二次包裹
+	srv2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		io.WriteString(w, `{"type":"error","error":{"type":"invalid_request_error","message":"native"}}`)
+	}))
+	defer srv2.Close()
+	resp2, _ := http.Get(srv2.URL)
+	defer resp2.Body.Close()
+	w2 := httptest.NewRecorder()
+	writeUpstreamErrorForProto(w2, resp2, `{"type":"error","error":{"type":"invalid_request_error","message":"native"}}`, protocolAnthropic)
+	if w2.Body.String() != `{"type":"error","error":{"type":"invalid_request_error","message":"native"}}` {
+		t.Fatalf("already-enveloped body must pass verbatim: %s", w2.Body.String())
+	}
+}

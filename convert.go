@@ -451,6 +451,11 @@ func clientGone(r *http.Request) bool {
 // 30s）；长思考/长工具调用间隙注入 ping 可避免误判。var 以便测试缩短间隔。
 var ssePingInterval = 15 * time.Second
 
+// upstreamSilenceBound 上游多少时间没有任何字节即按流失败终止（轮 10 红队 F2）。
+// 保活帧会不停重置客户端的空闲超时，若无此上限，半死上游会让客户端与账号槽
+// 永远挂着。10 分钟 > 客户端 600s 空闲超时，远大于合法思考间隙。var 便于测试缩短。
+var upstreamSilenceBound = 10 * time.Minute
+
 // ssePumpChunk 上游 SSE 泵送的单次读取结果
 type ssePumpChunk struct {
 	data []byte
@@ -480,7 +485,7 @@ func pumpSSEWithKeepalive(body io.ReadCloser, interval time.Duration,
 			}
 			n, err := body.Read(b)
 			select {
-			case chunks <- ssePumpChunk{data: b[:n:n], err: err}:
+			case chunks <- ssePumpChunk{data: b[:n], err: err}:
 			case <-done:
 				return
 			}
@@ -495,9 +500,18 @@ func pumpSSEWithKeepalive(body io.ReadCloser, interval time.Duration,
 		defer ticker.Stop()
 		pingC = ticker.C
 	}
+	// 上游静默上限（轮 10 红队 F2）：保活帧会不停重置客户端的空闲超时，
+	// 半死的上游（NAT 超时/中间盒静默丢流）原本会无限占住客户端与账号槽——
+	// 心跳只该桥接合法的分钟级思考间隙，不允许把"客户端 600s 会放弃"变成"永远挂着"。
+	// var 便于测试缩短。
+	var silenceC <-chan time.Time
+	silenceTimer := time.NewTimer(upstreamSilenceBound)
+	defer silenceTimer.Stop()
+	silenceC = silenceTimer.C
 	for {
 		select {
 		case c := <-chunks:
+			silenceTimer.Reset(upstreamSilenceBound)
 			if len(c.data) > 0 {
 				if !onChunk(c.data) {
 					return nil
@@ -512,6 +526,8 @@ func pumpSSEWithKeepalive(body io.ReadCloser, interval time.Duration,
 			bufs <- c.data // 处理完毕归还；生产端复用后才发起下一次 Read
 		case <-pingC:
 			onKeepalive()
+		case <-silenceC:
+			return fmt.Errorf("upstream stream stalled: no upstream data for %v", upstreamSilenceBound)
 		}
 	}
 }
@@ -591,6 +607,10 @@ func streamProtocolResponse(w http.ResponseWriter, rc *relayCtx, resp *http.Resp
 			defer ticker.Stop()
 			pingC = ticker.C
 		}
+		// 上游静默上限（轮 10 红队 F2，与 pumpSSEWithKeepalive 同规）：
+		// ping 帧会不停重置客户端空闲超时，无上限时半死上游永远挂着
+		silenceTimer := time.NewTimer(upstreamSilenceBound)
+		defer silenceTimer.Stop()
 	readLoop:
 		for {
 			select {
@@ -615,6 +635,10 @@ func streamProtocolResponse(w http.ResponseWriter, rc *relayCtx, resp *http.Resp
 					break readLoop
 				}
 				bufs <- c.buf // 处理完毕归还；生产端复用后才发起下一次 Read
+				silenceTimer.Reset(upstreamSilenceBound)
+			case <-silenceTimer.C:
+				readErr = fmt.Errorf("upstream stream stalled: no upstream data for %v", upstreamSilenceBound)
+				break readLoop
 			case <-pingC:
 				w.Write([]byte("event: ping\ndata: {\"type\":\"ping\"}\n\n"))
 				if flusher != nil {
@@ -674,7 +698,10 @@ func streamProtocolResponse(w http.ResponseWriter, rc *relayCtx, resp *http.Resp
 		z.streamCompletions(w, flusher, resp, clientModel, includeUsage, rc.echo, rc.prompt, a, r, payload, start)
 
 	default:
-		// 客户端要非流式，但上游是流式：聚合后写单个 JSON
+		// 客户端要非流式，但上游是流式：聚合后写单个 JSON。
+		// 聚合读取同样受总时限约束（轮 10 红队 F1：客户端对非流式无超时，
+		// 慢滴/挂死上游原本无限占住账号并发槽——轮 5 只包了上游 JSON 分支）
+		resp.Body = newTotalDeadlineBody(resp.Body, nonStreamBodyReadDeadline)
 		if proto == protocolAnthropic {
 			// Anthropic 客户端：聚合回完整 message（与闲时通道同一聚合器）。
 			// 64MB 上限与 relay 非流式路径同规：多读 1 字节判定超限防静默截断
@@ -699,7 +726,7 @@ func streamProtocolResponse(w http.ResponseWriter, rc *relayCtx, resp *http.Resp
 			w.Write(aggregated)
 			return
 		}
-		all, readErr := io.ReadAll(io.LimitReader(resp.Body, 64<<20))
+		all, readErr := io.ReadAll(io.LimitReader(resp.Body, (64<<20)+1))
 		var usage StreamUsage
 		var activeTool map[string]interface{}
 		var texts, thinks []string

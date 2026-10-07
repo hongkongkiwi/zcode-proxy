@@ -426,6 +426,7 @@ func (z *ZCodeAPI) tryAccount(w http.ResponseWriter, r *http.Request, a *Account
 			return outcomeNextAccount
 		case outcomeRiskBlocked:
 			z.pool.MarkPaidRiskCooling(a, "付费通道风控拦截（unusual activity）")
+			rc.sawNonRateCooldown = true
 			note("API Key 通道也被风控拦截")
 		case outcomeCaptchaRejected:
 			note("API Key 回退被拒（captcha required）")
@@ -437,6 +438,7 @@ func (z *ZCodeAPI) tryAccount(w http.ResponseWriter, r *http.Request, a *Account
 	// 所有路径失败：若是风控拦截则按阶梯冷却（R4：120s → 30min → 24h）
 	if riskBlocked {
 		z.pool.MarkRiskCooling(a, "上游风控拦截（unusual activity），全通道失败")
+		rc.sawNonRateCooldown = true
 	}
 	log.Printf("[relay] account %s all paths failed", a.Email)
 	return outcomeNextAccount
@@ -480,6 +482,7 @@ func (z *ZCodeAPI) tryPaidChannel(w http.ResponseWriter, r *http.Request, a *Acc
 		return outcomeNextAccount
 	case outcomeRiskBlocked:
 		z.pool.MarkPaidRiskCooling(a, "付费通道风控拦截（unusual activity）")
+		rc.sawNonRateCooldown = true
 		note("付费通道风控拦截（unusual activity）")
 		return outcomeNextAccount
 	}
@@ -631,6 +634,7 @@ func (z *ZCodeAPI) forwardOnce(w http.ResponseWriter, r *http.Request, a *Accoun
 					// API Key 自身鉴权失败：与免费侧凭证互不相干，只冷付费通道
 					//（1h：坏 Key 不会自愈，但留窗口给用户换 Key）
 					z.pool.MarkPaidCooling(a, fmt.Sprintf("付费通道鉴权失败 HTTP %d（API Key 无效或被禁）", resp.StatusCode), 3600)
+					rc.sawNonRateCooldown = true
 					return outcomeNextAccount
 				}
 				// 先尝试 refresh_token 兑换；成功或已有并发刷新在跑则不判死，
@@ -679,6 +683,7 @@ func (z *ZCodeAPI) forwardOnce(w http.ResponseWriter, r *http.Request, a *Accoun
 				if channel == ChannelPaid {
 					// 付费通道余额/额度不足：长冷却留充值自愈窗口，免费侧不受牵连
 					z.pool.MarkPaidExhausted(a, "付费通道余额/额度不足")
+					rc.sawNonRateCooldown = true
 					return outcomeNextAccount
 				}
 				z.pool.MarkExhausted(a, "额度已用完")
@@ -1171,7 +1176,21 @@ func fixThinking(body map[string]interface{}) {
 		if t, _ := thinking["type"].(string); t == "disabled" {
 			body["thinking"] = map[string]interface{}{"type": "disabled"}
 			delete(body, "reasoning_effort")
-			delete(body, "output_config")
+			// 与 adaptive 分支同规：仅剔除 effort 本身，保留 format/task_budget
+			//（结构化输出与思考开关正交，整体 delete 会静默丢 schema，轮 10 F8）
+			if oc, ok := body["output_config"].(map[string]interface{}); ok {
+				rest := map[string]interface{}{}
+				for k, v := range oc {
+					if k != "effort" {
+						rest[k] = v
+					}
+				}
+				if len(rest) > 0 {
+					body["output_config"] = rest
+				} else {
+					delete(body, "output_config")
+				}
+			}
 			return
 		}
 		if effort == "" {
@@ -1372,27 +1391,30 @@ func validateMessagesBody(ctx context.Context, body map[string]interface{}) erro
 					st, _ := src["type"].(string)
 					data, _ := src["data"].(string)
 					if st == "url" {
-						u, _ := src["url"].(string)
-						if inl, ok := inline.cache[u]; ok {
-							bm["source"] = map[string]interface{}{"type": "base64", "media_type": inl.mediaType, "data": inl.data}
-							continue
-						}
-						if inline.count >= maxInlineImagesPerRequest {
-							return fmt.Errorf("messages[%d].content[%d]: too many url images in one request (limit %d)", i, j, maxInlineImagesPerRequest)
-						}
-						inl, ferr := fetchImageAsBase64(ctx, u)
-						if ferr != nil {
+					u, _ := src["url"].(string)
+					// 额度按出现处计（去重只省网络抓取——红队 F4：同一 URL
+					// 重复 N 次不得绕过上限在 marshal 时放大数 GB）
+					if inline.count >= maxInlineImagesPerRequest {
+						return fmt.Errorf("messages[%d].content[%d]: too many url images in one request (limit %d)", i, j, maxInlineImagesPerRequest)
+					}
+					inl, cached := inline.cache[u]
+					if !cached {
+						var ferr error
+						if inl, ferr = fetchImageAsBase64(ctx, u); ferr != nil {
 							return fmt.Errorf("messages[%d].content[%d]: image url fetch failed: %v", i, j, ferr)
 						}
-						inline.count++
-						inline.bytes += len(inl.data)
-						if inline.bytes > maxInlineBase64BytesPerRequest {
-							return fmt.Errorf("messages[%d].content[%d]: inlined image payload exceeds %dMB per request", i, j, maxInlineBase64BytesPerRequest>>20)
-						}
-						inline.cache[u] = inl
-						bm["source"] = map[string]interface{}{"type": "base64", "media_type": inl.mediaType, "data": inl.data}
-						continue
 					}
+					inline.count++
+					inline.bytes += len(inl.data)
+					if inline.bytes > maxInlineBase64BytesPerRequest {
+						return fmt.Errorf("messages[%d].content[%d]: inlined image payload exceeds %dMB per request", i, j, maxInlineBase64BytesPerRequest>>20)
+					}
+					if !cached {
+						inline.cache[u] = inl
+					}
+					bm["source"] = map[string]interface{}{"type": "base64", "media_type": inl.mediaType, "data": inl.data}
+					continue
+				}
 					if src == nil || data == "" {
 						return fmt.Errorf("messages[%d].content[%d]: image block must contain base64 data (url sources are not accepted by the upstream)", i, j)
 					}
@@ -1475,6 +1497,15 @@ func writeUpstreamErrorForProto(w http.ResponseWriter, resp *http.Response, text
 	w.WriteHeader(status)
 	var v map[string]interface{}
 	if json.Unmarshal([]byte(text), &v) == nil {
+		// 上游错误体未必带顶层 type:"error"（bigmodel {"error":{...}} 等）：
+		// 客户端 schema 要求该键，缺失时补上再回传，保留上游其余字段原样
+		if s, ok := v["type"].(string); !ok || s != "error" {
+			v["type"] = "error"
+			if b, merr := json.Marshal(v); merr == nil {
+				w.Write(b)
+				return
+			}
+		}
 		w.Write([]byte(text))
 		return
 	}
