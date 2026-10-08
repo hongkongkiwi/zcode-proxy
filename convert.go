@@ -557,6 +557,7 @@ func streamProtocolResponse(w http.ResponseWriter, rc *relayCtx, resp *http.Resp
 		var usage StreamUsage
 		var activeTool map[string]interface{}
 		var texts, thinks []string
+		sawStop := false // message_stop 到达过：协议完整的空流（vs 中途断流的残缺流）
 		parser := &sseParser{}
 		ttft := 0
 		buf := make([]byte, 32*1024)
@@ -624,6 +625,9 @@ func streamProtocolResponse(w http.ResponseWriter, rc *relayCtx, resp *http.Resp
 						flusher.Flush()
 					}
 					if ferr := parser.feed(c.buf[:c.n], func(ev sseEvent) {
+						if ev.Event == "message_stop" {
+							sawStop = true
+						}
 						applyEventToUsage(ev, &usage, &activeTool, &texts, &thinks)
 					}); ferr != nil {
 						readErr = ferr
@@ -659,6 +663,15 @@ func streamProtocolResponse(w http.ResponseWriter, rc *relayCtx, resp *http.Resp
 			// 不把半截流当干净结束、拿空参去执行工具
 			writeSSEErrorEvent(w, "upstream tool arguments truncated")
 		}
+		// 200 干净 EOF 但一个内容块都没有（message_start→message_stop 空流：
+		// 验证码待解/套餐异常形态）：补错误帧，客户端不得当成成功空响应
+		emptyStream := resp.StatusCode == http.StatusOK && sawStop &&
+			(readErr == nil || readErr == io.EOF) &&
+			usage.StreamError == "" && !usage.ToolTruncated &&
+			len(texts) == 0 && len(thinks) == 0 && len(usage.ToolCalls) == 0
+		if emptyStream {
+			writeSSEErrorEvent(w, "upstream returned an empty response (no content blocks)")
+		}
 		// 透传路径错误事件已原样转发给客户端；此处仅修正用量记录语义并告警
 		recStatus := resp.StatusCode
 		if usage.ToolTruncated {
@@ -667,6 +680,9 @@ func streamProtocolResponse(w http.ResponseWriter, rc *relayCtx, resp *http.Resp
 		} else if usage.StreamError != "" {
 			recStatus = 502
 			log.Printf("[relay] upstream stream error event (passthrough): %s", usage.StreamError)
+		} else if emptyStream {
+			recStatus = 502
+			log.Printf("[relay] upstream 200 stream ended with no content (passthrough)")
 		} else if readErr != nil && readErr != io.EOF {
 			if clientGone(r) {
 				// 客户端主动断开：499 落库，不计入上游错误
@@ -719,6 +735,16 @@ func streamProtocolResponse(w http.ResponseWriter, rc *relayCtx, resp *http.Resp
 				})
 				return
 			}
+			// 聚合结果是零内容 message：与非流式上游路径同规按失败回写，
+			// 不得把空助手回合洗成 200
+			if resp.StatusCode == http.StatusOK && isEmptyMessageBody(aggregated) {
+				z.recordUsage(a, r, payload, 502, start, 0, aggUsage, false)
+				writeJSON(w, http.StatusBadGateway, map[string]interface{}{
+					"type":  "error",
+					"error": map[string]string{"message": "upstream returned an empty response (no content blocks)", "type": "upstream_error"},
+				})
+				return
+			}
 			z.recordUsage(a, r, payload, resp.StatusCode, start, 0, aggUsage, false)
 			w.Header().Set("Content-Type", "application/json")
 			w.Header().Set("Cache-Control", "no-store")
@@ -731,11 +757,15 @@ func streamProtocolResponse(w http.ResponseWriter, rc *relayCtx, resp *http.Resp
 		var activeTool map[string]interface{}
 		var texts, thinks []string
 		sawStart := false
+		sawStop := false // message_stop 到达过：协议完整的空流才算空响应
 		parser := &sseParser{}
 		sawMessageDelta := false // message_delta 到达过：干净完整流的标志（缺失 = 中途截断）
 		feedFn := func(ev sseEvent) {
 			if ev.Event == "message_start" {
 				sawStart = true
+			}
+			if ev.Event == "message_stop" {
+				sawStop = true
 			}
 			if ev.Event == "message_delta" {
 				sawMessageDelta = true
@@ -769,6 +799,15 @@ func streamProtocolResponse(w http.ResponseWriter, rc *relayCtx, resp *http.Resp
 			z.recordUsage(a, r, payload, 502, start, 0, &usage, rc.clientStream)
 			writeJSON(w, http.StatusBadGateway, map[string]interface{}{
 				"error": map[string]string{"message": "upstream stream ended without any events", "type": "upstream_error"},
+			})
+			return
+		}
+		// 协议完整（message_stop 已到）但零内容块（空流）：同规不得合成
+		// 200 空助手回合；裸 message_start 截断流维持既有容忍路径
+		if sawStop && len(texts) == 0 && len(thinks) == 0 && len(usage.ToolCalls) == 0 {
+			z.recordUsage(a, r, payload, 502, start, 0, &usage, rc.clientStream)
+			writeJSON(w, http.StatusBadGateway, map[string]interface{}{
+				"error": map[string]string{"message": "upstream stream ended without any content", "type": "upstream_error"},
 			})
 			return
 		}
@@ -809,6 +848,7 @@ func (z *ZCodeAPI) streamOpenAI(w http.ResponseWriter, flusher http.Flusher, res
 	var texts, thinks []string
 	first := true
 	sawStart := false // 见过 message_start（与聚合路径 sawStart 同义，零事件判定用）
+	sawStop := false  // message_stop 到达过：协议完整的空流才算空响应（裸 message_start 截断流仍走容忍路径）
 	toolIndices := map[int]int{}
 	toolArgsSeen := map[int]bool{}    // 该工具块是否已收到过 input_json_delta
 	toolStartArgs := map[int]string{} // content_block_start 自带的完整 input（无 delta 时补发用）
@@ -837,6 +877,9 @@ func (z *ZCodeAPI) streamOpenAI(w http.ResponseWriter, flusher http.Flusher, res
 		}
 		if ev.Event == "message_start" {
 			sawStart = true
+		}
+		if ev.Event == "message_stop" {
+			sawStop = true
 		}
 		applyEventToUsage(ev, &usage, &activeTool, &texts, &thinks)
 		switch ev.Event {
@@ -958,7 +1001,10 @@ func (z *ZCodeAPI) streamOpenAI(w http.ResponseWriter, flusher http.Flusher, res
 	//（零事件判定与聚合路径同规：不得合成 200 空助手回合）
 	interrupted := readErr != nil
 	zeroEvents := !sawStart && len(texts) == 0 && len(usage.ToolCalls) == 0
-	if usage.StreamError != "" || interrupted || zeroEvents || usage.ToolTruncated {
+	// 见过 message_start 但一个内容块都没有（空流）：与零事件同规，
+	// 不得合成 200 空助手回合（验证码待解/套餐异常的上游形态）
+	noContent := sawStop && len(texts) == 0 && len(thinks) == 0 && len(usage.ToolCalls) == 0
+	if usage.StreamError != "" || interrupted || zeroEvents || noContent || usage.ToolTruncated {
 		msg := usage.StreamError
 		if msg == "" && interrupted {
 			msg = fmt.Sprintf("upstream stream interrupted: %v", readErr)
@@ -967,8 +1013,11 @@ func (z *ZCodeAPI) streamOpenAI(w http.ResponseWriter, flusher http.Flusher, res
 			// 参数中途断流（评审 F7）：不得以 tool_calls + 空参数收尾洗成成功
 			msg = "upstream tool arguments truncated"
 		}
-		if msg == "" {
+		if msg == "" && zeroEvents {
 			msg = "upstream stream ended without any events"
+		}
+		if msg == "" {
+			msg = "upstream stream ended without any content"
 		}
 		ep, _ := json.Marshal(map[string]interface{}{
 			"error": map[string]interface{}{"message": msg, "type": "api_error", "code": "stream_error"},
@@ -1049,6 +1098,7 @@ func (z *ZCodeAPI) streamResponses(w http.ResponseWriter, flusher http.Flusher, 
 	var activeTool map[string]interface{}
 	var texts, thinks []string
 	sawStart := false // 见过 message_start（与聚合路径 sawStart 同义，零事件判定用）
+	sawStop := false  // message_stop 到达过：协议完整的空流才算空响应（裸 message_start 截断流仍走容忍路径）
 	sequence := 0
 	nextOutputIndex := 0
 	ttft := 0
@@ -1245,6 +1295,9 @@ func (z *ZCodeAPI) streamResponses(w http.ResponseWriter, flusher http.Flusher, 
 			if ev.Event == "message_start" {
 				sawStart = true
 			}
+			if ev.Event == "message_stop" {
+				sawStop = true
+			}
 			applyEventToUsage(ev, &usage, &activeTool, &texts, &thinks)
 			return
 		}
@@ -1416,7 +1469,10 @@ func (z *ZCodeAPI) streamResponses(w http.ResponseWriter, flusher http.Flusher, 
 	//（零事件判定与聚合路径同规：不得合成空 message 项 + completed）
 	interrupted := readErr != nil && readErr != io.EOF
 	zeroEvents := !sawStart && len(texts) == 0 && len(usage.ToolCalls) == 0
-	if usage.StreamError != "" || interrupted || zeroEvents || usage.ToolTruncated {
+	// 见过 message_start 但一个内容块都没有（空流）：与零事件同规，
+	// 不得合成 200 空助手回合（验证码待解/套餐异常的上游形态）
+	noContent := sawStop && len(texts) == 0 && len(thinks) == 0 && len(usage.ToolCalls) == 0
+	if usage.StreamError != "" || interrupted || zeroEvents || noContent || usage.ToolTruncated {
 		msg := usage.StreamError
 		if msg == "" && interrupted {
 			msg = fmt.Sprintf("upstream stream interrupted: %v", readErr)
@@ -1425,8 +1481,11 @@ func (z *ZCodeAPI) streamResponses(w http.ResponseWriter, flusher http.Flusher, 
 			// 参数中途断流（评审 F7）：不得以 tool_calls + 空参数收尾洗成成功
 			msg = "upstream tool arguments truncated"
 		}
-		if msg == "" {
+		if msg == "" && zeroEvents {
 			msg = "upstream stream ended without any events"
+		}
+		if msg == "" {
+			msg = "upstream stream ended without any content"
 		}
 		writeEvent("response.failed", map[string]interface{}{
 			"response": map[string]interface{}{
@@ -1675,6 +1734,7 @@ func (z *ZCodeAPI) streamCompletions(w http.ResponseWriter, flusher http.Flusher
 	var activeTool map[string]interface{}
 	var texts, thinks []string
 	sawStart := false // 见过 message_start（与聚合路径 sawStart 同义，零事件判定用）
+	sawStop := false  // message_stop 到达过：协议完整的空流才算空响应（裸 message_start 截断流仍走容忍路径）
 	ttft := 0
 	echoPending := echo
 
@@ -1702,6 +1762,9 @@ func (z *ZCodeAPI) streamCompletions(w http.ResponseWriter, flusher http.Flusher
 		}
 		if ev.Event == "message_start" {
 			sawStart = true
+		}
+		if ev.Event == "message_stop" {
+			sawStop = true
 		}
 		applyEventToUsage(ev, &usage, &activeTool, &texts, &thinks)
 		if ev.Event != "content_block_delta" {
@@ -1754,7 +1817,10 @@ func (z *ZCodeAPI) streamCompletions(w http.ResponseWriter, flusher http.Flusher
 	//（零事件判定与聚合路径同规：不得合成 200 空助手回合）
 	interrupted := readErr != nil && readErr != io.EOF
 	zeroEvents := !sawStart && len(texts) == 0 && len(usage.ToolCalls) == 0
-	if usage.StreamError != "" || interrupted || zeroEvents || usage.ToolTruncated {
+	// 见过 message_start 但一个内容块都没有（空流）：与零事件同规，
+	// 不得合成 200 空助手回合（验证码待解/套餐异常的上游形态）
+	noContent := sawStop && len(texts) == 0 && len(thinks) == 0 && len(usage.ToolCalls) == 0
+	if usage.StreamError != "" || interrupted || zeroEvents || noContent || usage.ToolTruncated {
 		msg := usage.StreamError
 		if msg == "" && interrupted {
 			msg = fmt.Sprintf("upstream stream interrupted: %v", readErr)
@@ -1763,8 +1829,11 @@ func (z *ZCodeAPI) streamCompletions(w http.ResponseWriter, flusher http.Flusher
 			// 参数中途断流（评审 F7）：不得以 tool_calls + 空参数收尾洗成成功
 			msg = "upstream tool arguments truncated"
 		}
-		if msg == "" {
+		if msg == "" && zeroEvents {
 			msg = "upstream stream ended without any events"
+		}
+		if msg == "" {
+			msg = "upstream stream ended without any content"
 		}
 		ep, _ := json.Marshal(map[string]interface{}{
 			"error": map[string]interface{}{"message": msg, "type": "api_error", "code": "stream_error"},

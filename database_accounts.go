@@ -113,7 +113,7 @@ const accountCols = `id, user_id, email, display_name, provider, auth_type,
 	total_units, used_units, remaining, use_count, fail_count,
 	last_used_at, last_checked_at, cooling_until, last_error,
 	last_claim_at, last_claim_plan, last_claim_msg, remark, created_at, updated_at,
-	paid_fallback, paid_cooling_until`
+	paid_fallback, paid_cooling_until, paid_last_error`
 
 func scanAccount(row interface{ Scan(...interface{}) error }) (*Account, error) {
 	var a Account
@@ -126,7 +126,7 @@ func scanAccount(row interface{ Scan(...interface{}) error }) (*Account, error) 
 		&a.TotalUnits, &a.UsedUnits, &a.Remaining, &a.UseCount, &a.FailCount,
 		&a.LastUsedAt, &a.LastCheckedAt, &a.CoolingUntil, &a.LastError,
 		&a.LastClaimAt, &a.LastClaimPlan, &a.LastClaimMsg, &a.Remark, &a.CreatedAt, &a.UpdatedAt,
-		&paidFallback, &a.PaidCoolingUntil)
+		&paidFallback, &a.PaidCoolingUntil, &a.PaidLastError)
 	if err != nil {
 		return nil, err
 	}
@@ -244,11 +244,14 @@ func (a *Account) paidCoolingActive(now int64) bool {
 	return now < a.PaidCoolingUntil
 }
 
-// setPaidRuntime 写付费通道冷却（内存副本；DB 由调用方跟进）
+// setPaidRuntime 写付费通道冷却（内存副本；DB 由调用方跟进）。
+// 只写付费侧 PaidLastError——免费侧 LastError 与 status/cooling_until 是
+// 独立通道状态，付费事件（秒级 429 冷却）覆盖它会让 503 提示拿付费理由
+// 解释免费长冷却
 func (a *Account) setPaidRuntime(lastError string, coolingUntil int64) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	a.LastError = lastError
+	a.PaidLastError = lastError
 	a.PaidCoolingUntil = coolingUntil
 }
 
@@ -260,6 +263,7 @@ func (a *Account) bumpUsePaid() {
 	a.UseCount++
 	a.LastUsedAt = time.Now().Unix()
 	a.PaidCoolingUntil = 0
+	a.PaidLastError = ""
 }
 
 // credentialSnapshot 锁保护地读取凭证三元组（供独立 goroutine 如异步 settle 使用，
@@ -364,10 +368,11 @@ func (db *DB) UpdateAccountFieldsWithPriority(id int64, group, remark string, en
 	return tx.Commit()
 }
 
-// SetAccountPaidStatus 写付费通道冷却（含余额不足长冷却）；不触碰免费侧状态列
+// SetAccountPaidStatus 写付费通道冷却（含余额不足长冷却）；不触碰免费侧
+// status/cooling_until/last_error（错误落独立列 paid_last_error）
 func (db *DB) SetAccountPaidStatus(id int64, lastError string, coolingUntil int64) error {
 	_, err := db.conn.Exec(`
-		UPDATE accounts SET last_error = ?, paid_cooling_until = ?,
+		UPDATE accounts SET paid_last_error = ?, paid_cooling_until = ?,
 		updated_at = datetime('now','localtime') WHERE id = ?`,
 		lastError, coolingUntil, id)
 	return err
@@ -377,7 +382,7 @@ func (db *DB) SetAccountPaidStatus(id int64, lastError string, coolingUntil int6
 func (db *DB) TouchAccountPaidUse(id int64) error {
 	_, err := db.conn.Exec(`
 		UPDATE accounts SET use_count = use_count + 1, last_used_at = ?,
-		paid_cooling_until = 0,
+		paid_cooling_until = 0, paid_last_error = '',
 		updated_at = datetime('now','localtime') WHERE id = ?`, time.Now().Unix(), id)
 	return err
 }

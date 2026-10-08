@@ -204,6 +204,7 @@ func accountPublicView(a *Account) map[string]interface{} {
 		"last_error":         a.LastError,
 		"paid_fallback":      a.PaidFallback,
 		"paid_cooling_until": a.PaidCoolingUntil,
+		"paid_last_error":    a.PaidLastError,
 		"last_claim_at":      a.LastClaimAt, "last_claim_plan": a.LastClaimPlan, "last_claim_msg": a.LastClaimMsg,
 		"created_at": a.CreatedAt, "updated_at": a.UpdatedAt,
 	}

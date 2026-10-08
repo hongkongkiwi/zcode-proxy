@@ -335,7 +335,8 @@ func listenAddrIsLoopback(addr string) bool {
 
 // limitBody 全局请求体上限：管理 API 与登录接口此前无大小限制，
 // 超大 JSON 会在 Decode 时整体载入内存（未认证 /api/login 即可触发）。
-// /v1 转发路径另有 8MB 的 readJSONBody 上限，互不影响。
+// /v1 转发路径另有 32MB 的 readJSONBody 上限（轮 7 自 8MB 提升，容纳
+// GLM-5.3 百万上下文大请求），互不影响。
 func limitBody(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Body != nil {
