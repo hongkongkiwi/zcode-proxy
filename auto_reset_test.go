@@ -240,6 +240,67 @@ func TestSpendGuardDBBootstrap(t *testing.T) {
 	}
 }
 
+// R: 幂等键只在临期路径确定性化（G1 回归锁）——阈值路径的 expireAt 恒 0，
+// 若也走确定性键会退化为 "auto-expiry-<id>-0" 常量：同一账号两次合法阈值
+// 消耗（本次 five_hour、下周 week）撞成同键，上游幂等真生效时第二次被误拒
+func TestAutoResetIdemKeyThresholdEmpty(t *testing.T) {
+	if got := autoResetIdemKey(false, 7, 0); got != "" {
+		t.Errorf("threshold path: got %q, want empty (random UUID fallback)", got)
+	}
+	if got := autoResetIdemKey(true, 7, 1000); got != "auto-expiry-7-1000" {
+		t.Errorf("expiring path: got %q, want auto-expiry-7-1000", got)
+	}
+}
+
+// R: 阈值路径防重放闸（G2 回归锁）——任一路径 30 分钟内成功消耗过（暖印或
+// 冷启动账本）即暂缓；印老化出 gap 且账本干净后恢复放行
+func TestThresholdSpendDeferred(t *testing.T) {
+	db, _ := newVaultTestDB(t)
+	z := &ZCodeAPI{db: db, claimLocks: map[int64]*sync.Mutex{}}
+	const id = int64(990107)
+	clean := func() {
+		autoResetState.Lock()
+		delete(autoResetState.lastExpirySpend, id)
+		delete(autoResetState.lastExpirySpendSlot, id)
+		autoResetState.Unlock()
+	}
+	clean()
+	defer clean()
+
+	// 干净状态：不暂缓
+	if z.thresholdSpendDeferred(id) {
+		t.Fatal("clean state must not defer threshold spend")
+	}
+	// 暖印在 gap 内：暂缓
+	autoResetState.Lock()
+	autoResetState.lastExpirySpend[id] = time.Now()
+	autoResetState.lastExpirySpendSlot[id] = 0
+	autoResetState.Unlock()
+	if !z.thresholdSpendDeferred(id) {
+		t.Fatal("warm stamp within gap must defer threshold spend")
+	}
+	// 印老化出 gap、账本无记录：放行
+	autoResetState.Lock()
+	autoResetState.lastExpirySpend[id] = time.Now().Add(-autoResetExpirySpendGap - time.Minute)
+	autoResetState.Unlock()
+	if z.thresholdSpendDeferred(id) {
+		t.Fatal("aged warm stamp with clean ledger must not defer")
+	}
+	// 冷启动（内存无印）+ 账本 gap 内有成功重置：暂缓
+	autoResetState.Lock()
+	delete(autoResetState.lastExpirySpend, id)
+	autoResetState.Unlock()
+	if err := db.InsertClaimRecord(&ClaimRecord{
+		AccountID: id, Email: "thresh@test", TaskType: "reset",
+		PlanName: "配额重置(WEEK)", Success: true, UsedAt: time.Now().Unix(),
+	}); err != nil {
+		t.Fatalf("insert record: %v", err)
+	}
+	if !z.thresholdSpendDeferred(id) {
+		t.Fatal("cold start with recent ledger spend must defer threshold spend")
+	}
+}
+
 // R: 临期消耗开关默认关（2026-10-09 收紧）——未配置/0/false 一律关，显式 "1" 才开。
 // "自动动用重置机会"整体 opt-in，默认态下任何路径都不得动槽位
 func TestAutoResetExpiryDefaultOff(t *testing.T) {
