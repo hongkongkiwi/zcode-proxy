@@ -77,6 +77,12 @@ func (am *AuthManager) resolveGatewayKey(key string) (*GatewayKey, *errorRespons
 	return k, nil
 }
 
+// gatewayKeyModelAllowed 仅白名单判定（无配额副作用）：nil Key（根 Key）放行。
+// 请求校验前先行拦截用——避免注定 403 的请求先触发 URL 图片抓取等准备工作（轮 8）
+func gatewayKeyModelAllowed(k *GatewayKey, model string) bool {
+	return k == nil || k.modelAllowed(model)
+}
+
 // checkGatewayKeyRequest 转发前拦截：配额耗尽 / 模型不在白名单。
 // model 须已去掉 provider 前缀并小写（与白名单同规范）。
 func checkGatewayKeyRequest(k *GatewayKey, model string) *errorResponse {

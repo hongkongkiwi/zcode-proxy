@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -105,7 +106,7 @@ func TestReviewExplicitSignedThinkingSurvivesNativeNormalization(t *testing.T) {
 	if err := normalizeBody(body, &ZCodeAPI{cfg: &FileConfig{}, db: db}); err != nil {
 		t.Fatal(err)
 	}
-	if err := validateMessagesBody(body); err != nil {
+	if err := validateMessagesBody(context.Background(), body); err != nil {
 		t.Fatal(err)
 	}
 	messages := body["messages"].([]interface{})

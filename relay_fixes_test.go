@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 )
@@ -113,8 +114,10 @@ func TestMessagesImageSourceValidation(t *testing.T) {
 		img     map[string]interface{}
 		wantErr bool
 	}{
+		// url source：现为受控抓取（image_fetch.go），环回地址被 SSRF 防护拒绝
+		// （fail-closed，与旧的本地 400 行为等价）
 		{"url source", map[string]interface{}{"type": "image",
-			"source": map[string]interface{}{"type": "url", "url": "https://x/y.png"}}, true},
+			"source": map[string]interface{}{"type": "url", "url": "http://127.0.0.1:9/x.png"}}, true},
 		{"missing source", map[string]interface{}{"type": "image"}, true},
 		{"null source", map[string]interface{}{"type": "image", "source": nil}, true},
 		{"non-map source", map[string]interface{}{"type": "image", "source": "https://x/y.png"}, true},
@@ -124,7 +127,7 @@ func TestMessagesImageSourceValidation(t *testing.T) {
 			"source": map[string]interface{}{"type": "base64", "data": ""}}, true},
 	}
 	for _, c := range cases {
-		err := validateMessagesBody(build(c.img))
+		err := validateMessagesBody(context.Background(), build(c.img))
 		if c.wantErr && err == nil {
 			t.Fatalf("%s: expected validation error, got nil", c.name)
 		}
@@ -138,7 +141,10 @@ func TestMessagesImageSourceValidation(t *testing.T) {
 }
 
 func wantImageSourceError(err error) bool {
-	return err.Error() == "messages[0].content[1]: image block must contain base64 data (url sources are not accepted by the upstream)"
+	s := err.Error()
+	// base64 形状错误（missing/null/非对象/空 data）或 url 抓取失败（SSRF 拦截等）
+	return strings.Contains(s, "image block must contain base64 data") ||
+		strings.Contains(s, "image url fetch failed")
 }
 
 // ---- 间隔设置钳制：极端值不得溢出 Duration 导致热循环 ----

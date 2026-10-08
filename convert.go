@@ -446,6 +446,92 @@ func clientGone(r *http.Request) bool {
 	return r != nil && errors.Is(r.Context().Err(), context.Canceled)
 }
 
+// ssePingInterval 上游静默多久后向客户端注入一个协议合法的 ping 帧。
+// zai-org/ZCode 按 chunk 间隔计流空闲超时（超限 abort + 全量重试且每次重试加罚
+// 30s）；长思考/长工具调用间隙注入 ping 可避免误判。var 以便测试缩短间隔。
+var ssePingInterval = 15 * time.Second
+
+// upstreamSilenceBound 上游多少时间没有任何字节即按流失败终止（轮 10 红队 F2）。
+// 保活帧会不停重置客户端的空闲超时，若无此上限，半死上游会让客户端与账号槽
+// 永远挂着。10 分钟 > 客户端 600s 空闲超时，远大于合法思考间隙。var 便于测试缩短。
+var upstreamSilenceBound = 10 * time.Minute
+
+// ssePumpChunk 上游 SSE 泵送的单次读取结果
+type ssePumpChunk struct {
+	data []byte
+	err  error
+}
+
+// pumpSSEWithKeepalive 阻塞读上游 SSE 并把字节交给 onChunk；上游静默超过
+// interval 时调用 onKeepalive 注入保活帧（interval<=0 不注入，仅 200 透传体调用）。
+// 读取在生产 goroutine 中进行 + buf 归还通道（Read 覆写消费端仍在解析数据的
+// 竞态见 streamProtocolResponse 的 -race 实证）；onChunk 返回 false 终止泵送。
+// 返回读取错误；io.EOF 折算为 nil（干净结束）。
+func pumpSSEWithKeepalive(body io.ReadCloser, interval time.Duration,
+	onChunk func([]byte) bool, onKeepalive func()) error {
+
+	chunks := make(chan ssePumpChunk)
+	bufs := make(chan []byte, 1)
+	bufs <- make([]byte, 32*1024)
+	done := make(chan struct{})
+	defer close(done)
+	go func() {
+		for {
+			var b []byte
+			select {
+			case b = <-bufs:
+			case <-done:
+				return
+			}
+			n, err := body.Read(b)
+			select {
+			case chunks <- ssePumpChunk{data: b[:n], err: err}:
+			case <-done:
+				return
+			}
+			if err != nil {
+				return
+			}
+		}
+	}()
+	var pingC <-chan time.Time
+	if interval > 0 {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		pingC = ticker.C
+	}
+	// 上游静默上限（轮 10 红队 F2）：保活帧会不停重置客户端的空闲超时，
+	// 半死的上游（NAT 超时/中间盒静默丢流）原本会无限占住客户端与账号槽——
+	// 心跳只该桥接合法的分钟级思考间隙，不允许把"客户端 600s 会放弃"变成"永远挂着"。
+	// var 便于测试缩短。
+	var silenceC <-chan time.Time
+	silenceTimer := time.NewTimer(upstreamSilenceBound)
+	defer silenceTimer.Stop()
+	silenceC = silenceTimer.C
+	for {
+		select {
+		case c := <-chunks:
+			silenceTimer.Reset(upstreamSilenceBound)
+			if len(c.data) > 0 {
+				if !onChunk(c.data) {
+					return nil
+				}
+			}
+			if c.err != nil {
+				if errors.Is(c.err, io.EOF) {
+					return nil
+				}
+				return c.err
+			}
+			bufs <- c.data // 处理完毕归还；生产端复用后才发起下一次 Read
+		case <-pingC:
+			onKeepalive()
+		case <-silenceC:
+			return fmt.Errorf("upstream stream stalled: no upstream data for %v", upstreamSilenceBound)
+		}
+	}
+}
+
 // streamProtocolResponse 流式透传/转换 + usage 嗅探 + 用量落库
 func streamProtocolResponse(w http.ResponseWriter, rc *relayCtx, resp *http.Response,
 	a *Account, r *http.Request, payload []byte, z *ZCodeAPI, start time.Time) {
@@ -475,26 +561,89 @@ func streamProtocolResponse(w http.ResponseWriter, rc *relayCtx, resp *http.Resp
 		ttft := 0
 		buf := make([]byte, 32*1024)
 		var readErr error
-		for {
-			n, err := resp.Body.Read(buf)
-			if n > 0 {
-				if ttft == 0 {
-					ttft = int(time.Since(start).Milliseconds())
+		// 上游静默时注入 ping 保活。仅对 200 透传体注入：错误体里混入 ping 会破坏协议。
+		// 上游 Read 是阻塞的，读到单独 goroutine，主循环 select 兼顾 ping 定时器；
+		// readDone 保证提前退出（解析溢出/错误）时生产 goroutine 不永久阻塞在 channel 上
+		pingInterval := time.Duration(0)
+		if resp.StatusCode == http.StatusOK {
+			pingInterval = ssePingInterval
+		}
+		type readResult struct {
+			buf []byte
+			n   int
+			err error
+		}
+		chunks := make(chan readResult)
+		// buf 归还通道：生产端取回处理完的 buf 才发起下一次 Read，否则上游
+		// Read 会覆写消费端仍在解析的上一块数据（-race 实证）
+		bufs := make(chan []byte, 1)
+		bufs <- buf
+		readDone := make(chan struct{})
+		// defer 而非循环后裸 close：中途 panic 时生产 goroutine 才不至于
+		// 永久阻塞在发送/等待上（评审轮 3 红队 F7）
+		defer close(readDone)
+		go func() {
+			for {
+				var b []byte
+				select {
+				case b = <-bufs:
+				case <-readDone:
+					return
 				}
-				w.Write(buf[:n])
+				n, err := resp.Body.Read(b)
+				select {
+				case chunks <- readResult{buf: b, n: n, err: err}:
+				case <-readDone:
+					return
+				}
+				if err != nil {
+					return
+				}
+			}
+		}()
+		var pingC <-chan time.Time
+		if pingInterval > 0 {
+			ticker := time.NewTicker(pingInterval)
+			defer ticker.Stop()
+			pingC = ticker.C
+		}
+		// 上游静默上限（轮 10 红队 F2，与 pumpSSEWithKeepalive 同规）：
+		// ping 帧会不停重置客户端空闲超时，无上限时半死上游永远挂着
+		silenceTimer := time.NewTimer(upstreamSilenceBound)
+		defer silenceTimer.Stop()
+	readLoop:
+		for {
+			select {
+			case c := <-chunks:
+				if c.n > 0 {
+					if ttft == 0 {
+						ttft = int(time.Since(start).Milliseconds())
+					}
+					w.Write(c.buf[:c.n])
+					if flusher != nil {
+						flusher.Flush()
+					}
+					if ferr := parser.feed(c.buf[:c.n], func(ev sseEvent) {
+						applyEventToUsage(ev, &usage, &activeTool, &texts, &thinks)
+					}); ferr != nil {
+						readErr = ferr
+						break readLoop
+					}
+				}
+				if c.err != nil {
+					readErr = c.err
+					break readLoop
+				}
+				bufs <- c.buf // 处理完毕归还；生产端复用后才发起下一次 Read
+				silenceTimer.Reset(upstreamSilenceBound)
+			case <-silenceTimer.C:
+				readErr = fmt.Errorf("upstream stream stalled: no upstream data for %v", upstreamSilenceBound)
+				break readLoop
+			case <-pingC:
+				w.Write([]byte("event: ping\ndata: {\"type\":\"ping\"}\n\n"))
 				if flusher != nil {
 					flusher.Flush()
 				}
-				if ferr := parser.feed(buf[:n], func(ev sseEvent) {
-					applyEventToUsage(ev, &usage, &activeTool, &texts, &thinks)
-				}); ferr != nil {
-					readErr = ferr
-					break
-				}
-			}
-			if err != nil {
-				readErr = err
-				break
 			}
 		}
 		parser.flush(func(ev sseEvent) { applyEventToUsage(ev, &usage, &activeTool, &texts, &thinks) })
@@ -549,7 +698,10 @@ func streamProtocolResponse(w http.ResponseWriter, rc *relayCtx, resp *http.Resp
 		z.streamCompletions(w, flusher, resp, clientModel, includeUsage, rc.echo, rc.prompt, a, r, payload, start)
 
 	default:
-		// 客户端要非流式，但上游是流式：聚合后写单个 JSON
+		// 客户端要非流式，但上游是流式：聚合后写单个 JSON。
+		// 聚合读取同样受总时限约束（轮 10 红队 F1：客户端对非流式无超时，
+		// 慢滴/挂死上游原本无限占住账号并发槽——轮 5 只包了上游 JSON 分支）
+		resp.Body = newTotalDeadlineBody(resp.Body, nonStreamBodyReadDeadline)
 		if proto == protocolAnthropic {
 			// Anthropic 客户端：聚合回完整 message（与闲时通道同一聚合器）。
 			// 64MB 上限与 relay 非流式路径同规：多读 1 字节判定超限防静默截断
@@ -559,7 +711,10 @@ func streamProtocolResponse(w http.ResponseWriter, rc *relayCtx, resp *http.Resp
 			}
 			if aerr != nil {
 				z.recordUsage(a, r, payload, 502, start, 0, aggUsage, false)
+				// Anthropic 原生客户端：错误体须带顶层 type:"error" 信封（SDK
+				// schema 要求，否则只显示 statusText），与 writeAPIError 同规
 				writeJSON(w, http.StatusBadGateway, map[string]interface{}{
+					"type":  "error",
 					"error": map[string]string{"message": "上游响应聚合失败: " + truncate(aerr.Error(), 200), "type": "upstream_error"},
 				})
 				return
@@ -571,7 +726,7 @@ func streamProtocolResponse(w http.ResponseWriter, rc *relayCtx, resp *http.Resp
 			w.Write(aggregated)
 			return
 		}
-		all, readErr := io.ReadAll(io.LimitReader(resp.Body, 64<<20))
+		all, readErr := io.ReadAll(io.LimitReader(resp.Body, (64<<20)+1))
 		var usage StreamUsage
 		var activeTool map[string]interface{}
 		var texts, thinks []string
@@ -770,28 +925,38 @@ func (z *ZCodeAPI) streamOpenAI(w http.ResponseWriter, flusher http.Flusher, res
 		}
 	}
 
-	buf := make([]byte, 32*1024)
-	var readErr error
-	for {
-		n, err := resp.Body.Read(buf)
-		if n > 0 {
-			if ferr := parser.feed(buf[:n], handle); ferr != nil {
-				readErr = ferr
-				break
-			}
-		}
-		if err != nil {
-			readErr = err
-			break
-		}
+	// 上游静默期注入空 choices 心跳 chunk（schema 合法且被 openai-compatible
+	// 解析端忽略），防客户端流空闲超时 abort+重试（与 Anthropic ping 同动机）
+	keepalive := time.Duration(0)
+	if resp.StatusCode == http.StatusOK {
+		keepalive = ssePingInterval
 	}
+	var readErr error
+	readErr = pumpSSEWithKeepalive(resp.Body, keepalive,
+		func(b []byte) bool {
+			if ferr := parser.feed(b, handle); ferr != nil {
+				readErr = ferr
+				return false
+			}
+			return true
+		},
+		func() {
+			hb, _ := json.Marshal(map[string]interface{}{
+				"id": cid, "object": "chat.completion.chunk", "created": now, "model": model,
+				"choices": []interface{}{},
+			})
+			fmt.Fprintf(w, "data: %s\n\n", hb)
+			if flusher != nil {
+				flusher.Flush()
+			}
+		})
 	parser.flush(handle)
 	finalizeToolCalls(&usage)
 	cacheThinkingForOutput(strings.Join(texts, ""), &usage)
 
 	// 上游流内错误、中途断流或零事件干净 EOF：发 OpenAI 错误 chunk 而非伪装成功
 	//（零事件判定与聚合路径同规：不得合成 200 空助手回合）
-	interrupted := readErr != nil && readErr != io.EOF
+	interrupted := readErr != nil
 	zeroEvents := !sawStart && len(texts) == 0 && len(usage.ToolCalls) == 0
 	if usage.StreamError != "" || interrupted || zeroEvents || usage.ToolTruncated {
 		msg := usage.StreamError
@@ -852,6 +1017,10 @@ func (z *ZCodeAPI) streamOpenAI(w http.ResponseWriter, flusher http.Flusher, res
 			"prompt_tokens":     usage.InputTokens,
 			"completion_tokens": usage.OutputTokens,
 			"total_tokens":      usage.InputTokens + usage.OutputTokens,
+		}
+		// 缓存命中明细（round-4 闭集：openai-compatible 客户端读取该键）
+		if usage.CacheReadTokens > 0 {
+			finalUsage["prompt_tokens_details"] = map[string]interface{}{"cached_tokens": usage.CacheReadTokens}
 		}
 		p, _ := json.Marshal(map[string]interface{}{
 			"id": cid, "object": "chat.completion.chunk", "created": now, "model": model,
@@ -1205,21 +1374,24 @@ func (z *ZCodeAPI) streamResponses(w http.ResponseWriter, flusher http.Flusher, 
 		}
 	}
 
-	buf := make([]byte, 32*1024)
-	var readErr error
-	for {
-		n, err := resp.Body.Read(buf)
-		if n > 0 {
-			if ferr := parser.feed(buf[:n], handle); ferr != nil {
-				readErr = ferr
-				break
-			}
-		}
-		if err != nil {
-			readErr = err
-			break
-		}
+	// 上游静默期注入 response.in_progress 心跳（客户端解析联合不含该类型 →
+	// 静默忽略），防流空闲超时误判
+	keepalive := time.Duration(0)
+	if resp.StatusCode == http.StatusOK {
+		keepalive = ssePingInterval
 	}
+	var readErr error
+	readErr = pumpSSEWithKeepalive(resp.Body, keepalive,
+		func(b []byte) bool {
+			if ferr := parser.feed(b, handle); ferr != nil {
+				readErr = ferr
+				return false
+			}
+			return true
+		},
+		func() {
+			writeEvent("response.in_progress", map[string]interface{}{})
+		})
 	parser.flush(handle)
 
 	// 关闭未完成的块（上游异常中断兜底）；map 遍历无序，按 index 排序保证
@@ -1283,9 +1455,13 @@ func (z *ZCodeAPI) streamResponses(w http.ResponseWriter, flusher http.Flusher, 
 		openMessageEvents(emptyIdx)
 		closeMessageEvents(emptyIdx)
 	}
-	writeEvent("response.completed", map[string]interface{}{
-		"response": responsesResponseWithItems(model, responseID, outputItems, fullText, fullThinking, &usage),
-	})
+	// max_tokens 截断 → response.incomplete（协议语义同上），其余 completed
+	responseObj := responsesResponseWithItems(model, responseID, outputItems, fullText, fullThinking, &usage)
+	terminal := "response.completed"
+	if responseObj["status"] == "incomplete" {
+		terminal = "response.incomplete"
+	}
+	writeEvent(terminal, map[string]interface{}{"response": responseObj})
 	if flusher != nil {
 		flusher.Flush()
 	}
@@ -1341,9 +1517,23 @@ func openaiResponse(model, text, thinking string, usage *StreamUsage) map[string
 	in, out := 0, 0
 	stop := ""
 	hasTools := false
+	var usageObj map[string]interface{}
 	if usage != nil {
 		in, out, stop = usage.InputTokens, usage.OutputTokens, usage.StopReason
 		hasTools = len(usage.ToolCalls) > 0
+		usageObj = map[string]interface{}{
+			"prompt_tokens": in, "completion_tokens": out, "total_tokens": in + out,
+		}
+		// openai-compatible 客户端从 prompt_tokens_details.cached_tokens 读缓存命中
+		//（round-4 闭集）；无缓存时不带该键（nullish 合法）
+		if usage.CacheReadTokens > 0 {
+			usageObj["prompt_tokens_details"] = map[string]interface{}{"cached_tokens": usage.CacheReadTokens}
+		}
+	}
+	if usageObj == nil {
+		usageObj = map[string]interface{}{
+			"prompt_tokens": in, "completion_tokens": out, "total_tokens": in + out,
+		}
 	}
 	return map[string]interface{}{
 		"id":      "chatcmpl-" + randomHex(12),
@@ -1353,9 +1543,7 @@ func openaiResponse(model, text, thinking string, usage *StreamUsage) map[string
 		"choices": []map[string]interface{}{{
 			"index": 0, "message": message, "finish_reason": openaiFinish(stop, hasTools),
 		}},
-		"usage": map[string]interface{}{
-			"prompt_tokens": in, "completion_tokens": out, "total_tokens": in + out,
-		},
+		"usage": usageObj,
 	}
 }
 
@@ -1414,15 +1602,31 @@ func responsesResponseWithItems(model, responseID string, items []map[string]int
 	if usage != nil {
 		in, out = usage.InputTokens, usage.OutputTokens
 	}
-	return map[string]interface{}{
+	// max_tokens 截断按 Responses 协议语义回 status:"incomplete" +
+	// incomplete_details.max_output_tokens（客户端据此映射 finish=length）；
+	// 恒发 completed 会把截断谎报成正常 stop（轮 8）
+	status := "completed"
+	if usage != nil && usage.StopReason == "max_tokens" {
+		status = "incomplete"
+	}
+	// Responses 客户端从 input_tokens_details.cached_tokens 读缓存命中（round-4 闭集）
+	usageObj := map[string]interface{}{
+		"input_tokens": in, "output_tokens": out, "total_tokens": in + out,
+	}
+	if usage != nil && usage.CacheReadTokens > 0 {
+		usageObj["input_tokens_details"] = map[string]interface{}{"cached_tokens": usage.CacheReadTokens}
+	}
+	out2 := map[string]interface{}{
 		"id": responseID, "object": "response", "created_at": time.Now().Unix(),
-		"status": "completed", "model": model,
+		"status": status, "model": model,
 		"output":      output,
 		"output_text": text,
-		"usage": map[string]interface{}{
-			"input_tokens": in, "output_tokens": out, "total_tokens": in + out,
-		},
+		"usage":       usageObj,
 	}
+	if status == "incomplete" {
+		out2["incomplete_details"] = map[string]interface{}{"reason": "max_output_tokens"}
+	}
+	return out2
 }
 
 // ---- OpenAI legacy text_completion 构造（/v1/completions shim）----
@@ -1518,21 +1722,30 @@ func (z *ZCodeAPI) streamCompletions(w http.ResponseWriter, flusher http.Flusher
 		writeChunk(t, nil, nil)
 	}
 
-	buf := make([]byte, 32*1024)
-	var readErr error
-	for {
-		n, err := resp.Body.Read(buf)
-		if n > 0 {
-			if ferr := parser.feed(buf[:n], handle); ferr != nil {
-				readErr = ferr
-				break
-			}
-		}
-		if err != nil {
-			readErr = err
-			break
-		}
+	// 上游静默期注入空 choices 心跳（与 streamOpenAI 同动机，text_completion 形状）
+	keepalive := time.Duration(0)
+	if resp.StatusCode == http.StatusOK {
+		keepalive = ssePingInterval
 	}
+	var readErr error
+	readErr = pumpSSEWithKeepalive(resp.Body, keepalive,
+		func(b []byte) bool {
+			if ferr := parser.feed(b, handle); ferr != nil {
+				readErr = ferr
+				return false
+			}
+			return true
+		},
+		func() {
+			hb, _ := json.Marshal(map[string]interface{}{
+				"id": cid, "object": "text_completion", "created": now, "model": model,
+				"choices": []interface{}{},
+			})
+			fmt.Fprintf(w, "data: %s\n\n", hb)
+			if flusher != nil {
+				flusher.Flush()
+			}
+		})
 	parser.flush(handle)
 	finalizeToolCalls(&usage)
 	cacheThinkingForOutput(strings.Join(texts, ""), &usage)
@@ -1579,6 +1792,10 @@ func (z *ZCodeAPI) streamCompletions(w http.ResponseWriter, flusher http.Flusher
 			"prompt_tokens":     usage.InputTokens,
 			"completion_tokens": usage.OutputTokens,
 			"total_tokens":      usage.InputTokens + usage.OutputTokens,
+		}
+		// 缓存命中明细（round-4 闭集：openai-compatible 客户端读取该键）
+		if usage.CacheReadTokens > 0 {
+			finalUsage["prompt_tokens_details"] = map[string]interface{}{"cached_tokens": usage.CacheReadTokens}
 		}
 		p, _ := json.Marshal(map[string]interface{}{
 			"id": cid, "object": "text_completion", "created": now, "model": model,

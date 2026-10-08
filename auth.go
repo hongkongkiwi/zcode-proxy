@@ -481,9 +481,12 @@ func (am *AuthManager) Middleware(next http.Handler) http.Handler {
 		}
 
 		// /v1/* 与 /async/*（闲时通道）使用 API Key 认证（Authorization: Bearer 或 x-api-key）。
+		// /api/v1/ultra* 是官方编码计划网关改写路径的本地别名（见 registerModelRoutes），
+		// 同样走 API Key 认证——绝不允许成为未认证模型端点。
 		// 命中命名网关 Key（R1）时做启停/RPM 检查并注入 context，转发层再做
 		// 模型白名单/配额拦截；根 Key（旧 api_key）不受限。
-		if strings.HasPrefix(path, "/v1/") || strings.HasPrefix(path, "/async/") {
+		if strings.HasPrefix(path, "/v1/") || strings.HasPrefix(path, "/async/") ||
+			strings.HasPrefix(path, "/api/v1/ultra") {
 			var apiKey string
 			if xKey := r.Header.Get("x-api-key"); xKey != "" {
 				apiKey = xKey
@@ -492,6 +495,7 @@ func (am *AuthManager) Middleware(next http.Handler) http.Handler {
 			}
 			if apiKey == "" {
 				writeJSON(w, http.StatusUnauthorized, map[string]interface{}{
+					"type": "error",
 					"error": map[string]string{
 						"message": "API key required. Use 'Authorization: Bearer <key>' or 'x-api-key: <key>'",
 						"type":    "authentication_error",
@@ -505,6 +509,7 @@ func (am *AuthManager) Middleware(next http.Handler) http.Handler {
 					w.Header().Set("Retry-After", "10")
 				}
 				writeJSON(w, errResp.status, map[string]interface{}{
+					"type":  "error",
 					"error": map[string]string{"message": errResp.msg, "type": "authentication_error"},
 				})
 				return
@@ -755,7 +760,11 @@ func writeJSON(w http.ResponseWriter, status int, v interface{}) {
 }
 
 func writeAPIError(w http.ResponseWriter, status int, msg string) {
+	// Anthropic 错误信封：@ai-sdk/anthropic 的错误 schema 要求顶层 type:"error"，
+	// 否则 zod 解析失败、客户端只能显示 response.statusText（"Bad Request"），
+	// 详细的校验/限流原因全部丢失。error.message 同时满足 OpenAI 兼容端读取。
 	writeJSON(w, status, map[string]interface{}{
+		"type":  "error",
 		"error": map[string]string{"message": msg, "type": "api_error"},
 	})
 }

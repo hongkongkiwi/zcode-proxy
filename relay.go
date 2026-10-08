@@ -24,7 +24,10 @@ import (
 const (
 	maxCaptchaRetries  = 3
 	maxAccountAttempts = 5
-	maxRequestBytes    = 8 << 20
+	// 32MB：GLM-5.3 百万 token 上下文 + ~227 个工具 schema + base64 图片的
+	// 合法大请求可能越过 8MB；413 对客户端是不可重试硬失败（轮 7）。
+	// 出站上限仍为 64MB；本地个人代理，JSON 解析的内存尖峰可接受
+	maxRequestBytes = 32 << 20
 )
 
 // modelNameMap 上游模型名大小写敏感，客户端小写别名 → 官方名
@@ -81,6 +84,14 @@ type relayCtx struct {
 	includeUsage bool   // OpenAI stream_options.include_usage
 	echo         bool   // /v1/completions echo=true：choices.text 前缀原 prompt
 	prompt       string // /v1/completions 原始 prompt（echo 回显用）
+	// sawRateLimit 本次请求内任一账号/通道撞过上游限流（HTTP 429 或业务码）。
+	// 全部账号耗尽时用于区分"过载"（→ 529 overloaded_error，客户端有专门的
+	// 过载重试分类与文案）与"无可用账号"（→ 503）
+	sawRateLimit bool
+	// sawNonRateCooldown 本次请求内出现过非限流类的账号冷却（鉴权失效/额度
+	// 耗尽/风控/连接失败等）。与 sawRateLimit 同时为真 = 混合故障：终态按 503
+	// 如实回报，不得谎报成纯过载（轮 4 红队 F4）
+	sawNonRateCooldown bool
 }
 
 // HandleMessages POST /v1/messages — 原生 Anthropic 协议
@@ -99,7 +110,16 @@ func (z *ZCodeAPI) HandleMessages(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	if err := validateMessagesBody(body); err != nil {
+	// 网关 Key 白名单在请求校验前拦截（轮 8）：注定 403 的请求不得先触发
+	// URL 图片抓取等准备工作。RPM/配额仍在 relay 内计数，此处仅白名单
+	if gk := gatewayKeyFromCtx(r.Context()); gk != nil {
+		model, _ := body["model"].(string)
+		if name := canonicalModelName(model); !gatewayKeyModelAllowed(gk, name) {
+			writeAPIError(w, http.StatusForbidden, "model not allowed for this gateway key: "+name)
+			return
+		}
+	}
+	if err := validateMessagesBody(r.Context(), body); err != nil {
 		writeAPIError(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -220,12 +240,13 @@ func (z *ZCodeAPI) relay(w http.ResponseWriter, r *http.Request, rc *relayCtx) {
 		msg += "；" + paidSkipReason
 	}
 	// 若因冷却导致无可用账号，给出预计恢复时间
+	coolSecs := int64(0)
 	if until, reason := z.pool.CoolingInfo(rc.provider, rc.group, accounts); until > 0 {
-		secs := until - time.Now().Unix()
-		if secs < 0 {
-			secs = 0
+		coolSecs = until - time.Now().Unix()
+		if coolSecs < 0 {
+			coolSecs = 0
 		}
-		msg += fmt.Sprintf("；免费通道冷却中（%s），约 %d 秒后自动恢复重试", firstNonEmpty(reason, "上游限流/风控"), secs)
+		msg += fmt.Sprintf("；免费通道冷却中（%s），约 %d 秒后自动恢复重试", firstNonEmpty(reason, "上游限流/风控"), coolSecs)
 	}
 	// F3：耗尽账号的上游重置时间已知时如实告知（monitor 通道 nextResetTime）。
 	// 不带账号邮箱/展示名：503 体面向命名 Key 持有方（可能发给第三方）
@@ -240,24 +261,57 @@ func (z *ZCodeAPI) relay(w http.ResponseWriter, r *http.Request, rc *relayCtx) {
 		msg += "（最近失败原因: " + detail + "）"
 	}
 	log.Printf("[relay] no available account: %s", detail)
+	writeAllAccountsUnavailable(w, rc, msg, paidSkipReason != "", coolSecs)
+}
+
+// writeAllAccountsUnavailable 终态"无账号可用"响应。Anthropic 协议且本次请求见过
+// 上游限流时按 529 overloaded_error 回报：zai-org/ZCode 客户端对 529 有专门的
+// 过载分类（可重试、文案 "Provider is overloaded"），并对 429/529 解析 Retry-After
+// 精确退避；一律 503 会让它退回通用指数退避。付费闸拦截（paidSkipped）说明根因
+// 含策略/配额而非纯过载，维持 503。错误体用 Anthropic 原生 {"type":"error",...} 形状。
+func writeAllAccountsUnavailable(w http.ResponseWriter, rc *relayCtx, msg string, paidSkipped bool, coolSecs int64) {
+	// 同为 Anthropic 信封：客户端 schema 要求顶层 type:"error"，否则
+	// no_available_account 的明细（冷却/重置时间）到不了用户眼前。
+	// 混合故障（限流+鉴权失效/耗尽等）按 503 如实回报，不谎报纯过载
+	if rc.proto == protocolAnthropic && rc.sawRateLimit && !rc.sawNonRateCooldown && !paidSkipped {
+		retryAfter := 10
+		if coolSecs >= 1 && coolSecs <= 300 {
+			retryAfter = int(coolSecs)
+		}
+		w.Header().Set("Retry-After", strconv.Itoa(retryAfter))
+		log.Printf("[relay] all accounts rate-limited → 529 overloaded_error (retry-after=%ds)", retryAfter)
+		writeJSON(w, 529, map[string]interface{}{
+			"type":  "error",
+			"error": map[string]string{"type": "overloaded_error", "message": msg},
+		})
+		return
+	}
+	// 同为 Anthropic 信封：客户端 schema 要求顶层 type:"error"，否则
+	// no_available_account 的明细（冷却/重置时间）到不了用户眼前
 	writeJSON(w, http.StatusServiceUnavailable, map[string]interface{}{
+		"type":  "error",
 		"error": map[string]string{"message": msg, "type": "no_available_account"},
 	})
 }
 
-// relayModelName 白名单校验用的规范模型名：去 provider 前缀 + 小写（与 gateway_keys 白名单同规范）
+// canonicalModelName 白名单校验用的规范模型名：去 provider 前缀 + 小写
+//（与 gateway_keys 白名单同规范）
+func canonicalModelName(bodyModel string) string {
+	if i := strings.Index(bodyModel, "/"); i >= 0 {
+		bodyModel = bodyModel[i+1:]
+	}
+	if official, ok := modelNameMap[strings.ToLower(strings.TrimSpace(bodyModel))]; ok {
+		return strings.ToLower(official)
+	}
+	return strings.ToLower(strings.TrimSpace(bodyModel))
+}
+
 func relayModelName(rc *relayCtx) string {
 	model := rc.clientModel
 	if m, ok := rc.body["model"].(string); ok && m != "" {
 		model = m // normalizeBody 已归一化，优先取
 	}
-	if i := strings.Index(model, "/"); i >= 0 {
-		model = model[i+1:]
-	}
-	if official, ok := modelNameMap[strings.ToLower(strings.TrimSpace(model))]; ok {
-		return strings.ToLower(official)
-	}
-	return strings.ToLower(strings.TrimSpace(model))
+	return canonicalModelName(model)
 }
 
 // sessionKey 会话粘滞键（F2）：优先 metadata.user_id（Anthropic 客户端语义），
@@ -354,6 +408,7 @@ func (z *ZCodeAPI) tryAccount(w http.ResponseWriter, r *http.Request, a *Account
 	if mode == relayModeFree {
 		if riskBlocked {
 			z.pool.MarkRiskCooling(a, "免费通道风控拦截（unusual activity）")
+			rc.sawNonRateCooldown = true
 		}
 		log.Printf("[relay] account %s free channel failed (paid fallback deferred)", a.Email)
 		return outcomeNextAccount
@@ -371,6 +426,7 @@ func (z *ZCodeAPI) tryAccount(w http.ResponseWriter, r *http.Request, a *Account
 			return outcomeNextAccount
 		case outcomeRiskBlocked:
 			z.pool.MarkPaidRiskCooling(a, "付费通道风控拦截（unusual activity）")
+			rc.sawNonRateCooldown = true
 			note("API Key 通道也被风控拦截")
 		case outcomeCaptchaRejected:
 			note("API Key 回退被拒（captcha required）")
@@ -382,6 +438,7 @@ func (z *ZCodeAPI) tryAccount(w http.ResponseWriter, r *http.Request, a *Account
 	// 所有路径失败：若是风控拦截则按阶梯冷却（R4：120s → 30min → 24h）
 	if riskBlocked {
 		z.pool.MarkRiskCooling(a, "上游风控拦截（unusual activity），全通道失败")
+		rc.sawNonRateCooldown = true
 	}
 	log.Printf("[relay] account %s all paths failed", a.Email)
 	return outcomeNextAccount
@@ -425,6 +482,7 @@ func (z *ZCodeAPI) tryPaidChannel(w http.ResponseWriter, r *http.Request, a *Acc
 		return outcomeNextAccount
 	case outcomeRiskBlocked:
 		z.pool.MarkPaidRiskCooling(a, "付费通道风控拦截（unusual activity）")
+		rc.sawNonRateCooldown = true
 		note("付费通道风控拦截（unusual activity）")
 		return outcomeNextAccount
 	}
@@ -494,21 +552,33 @@ func (z *ZCodeAPI) forwardOnce(w http.ResponseWriter, r *http.Request, a *Accoun
 			req.Header.Set(k, v)
 		}
 
-		client := ClientForURL(z.egress.ProxyURLForAccount(a), urlStr, 0) // 流式无总超时，靠 context
+		// 流式无总超时，靠 context；非流式走慢速 TTFB transport：GLM 思考型
+		// 非流式调用（客户端验证/compaction 回退）首字节可达分钟级，复用流式
+		// 的 60s ResponseHeaderTimeout 会在思考中途杀请求 → 客户端整单重试烧账号
+		proxyURL := z.egress.ProxyURLForAccount(a)
+		var client *http.Client
+		if upstreamStream {
+			client = ClientForURL(proxyURL, urlStr, 0)
+		} else {
+			client = ClientForURLSlowTTFB(proxyURL, urlStr)
+		}
 		resp, err := client.Do(req)
 		if err != nil {
 			// 客户端断连/取消：不动账号状态，直接终止（不写响应，对端已走）
 			if r.Context().Err() != nil || errors.Is(err, context.Canceled) {
 				return outcomeUpstreamError
 			}
-			z.markChannelFailure(a, channel, "连接失败: "+truncate(err.Error(), 180), 60)
+		// 完整错误（含出口代理地址）只进服务端日志；客户端可见明细经
+		// connFailReason 脱敏——失败原因会拼进 503/529 body 发给命名 Key 持有方
+		log.Printf("[relay] account %s connect failed via %s: %v", a.DisplayNameOrEmail(), redactProxyURL(proxyURL), err)
+			z.markChannelFailure(rc, a, channel, connFailReason(proxyURL, err), 60)
 			return outcomeNextAccount
 		}
 
 		// 3xx：WAF 挑战/登录页重定向（客户端已禁重定向），视为上游异常
 		if resp.StatusCode >= 300 && resp.StatusCode < 400 {
 			resp.Body.Close()
-			z.markChannelFailure(a, channel, fmt.Sprintf("上游重定向 HTTP %d（疑似 WAF 挑战）", resp.StatusCode), 120)
+			z.markChannelFailure(rc, a, channel, fmt.Sprintf("上游重定向 HTTP %d（疑似 WAF 挑战）", resp.StatusCode), 120)
 			return outcomeNextAccount
 		}
 
@@ -521,7 +591,7 @@ func (z *ZCodeAPI) forwardOnce(w http.ResponseWriter, r *http.Request, a *Accoun
 			// 既不能走下方 401/403 分支误杀账号，也不能当验证码被拒触发重解；
 			// 只冷却本账号该通道（同出口其他账号/路径先顶上）
 			if isCloudflareChallenge(resp.Header, text) {
-				z.markChannelFailure(a, channel, fmt.Sprintf("Cloudflare/WAF 挑战 HTTP %d", resp.StatusCode), 300)
+				z.markChannelFailure(rc, a, channel, fmt.Sprintf("Cloudflare/WAF 挑战 HTTP %d", resp.StatusCode), 300)
 				return outcomeNextAccount
 			}
 
@@ -530,7 +600,7 @@ func (z *ZCodeAPI) forwardOnce(w http.ResponseWriter, r *http.Request, a *Accoun
 			// + HTML 与凭证无关，与上方 CF 分支同待遇：只冷通道，绝不判死账号，
 			// 也不当验证码被拒
 			if strings.Contains(resp.Header.Get("Content-Type"), "text/html") {
-				z.markChannelFailure(a, channel, fmt.Sprintf("上游返回 HTML 拦截/错误页 HTTP %d", resp.StatusCode), 300)
+				z.markChannelFailure(rc, a, channel, fmt.Sprintf("上游返回 HTML 拦截/错误页 HTTP %d", resp.StatusCode), 300)
 				return outcomeNextAccount
 			}
 
@@ -564,6 +634,7 @@ func (z *ZCodeAPI) forwardOnce(w http.ResponseWriter, r *http.Request, a *Accoun
 					// API Key 自身鉴权失败：与免费侧凭证互不相干，只冷付费通道
 					//（1h：坏 Key 不会自愈，但留窗口给用户换 Key）
 					z.pool.MarkPaidCooling(a, fmt.Sprintf("付费通道鉴权失败 HTTP %d（API Key 无效或被禁）", resp.StatusCode), 3600)
+					rc.sawNonRateCooldown = true
 					return outcomeNextAccount
 				}
 				// 先尝试 refresh_token 兑换；成功或已有并发刷新在跑则不判死，
@@ -575,10 +646,13 @@ func (z *ZCodeAPI) forwardOnce(w http.ResponseWriter, r *http.Request, a *Accoun
 					return outcomeNextAccount
 				}
 				z.pool.MarkInvalid(a, fmt.Sprintf("鉴权失败 HTTP %d", resp.StatusCode))
+				rc.sawNonRateCooldown = true
 				return outcomeNextAccount
 			case resp.StatusCode == 429 || isRateLimitBody(resp.StatusCode, text):
 				// 限流（HTTP 429 或业务码 1302/1303 并发超限）：请求内退避重试一次
-				//（尊重 Retry-After），仍失败则按历史冷却时长升级 30s → 120s → 300s
+				//（尊重 Retry-After），仍失败则按历史冷却时长升级 30s → 120s → 300s。
+				// 记录过载信号：全账号耗尽时终态按 529 overloaded_error 回报
+				rc.sawRateLimit = true
 				retryAfter := 2
 				if ra := resp.Header.Get("Retry-After"); ra != "" {
 					if n, err := strconv.Atoi(ra); err == nil && n > 0 && n <= 5 {
@@ -609,9 +683,11 @@ func (z *ZCodeAPI) forwardOnce(w http.ResponseWriter, r *http.Request, a *Accoun
 				if channel == ChannelPaid {
 					// 付费通道余额/额度不足：长冷却留充值自愈窗口，免费侧不受牵连
 					z.pool.MarkPaidExhausted(a, "付费通道余额/额度不足")
+					rc.sawNonRateCooldown = true
 					return outcomeNextAccount
 				}
 				z.pool.MarkExhausted(a, "额度已用完")
+				rc.sawNonRateCooldown = true
 				// 后台任务在库内新副本上跑：relay 的账号快照被本请求的 503 提示
 				// 扫描无锁读取，共享实例就地写（setQuota/setRuntime）会与之竞态。
 				// 走节流+单飞版本：并发请求同时撞上同一耗尽账号时只拉一次 billing
@@ -667,14 +743,26 @@ func (z *ZCodeAPI) forwardOnce(w http.ResponseWriter, r *http.Request, a *Accoun
 		if !isStream && !strings.Contains(contentType, "json") {
 			body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 			resp.Body.Close()
-			z.markChannelFailure(a, channel, fmt.Sprintf("上游返回非 JSON 内容（%s）", truncate(contentType, 60)), 120)
+			z.markChannelFailure(rc, a, channel, fmt.Sprintf("上游返回非 JSON 内容（%s）", truncate(contentType, 60)), 120)
 			writeUpstreamErrorForProto(w, resp, string(body), rc.proto)
 			return outcomeUpstreamError
 		}
 
 		if !isStream {
-			body, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<20))
+			// 非流式响应体总读取时限（红队 F3）：客户端对非流式无超时，慢滴上游
+			// 原本可以无限占住账号并发槽。流式不受此限（客户端 600s 空闲超时兜底）
+			resp.Body = newTotalDeadlineBody(resp.Body, nonStreamBodyReadDeadline)
+			body, readErr := io.ReadAll(io.LimitReader(resp.Body, 64<<20))
 			resp.Body.Close()
+			if readErr != nil {
+				// 读取中断/超时：截断的 body 不得洗成成功响应（原代码忽略
+				// readErr，半截 JSON 会原样下传给客户端）
+				log.Printf("[relay] account %s non-stream body read failed: %v", a.DisplayNameOrEmail(), readErr)
+				z.markChannelFailure(rc, a, channel, "上游响应读取中断或超时", 60)
+				z.recordUsage(a, r, payload, http.StatusBadGateway, start, 0, nil, rc.clientStream)
+				writeAPIError(w, http.StatusBadGateway, "upstream response read interrupted or timed out")
+				return outcomeUpstreamError
+			}
 			// 撞到 64MB 上限（LimitReader EOF 与真实 EOF 无法区分）按失败处理：
 			// 静默截断会把截在半截的 input_json_delta 洗成"成功的空参 tool_use"
 			if len(body) == 64<<20 {
@@ -695,6 +783,13 @@ func (z *ZCodeAPI) forwardOnce(w http.ResponseWriter, r *http.Request, a *Accoun
 				return outcomeUpstreamError
 			}
 			usage := parseAnthropicUsageJSON(body)
+			// 客户端遥测按 x-request-id → request-id 顺序读取（runner-telemetry）：
+			// 与流式透传、错误路径同规转发
+			for _, k := range []string{"x-request-id", "request-id"} {
+				if v := resp.Header.Get(k); v != "" {
+					w.Header().Set(k, v)
+				}
+			}
 			z.recordUsage(a, r, payload, resp.StatusCode, start, 0, usage, rc.clientStream)
 			writeProtocolResponse(w, rc, resp.StatusCode, contentType, body, usage)
 			return outcomeWritten
@@ -706,9 +801,61 @@ func (z *ZCodeAPI) forwardOnce(w http.ResponseWriter, r *http.Request, a *Accoun
 	return outcomeCaptchaRejected // 验证码重试次数用尽
 }
 
+// connFailReason 连接失败的客户端可见原因：经出口代理时只说明代理不可达，
+// 不泄露代理地址/端口（失败明细会拼进 503/529 body 发给命名 Key 持有方，
+// 可能是第三方）；直连错误的 host 本就是公开的上游地址，可保留。
+// 完整错误由调用方写服务端日志。
+func connFailReason(proxyURL string, err error) string {
+	if proxyURL != "" {
+		return "连接失败（出口代理不可达）"
+	}
+	return "连接失败: " + truncate(err.Error(), 120)
+}
+
+// redactProxyURL 代理 URL 进日志前抹掉内嵌凭据（ProxyURLForNode 会拼
+// user:pass@ 形态；round-8 自查：connect-failure 日志此前泄露代理密码）
+func redactProxyURL(raw string) string {
+	if raw == "" {
+		return "direct"
+	}
+	if i := strings.Index(raw, "://"); i >= 0 {
+		if at := strings.Index(raw[i+3:], "@"); at >= 0 {
+			return raw[:i+3] + raw[i+4+at:]
+		}
+	}
+	return raw
+}
+
+// nonStreamBodyReadDeadline 非流式响应体总读取时限。var 便于测试缩短。
+var nonStreamBodyReadDeadline = 15 * time.Minute
+
+// totalDeadlineBody 非流式响应体总时限包装：deadline 到点关闭底层连接，
+// 阻塞中的 Read 随即报错返回
+type totalDeadlineBody struct {
+	io.ReadCloser
+	stop func()
+}
+
+func newTotalDeadlineBody(rc io.ReadCloser, d time.Duration) io.ReadCloser {
+	if d <= 0 {
+		return rc
+	}
+	timer := time.AfterFunc(d, func() { rc.Close() })
+	return totalDeadlineBody{ReadCloser: rc, stop: func() { timer.Stop() }}
+}
+
+func (b totalDeadlineBody) Close() error {
+	b.stop()
+	return b.ReadCloser.Close()
+}
+
 // markChannelFailure 受限冷却按通道落位：免费侧走账号 status/cooling_until，
-// 付费侧走 paid_cooling_until，两侧互不牵连
-func (z *ZCodeAPI) markChannelFailure(a *Account, channel, reason string, seconds int) {
+// 付费侧走 paid_cooling_until，两侧互不牵连。调用点均为非限流类故障
+// （连接失败/3xx/非 JSON），计入混合故障信号
+func (z *ZCodeAPI) markChannelFailure(rc *relayCtx, a *Account, channel, reason string, seconds int) {
+	if rc != nil {
+		rc.sawNonRateCooldown = true
+	}
 	if channel == ChannelPaid {
 		z.pool.MarkPaidCooling(a, reason, seconds)
 		return
@@ -1029,7 +1176,21 @@ func fixThinking(body map[string]interface{}) {
 		if t, _ := thinking["type"].(string); t == "disabled" {
 			body["thinking"] = map[string]interface{}{"type": "disabled"}
 			delete(body, "reasoning_effort")
-			delete(body, "output_config")
+			// 与 adaptive 分支同规：仅剔除 effort 本身，保留 format/task_budget
+			//（结构化输出与思考开关正交，整体 delete 会静默丢 schema，轮 10 F8）
+			if oc, ok := body["output_config"].(map[string]interface{}); ok {
+				rest := map[string]interface{}{}
+				for k, v := range oc {
+					if k != "effort" {
+						rest[k] = v
+					}
+				}
+				if len(rest) > 0 {
+					body["output_config"] = rest
+				} else {
+					delete(body, "output_config")
+				}
+			}
 			return
 		}
 		if effort == "" {
@@ -1041,8 +1202,18 @@ func fixThinking(body map[string]interface{}) {
 	if effort == "" {
 		effort = "high"
 	}
+	oc := map[string]interface{}{"effort": effort}
+	// 保留 output_config 的其余键：ZCode 3.14 SDK 还会挂 format.json_schema
+	//（结构化输出）/ task_budget；整体替换会静默丢功能（评审轮 3）
+	if prev, ok := body["output_config"].(map[string]interface{}); ok {
+		for k, v := range prev {
+			if k != "effort" {
+				oc[k] = v
+			}
+		}
+	}
 	body["thinking"] = map[string]interface{}{"type": "adaptive"}
-	body["output_config"] = map[string]interface{}{"effort": effort}
+	body["output_config"] = oc
 	delete(body, "reasoning_effort")
 }
 
@@ -1068,7 +1239,8 @@ func effortFromBudget(budget int) string {
 	}
 }
 
-func validateMessagesBody(body map[string]interface{}) error {
+func validateMessagesBody(ctx context.Context, body map[string]interface{}) error {
+	inline := newImageInlineBudget() // 单请求 URL 图片内联额度 + 去重（每次调用即一个请求）
 	model, ok := body["model"].(string)
 	if !ok || strings.TrimSpace(model) == "" {
 		return fmt.Errorf("model must be a non-empty string")
@@ -1139,8 +1311,12 @@ func validateMessagesBody(body map[string]interface{}) error {
 			return fmt.Errorf("messages[%d] must be an object", i)
 		}
 		role, _ := mm["role"].(string)
-		if role != "user" && role != "assistant" {
-			return fmt.Errorf("messages[%d].role must be user or assistant", i)
+		// system 放行：zai-org/ZCode 允许 mid-conversation system 消息（硬编码
+		// allowSystemInMessages + anthropic-beta: mid-conversation-system-*），
+		// 一律 400 会把合法客户端流量打成不可重试的 InvalidModelRequest。
+		// 原样透传，由上游判定；仍拒绝其它未知 role
+		if role != "user" && role != "assistant" && role != "system" {
+			return fmt.Errorf("messages[%d].role must be user, assistant or system", i)
 		}
 		switch c := mm["content"].(type) {
 		case string:
@@ -1178,6 +1354,12 @@ func validateMessagesBody(body map[string]interface{}) error {
 				// 账号无谓计一次失败（空 text 例外同上：仅末条 assistant 放行）
 				switch btype {
 				case "text":
+					// 长度与 string content 同规（normalizeBody 已把 string 桥接成
+					// text 块，2M 上限不能只挡桥接前的形态）；超长块本地拒绝，
+					// 免得 marshal+转发后才被上游 400 并白计一次账号失败
+					if txt, _ := bm["text"].(string); len(txt) > 2_000_000 {
+						return fmt.Errorf("messages[%d].content[%d]: text block is too long", i, j)
+					}
 					if t, _ := bm["text"].(string); t == "" {
 						if !(i == len(msgs)-1 && role == "assistant") {
 							return fmt.Errorf("messages[%d].content[%d]: text block must contain non-empty text", i, j)
@@ -1201,13 +1383,39 @@ func validateMessagesBody(body map[string]interface{}) error {
 						return fmt.Errorf("messages[%d].content[%d]: tool_result references unknown tool_use_id %q (dropped assistant turn?)", i, j, tid)
 					}
 				case "image":
-					// 上游只接受 base64 source：url 形态与缺失/null/非对象 source
-					// 一律本地拒绝（此前 url 形态放行 → 上游 400，健康账号白计一次
-					// MarkFailed）。与 handlers_openai.go 的 image_url fail-closed 同规
+					// 上游只接受 base64 source。url 形态改为受控抓取后内联
+					// （image_fetch.go：SSRF 防护 + 限长限时 + content-type 白名单），
+					// 抓取失败 fail-closed 回 400，与缺失/null/非对象 source 同规——
+					// 放行任何不完整形状只会换来上游 400 + 健康账号白计一次 MarkFailed
 					src, _ := bm["source"].(map[string]interface{})
 					st, _ := src["type"].(string)
 					data, _ := src["data"].(string)
-					if st == "url" || src == nil || data == "" {
+					if st == "url" {
+					u, _ := src["url"].(string)
+					// 额度按出现处计（去重只省网络抓取——红队 F4：同一 URL
+					// 重复 N 次不得绕过上限在 marshal 时放大数 GB）
+					if inline.count >= maxInlineImagesPerRequest {
+						return fmt.Errorf("messages[%d].content[%d]: too many url images in one request (limit %d)", i, j, maxInlineImagesPerRequest)
+					}
+					inl, cached := inline.cache[u]
+					if !cached {
+						var ferr error
+						if inl, ferr = fetchImageAsBase64(ctx, u); ferr != nil {
+							return fmt.Errorf("messages[%d].content[%d]: image url fetch failed: %v", i, j, ferr)
+						}
+					}
+					inline.count++
+					inline.bytes += len(inl.data)
+					if inline.bytes > maxInlineBase64BytesPerRequest {
+						return fmt.Errorf("messages[%d].content[%d]: inlined image payload exceeds %dMB per request", i, j, maxInlineBase64BytesPerRequest>>20)
+					}
+					if !cached {
+						inline.cache[u] = inl
+					}
+					bm["source"] = map[string]interface{}{"type": "base64", "media_type": inl.mediaType, "data": inl.data}
+					continue
+				}
+					if src == nil || data == "" {
 						return fmt.Errorf("messages[%d].content[%d]: image block must contain base64 data (url sources are not accepted by the upstream)", i, j)
 					}
 				}
@@ -1289,10 +1497,20 @@ func writeUpstreamErrorForProto(w http.ResponseWriter, resp *http.Response, text
 	w.WriteHeader(status)
 	var v map[string]interface{}
 	if json.Unmarshal([]byte(text), &v) == nil {
+		// 上游错误体未必带顶层 type:"error"（bigmodel {"error":{...}} 等）：
+		// 客户端 schema 要求该键，缺失时补上再回传，保留上游其余字段原样
+		if s, ok := v["type"].(string); !ok || s != "error" {
+			v["type"] = "error"
+			if b, merr := json.Marshal(v); merr == nil {
+				w.Write(b)
+				return
+			}
+		}
 		w.Write([]byte(text))
 		return
 	}
 	json.NewEncoder(w).Encode(map[string]interface{}{
+		"type":  "error",
 		"error": map[string]string{"message": truncate(text, 500), "type": "upstream_error"},
 	})
 }

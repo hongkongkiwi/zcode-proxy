@@ -333,22 +333,51 @@ func cachedTransport(key string, build func() *http.Transport) *http.Transport {
 	return actual.(*http.Transport)
 }
 
+// 上游 transport 首字节上限分两档：
+//   - 流式 60s：SSE 只受 time-to-first-header 约束，黑洞路由不能无限占住账号并发闸门
+//   - 非流式 10min：TTFB ≈ 上游完整思考+生成时长（GLM 思考型非流式调用：zcode 客户端的
+//     验证/compaction 回退/提交信息生成会等数分钟）；复用流式档会在思考中途杀请求，
+//     客户端把 5xx 整单重试并白白烧账号
+const (
+	upstreamHeaderTimeout = 60 * time.Second
+	slowTTFBHeaderTimeout = 10 * time.Minute
+)
+
+// NewUpstreamHTTPClient 标准库 TLS 客户端（含 HTTP/2），用于 api.z.ai / open.bigmodel.cn
+// 等非 ESA WAF 保护的端点（实测 api.z.ai 协商 h2）。
 func NewUpstreamHTTPClient(proxyURL string, timeout time.Duration) *http.Client {
 	t := cachedTransport("std|"+proxyURL, func() *http.Transport {
-		transport := &http.Transport{
-			// 拨号/响应头都有界：流式客户端 Timeout=0 时没有它们，黑洞路由
-			// 会占住账号并发闸门直到下游断开（SSE 只受 time-to-first-header 约束，不受影响）
-			DialContext:           (&net.Dialer{Timeout: 30 * time.Second}).DialContext,
-			ResponseHeaderTimeout: 60 * time.Second,
-			TLSClientConfig:       &tls.Config{MinVersion: tls.VersionTLS12},
-			ForceAttemptHTTP2:     true,
-			MaxIdleConns:          32,
-			MaxIdleConnsPerHost:   16, // Go 默认 2：并发下多余连接被关闭，每请求重握手直拉高 TTFB
-			IdleConnTimeout:       90 * time.Second,
-		}
-		applyProxy(transport, proxyURL)
-		return transport
+		return buildStdTransport(proxyURL, upstreamHeaderTimeout)
 	})
+	return clientWithTransport(t, timeout)
+}
+
+// NewUpstreamHTTPClientSlowTTFB 非流式转发专用：首字节上限放宽到 slowTTFBHeaderTimeout，
+// client 级 Timeout 恒为 0（响应体读取不受限，与流式同规靠 context）
+func NewUpstreamHTTPClientSlowTTFB(proxyURL string) *http.Client {
+	t := cachedTransport("std-slow|"+proxyURL, func() *http.Transport {
+		return buildStdTransport(proxyURL, slowTTFBHeaderTimeout)
+	})
+	return clientWithTransport(t, 0)
+}
+
+func buildStdTransport(proxyURL string, headerTimeout time.Duration) *http.Transport {
+	transport := &http.Transport{
+		// 拨号/响应头都有界：流式客户端 Timeout=0 时没有它们，黑洞路由
+		// 会占住账号并发闸门直到下游断开（SSE 只受 time-to-first-header 约束，不受影响）
+		DialContext:           (&net.Dialer{Timeout: 30 * time.Second}).DialContext,
+		ResponseHeaderTimeout: headerTimeout,
+		TLSClientConfig:       &tls.Config{MinVersion: tls.VersionTLS12},
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          32,
+		MaxIdleConnsPerHost:   16, // Go 默认 2：并发下多余连接被关闭，每请求重握手直拉高 TTFB
+		IdleConnTimeout:       90 * time.Second,
+	}
+	applyProxy(transport, proxyURL)
+	return transport
+}
+
+func clientWithTransport(t http.RoundTripper, timeout time.Duration) *http.Client {
 	return &http.Client{
 		Transport: t,
 		Timeout:   timeout,
@@ -364,47 +393,62 @@ func NewUpstreamHTTPClient(proxyURL string, timeout time.Duration) *http.Client 
 func NewFingerprintHTTPClient(proxyURL string, timeout time.Duration) *http.Client {
 	fp := fingerprintHook()
 	t := cachedTransport("fp|"+fp.Mode+"|"+fp.JA3+"|"+proxyURL, func() *http.Transport {
-		dialer := &net.Dialer{Timeout: 30 * time.Second}
-		dialTLS := func(ctx context.Context, network, addr string) (net.Conn, error) {
-			host := addr
-			if h, _, err := net.SplitHostPort(addr); err == nil {
-				host = h
-			}
-			raw, err := dialRaw(ctx, dialer, proxyURL, network, addr)
-			if err != nil {
-				return nil, err
-			}
-			return utlsHandshake(ctx, raw, host, fp)
-		}
-		return &http.Transport{
-			DialContext:    dialer.DialContext,
-			DialTLSContext: dialTLS,
-			// 黑洞路由（代理/TCP 通了但对端永不回包）在 Timeout=0 的流式请求上
-			// 只受此约束——缺失时一次挂起就占死账号并发闸门直到下游断开
-			ResponseHeaderTimeout: 60 * time.Second,
-			TLSNextProto:          map[string]func(string, *tls.Conn) http.RoundTripper{}, // 禁 h2
-			MaxIdleConns:          32,
-			MaxIdleConnsPerHost:   16, // utls 握手成本高，保活连接直接决定 TTFB 稳定性
-			IdleConnTimeout:       90 * time.Second,
-		}
+		return buildFingerprintTransport(proxyURL, fp, upstreamHeaderTimeout)
 	})
-	return &http.Client{
-		Transport: t,
-		Timeout:   timeout,
-		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			return http.ErrUseLastResponse
-		},
+	return clientWithTransport(t, timeout)
+}
+
+// NewFingerprintHTTPClientSlowTTFB 非流式转发专用（同 NewUpstreamHTTPClientSlowTTFB）
+func NewFingerprintHTTPClientSlowTTFB(proxyURL string) *http.Client {
+	fp := fingerprintHook()
+	t := cachedTransport("fp-slow|"+fp.Mode+"|"+fp.JA3+"|"+proxyURL, func() *http.Transport {
+		return buildFingerprintTransport(proxyURL, fp, slowTTFBHeaderTimeout)
+	})
+	return clientWithTransport(t, 0)
+}
+
+func buildFingerprintTransport(proxyURL string, fp TLSFingerprint, headerTimeout time.Duration) *http.Transport {
+	dialer := &net.Dialer{Timeout: 30 * time.Second}
+	dialTLS := func(ctx context.Context, network, addr string) (net.Conn, error) {
+		host := addr
+		if h, _, err := net.SplitHostPort(addr); err == nil {
+			host = h
+		}
+		raw, err := dialRaw(ctx, dialer, proxyURL, network, addr)
+		if err != nil {
+			return nil, err
+		}
+		return utlsHandshake(ctx, raw, host, fp)
+	}
+	return &http.Transport{
+		DialContext:    dialer.DialContext,
+		DialTLSContext: dialTLS,
+		// 黑洞路由（代理/TCP 通了但对端永不回包）在 Timeout=0 的流式请求上
+		// 只受此约束——缺失时一次挂起就占死账号并发闸门直到下游断开
+		ResponseHeaderTimeout: headerTimeout,
+		TLSNextProto:          map[string]func(string, *tls.Conn) http.RoundTripper{}, // 禁 h2
+		MaxIdleConns:          32,
+		MaxIdleConnsPerHost:   16, // utls 握手成本高，保活连接直接决定 TTFB 稳定性
+		IdleConnTimeout:       90 * time.Second,
 	}
 }
 
 // ClientForURL 按主机选择客户端：zcode.z.ai（ESA WAF）→ utls 指纹；其余 → 标准库 h2。
-// transport 按 (代理, 类型, 指纹) 共享连接池；client（含 Timeout）按需构造。
+// transport 按 (代理, 类型, 指纹, TTFB 档) 共享连接池；client（含 Timeout）按需构造。
 // 指纹/代理设置变更时 CloseIdleClients() 整体失效。
 func ClientForURL(proxyURL, urlStr string, timeout time.Duration) *http.Client {
 	if strings.Contains(urlStr, "zcode.z.ai") {
 		return NewFingerprintHTTPClient(proxyURL, timeout)
 	}
 	return NewUpstreamHTTPClient(proxyURL, timeout)
+}
+
+// ClientForURLSlowTTFB 非流式转发专用（relay）：首字节可等待至 slowTTFBHeaderTimeout
+func ClientForURLSlowTTFB(proxyURL, urlStr string) *http.Client {
+	if strings.Contains(urlStr, "zcode.z.ai") {
+		return NewFingerprintHTTPClientSlowTTFB(proxyURL)
+	}
+	return NewUpstreamHTTPClientSlowTTFB(proxyURL)
 }
 
 // CloseIdleClients 关闭并清空缓存的全部上游 transport（指纹/代理设置变更后调用）
