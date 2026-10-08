@@ -52,3 +52,35 @@ func TestAutoResetWait(t *testing.T) {
 		t.Errorf("past reset: wait=%d ok=%v, want 0/true", wait, ok)
 	}
 }
+
+// R: 临期槽位 use-it-lose-it——槽位进入消耗窗口才触发；已过期/无到期时间/窗口外
+// 一律不触发（花已过期槽位必然失败，无到期时间视为无限期按原阈值策略走）
+func TestAutoResetSlotExpiringSoon(t *testing.T) {
+	const now = int64(1_000_000)
+	const hour = int64(3600)
+	slots := []ResetSlot{{ExpireAt: now + 45*60}, {ExpireAt: now + 20*60}}
+
+	at, ok := autoResetSlotExpiringSoon(now, 60*60, slots)
+	if !ok || at != now+20*60 {
+		t.Errorf("within window: got (%d,%v), want earliest expiring (%d,true)", at, ok, now+20*60)
+	}
+	if _, ok := autoResetSlotExpiringSoon(now, 10*60, slots); ok {
+		t.Error("slot beyond window must not trigger")
+	}
+	if _, ok := autoResetSlotExpiringSoon(now, 0, slots); ok {
+		t.Error("zero window (disabled) must not trigger")
+	}
+	if _, ok := autoResetSlotExpiringSoon(now, 60*60, nil); ok {
+		t.Error("empty slots must not trigger")
+	}
+	if _, ok := autoResetSlotExpiringSoon(now, 60*60, []ResetSlot{{ExpireAt: now - 60}}); ok {
+		t.Error("already-expired slot must not trigger")
+	}
+	if _, ok := autoResetSlotExpiringSoon(now, 60*60, []ResetSlot{{ExpireAt: 0}}); ok {
+		t.Error("unknown expiry (0) must not trigger")
+	}
+	// 恰好压窗口边界（expire_at == now+window）属于窗口内
+	if _, ok := autoResetSlotExpiringSoon(now, 60*60, []ResetSlot{{ExpireAt: now + 60*60}}); !ok {
+		t.Error("slot exactly at window edge must trigger")
+	}
+}

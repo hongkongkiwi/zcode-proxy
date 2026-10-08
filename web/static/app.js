@@ -1140,6 +1140,8 @@ async function loadSettings() {
     document.getElementById('setAutoReset').checked = s.auto_reset_enabled === '1';
     document.getElementById('setAutoResetMinWait5h').value = s.auto_reset_min_wait_minutes || '60';
     document.getElementById('setAutoResetMinWaitWeek').value = s.auto_reset_min_wait_week_hours || '24';
+    document.getElementById('setAutoResetExpiry').checked = !(s.auto_reset_expiry_enabled === '0' || s.auto_reset_expiry_enabled === 'false');
+    document.getElementById('setAutoResetExpirySpend').value = s.auto_reset_expiry_spend_minutes ?? '60';
     document.getElementById('setMaxConcurrent').value = s.max_concurrent_per_account || '3';
     document.getElementById('setPaidFallback').value = s.paid_fallback_mode || 'free_first';
     document.getElementById('setPaidCap').value = s.paid_daily_token_cap || '0';
@@ -1199,6 +1201,8 @@ async function saveStrategySettings() {
       auto_reset_enabled: document.getElementById('setAutoReset').checked ? '1' : '0',
       auto_reset_min_wait_minutes: document.getElementById('setAutoResetMinWait5h').value || '60',
       auto_reset_min_wait_week_hours: document.getElementById('setAutoResetMinWaitWeek').value || '24',
+      auto_reset_expiry_enabled: document.getElementById('setAutoResetExpiry').checked ? '1' : '0',
+      auto_reset_expiry_spend_minutes: document.getElementById('setAutoResetExpirySpend').value || '60',
       max_concurrent_per_account: document.getElementById('setMaxConcurrent').value || '3',
       paid_fallback_mode: document.getElementById('setPaidFallback').value || 'free_first',
       paid_daily_token_cap: document.getElementById('setPaidCap').value || '0',

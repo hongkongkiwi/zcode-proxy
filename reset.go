@@ -378,5 +378,8 @@ func (z *ZCodeAPI) SyncResetHistoryFromUpstream(a *Account) (int, error) {
 			z.db.SetSetting(anchorKey, string(raw))
 		}
 	}
+	// 临期槽位 use-it-or-lose-it：同一把 claim 锁内评估非耗尽账号的
+	// 到期重置机会（MaybeAutoReset 只有 402 触发点，盖不住它们）
+	z.spendExpiringResetForSync(a, st)
 	return inserted, nil
 }

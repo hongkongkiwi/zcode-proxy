@@ -287,9 +287,11 @@
 <div class="form-group" style="margin-bottom:16px">
 <label class="form-label" data-i18n="自动重置（耗尽时按阈值消耗重置机会）">自动重置（耗尽时按阈值消耗重置机会）</label>
 <div><label style="display:inline-flex;align-items:center;gap:6px;font-size:13px"><input type="checkbox" id="setAutoReset" style="width:auto"><span data-i18n="开启后：配额耗尽且自然重置等待超过阈值时自动消耗重置机会；默认关闭，重置仍可随时手动触发">开启后：配额耗尽且自然重置等待超过阈值时自动消耗重置机会；默认关闭，重置仍可随时手动触发</span></label></div>
+<div style="margin-top:6px"><label style="display:inline-flex;align-items:center;gap:6px;font-size:13px"><input type="checkbox" id="setAutoResetExpiry" style="width:auto"><span data-i18n="临期自动消耗（默认开启）：重置机会距到期不足消耗窗口时自动花掉，避免槽位作废；独立于上面的自动重置开关">临期自动消耗（默认开启）：重置机会距到期不足消耗窗口时自动花掉，避免槽位作废；独立于上面的自动重置开关</span></label></div>
 <div style="display:flex;gap:16px;margin-top:8px;flex-wrap:wrap">
 <div style="flex:1;min-width:180px"><label class="form-label" style="font-size:12px" data-i18n="5小时窗口阈值（分钟）：自然重置等待小于该值不消耗重置">5小时窗口阈值（分钟）：自然重置等待小于该值不消耗重置</label><input type="number" id="setAutoResetMinWait5h" class="form-input" min="0" max="300" placeholder="60"></div>
 <div style="flex:1;min-width:180px"><label class="form-label" style="font-size:12px" data-i18n="周窗口阈值（小时）：自然重置等待小于该值不消耗重置">周窗口阈值（小时）：自然重置等待小于该值不消耗重置</label><input type="number" id="setAutoResetMinWaitWeek" class="form-input" min="0" max="168" placeholder="24"></div>
+<div style="flex:1;min-width:180px"><label class="form-label" style="font-size:12px" data-i18n="临期消耗窗口（分钟）：重置机会距到期不足该窗口时自动消耗，避免槽位作废；0=关闭">临期消耗窗口（分钟）：重置机会距到期不足该窗口时自动消耗，避免槽位作废；0=关闭</label><input type="number" id="setAutoResetExpirySpend" class="form-input" min="0" max="1440" placeholder="60"></div>
 </div>
 </div>
 <div class="form-group" style="margin-bottom:16px">
