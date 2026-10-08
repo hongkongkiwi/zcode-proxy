@@ -48,8 +48,7 @@ var DefaultUpstream = UpstreamURLs{
 
 // DefaultModels 默认模型清单（上游大小写敏感，这里存官方名）
 var DefaultModels = []string{
-	"GLM-5.3", "GLM-5.2", "GLM-5-Turbo", "GLM-4.7", "GLM-4.6",
-	"GLM-4.5", "GLM-4.5-Air", "GLM-4.5V", "GLM-4.5-Flash",
+	"GLM-5.3", "GLM-5.3-Flash",
 }
 
 // LoadFileConfig 加载配置目录；文件不存在时用默认值并落盘一份

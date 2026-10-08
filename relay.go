@@ -33,6 +33,7 @@ const (
 // modelNameMap 上游模型名大小写敏感，客户端小写别名 → 官方名
 var modelNameMap = map[string]string{
 	"glm-5.3":       "GLM-5.3",
+	"glm-5.3-flash": "GLM-5.3-Flash",
 	"glm-5.2":       "GLM-5.2",
 	"glm-5-turbo":   "GLM-5-Turbo",
 	"glm-turbo":     "GLM-5-Turbo",
