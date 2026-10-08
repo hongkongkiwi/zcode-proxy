@@ -61,8 +61,11 @@ type Account struct {
 	// 付费通道（api.z.ai API Key，按量计费）与免费通道（JWT 套餐额度）状态分离：
 	// 免费侧耗尽/冷却记在 status/cooling_until，付费侧受限记在 paid_cooling_until，
 	// 互不牵连——免费耗尽的账号其付费通道仍可参与回退。
-	PaidFallback     bool  `json:"paid_fallback"`      // 允许付费通道参与回退（双通道账号才有意义）
-	PaidCoolingUntil int64 `json:"paid_cooling_until"` // 付费通道冷却截止 epoch 秒（含余额不足长冷却）
+	PaidFallback     bool   `json:"paid_fallback"`      // 允许付费通道参与回退（双通道账号才有意义）
+	PaidCoolingUntil int64  `json:"paid_cooling_until"` // 付费通道冷却截止 epoch 秒（含余额不足长冷却）
+	PaidLastError    string `json:"paid_last_error"`    // 付费侧最近错误：与免费侧 last_error 分离，
+	// 否则付费 429（秒级事件）会覆盖免费侧长冷却的真实原因（风控 24h），
+	// 503 提示与面板就会拿付费理由解释免费冷却时长
 
 	// usageChannel 本次请求实际使用的通道（"free"/"paid"），转发路径在上游请求前
 	// 设置、recordUsage 读取；每个请求持有独立 Account 副本，写读同 goroutine。
@@ -237,6 +240,7 @@ func NewDBWithOptions(dbPath string, migrate bool) (*DB, error) {
 	for _, col := range []string{
 		`ALTER TABLE accounts ADD COLUMN paid_fallback INTEGER NOT NULL DEFAULT 1`,
 		`ALTER TABLE accounts ADD COLUMN paid_cooling_until INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE accounts ADD COLUMN paid_last_error TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE usage_records ADD COLUMN channel TEXT NOT NULL DEFAULT ''`,
 	} {
 		if err := db.addColumnMigrate(col); err != nil {

@@ -378,7 +378,8 @@ function renderAccounts() {
         <td><span class="badge ${a.auth_type === 'jwt' ? 'badge-info' : 'badge-purple'}">${a.auth_type === 'jwt' ? 'JWT' : 'API Key'}</span>
             ${a.has_api_key && a.auth_type === 'jwt' ? `<div style="font-size:10.5px;color:var(--c-text-lighter);margin-top:3px">${t('+APIKey回退')}${paidStateText(a)}</div>` : ''}</td>
         <td>${statusBadge(a.status)}${!a.enabled ? ` <span class="badge badge-secondary">${t('停用')}</span>` : ''}
-            ${a.last_error ? `<div style="font-size:10.5px;color:var(--c-danger);margin-top:3px;max-width:160px;overflow:hidden;text-overflow:ellipsis" title="${esc(a.last_error)}">${esc(a.last_error)}</div>` : ''}</td>
+            ${a.last_error ? `<div style="font-size:10.5px;color:var(--c-danger);margin-top:3px;max-width:160px;overflow:hidden;text-overflow:ellipsis" title="${esc(a.last_error)}">${esc(a.last_error)}</div>` : ''}
+            ${a.paid_last_error ? `<div style="font-size:10.5px;color:var(--c-warning,var(--c-text-lighter));margin-top:2px;max-width:160px;overflow:hidden;text-overflow:ellipsis" title="${esc(a.paid_last_error)}">[${t('付费')}] ${esc(a.paid_last_error)}</div>` : ''}</td>
         <td style="min-width:190px;cursor:pointer" title="${t('点击查看套餐与额度构成')}" onclick="showQuotaModal(${a.id})">${quotaCell(a)}</td>
         <td><span class="mono" title="${esc(a.device_mid)}">${a.device_mid ? esc(a.device_mid.slice(0, 8)) + '…' : '-'}</span></td>
         <td>${a.use_count} / ${a.fail_count}<div style="font-size:10.5px;color:var(--c-text-lighter)">${fmtAgo(a.last_used_at)}</div></td>

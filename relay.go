@@ -774,6 +774,13 @@ func (z *ZCodeAPI) forwardOnce(w http.ResponseWriter, r *http.Request, a *Accoun
 			}
 			// 2xx + JSON 但不是 message（上游内联错误信封，SSE 路径已证实存在）：
 			// 不得洗成"成功空响应"，按上游错误处理
+			if isEmptyMessageBody(body) {
+				// 2xx message 信封但零内容块（上游"成功空响应"：验证码待解/套餐
+				// 异常的已知形态）：此时还没写任何响应头，无损换下一条路径/账号
+				z.markChannelFailure(rc, a, channel, "上游 2xx 空内容响应", 60)
+				z.recordUsage(a, r, payload, http.StatusBadGateway, start, 0, nil, rc.clientStream)
+				return outcomeNextAccount
+			}
 			if isErrorEnvelope(body) {
 				z.pool.MarkFailed(a, "上游 2xx 内联错误信封")
 				z.recordUsage(a, r, payload, http.StatusBadGateway, start, 0, nil, rc.clientStream)
@@ -862,6 +869,24 @@ func (z *ZCodeAPI) markChannelFailure(rc *relayCtx, a *Account, channel, reason 
 		return
 	}
 	z.pool.MarkCooling(a, reason, seconds)
+}
+
+// isEmptyMessageBody 识别 2xx message 信封但零内容（content 缺失/空数组/空串）：
+// 上游验证码待解、token 过期、套餐异常时的"成功空响应"形态。调用方须先过
+// isErrorEnvelope（错误信封同样没有 content，不得误判成空消息）。
+func isEmptyMessageBody(body []byte) bool {
+	var v struct {
+		Type    string          `json:"type"`
+		Content json.RawMessage `json:"content"`
+	}
+	if err := json.Unmarshal(body, &v); err != nil {
+		return false
+	}
+	if v.Type != "" && v.Type != "message" {
+		return false
+	}
+	c := strings.TrimSpace(string(v.Content))
+	return c == "" || c == "[]" || c == `""`
 }
 
 // isErrorEnvelope 识别 2xx JSON body 里的内联错误信封：
