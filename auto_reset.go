@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"strconv"
@@ -22,15 +23,18 @@ import (
 // 防抖：同账号自动评估最小间隔 10 分钟，失败/跳过都不因每条 402 反复打状态接口。
 //
 // ---- 临期槽位 use-it-or-lose-it ----
-// 重置机会槽位自带 expire_at，到期未用即作废。上面的阈值保留策略在"槽位先于
-// 下次耗尽到期"时会把槽位一直保留到作废——保留到作废不如到期前花掉。临期消耗
-// 由独立开关 auto_reset_expiry_enabled 控制（默认开：到期作废的槽位花了不亏，
-// 不依赖上面默认关闭的耗尽阈值主开关），窗口为
+// 重置机会槽位自带 expire_at（上游毫秒已实证——ZCode 客户端 app.asar 与
+// Date.now() 直接比较；经 FetchResetStatus 归一为秒），到期未用即作废。
+// 上面的阈值保留策略在"槽位先于下次耗尽到期"时会把槽位一直保留到作废——保留到
+// 作废不如到期前花掉。临期消耗由独立开关 auto_reset_expiry_enabled 控制
+// （默认关：自动动用重置机会整体是 opt-in，与本文件顶部的阈值主开关同款默认关
+// 语义；开启后独立于主开关生效），窗口为
 // auto_reset_expiry_spend_minutes（默认 60，0=关闭）：无论账号是否耗尽、自然
 // 恢复多近，都消耗临期槽位——剩余额度在自然重置时不结转，临期消耗至少把
 // (100-剩余)% 的恢复价值拿到手。非耗尽账号没有 402 触发点，由 reset/status
-// 同步路径（每账号 ≤10 分钟一次）代为评估——窗口设在到期前一小时也给失败
-// 重试留出多次机会。
+// 同步路径（每账号 ≤10 分钟一次）代为评估；refreshAll 会跳过冷却中的账号，
+// 冷却账号的心跳由调度器 SweepExpiringResetsTick 补上——窗口设在到期前一小时
+// 也给失败重试留出多次机会。
 
 const autoResetAttemptInterval = 10 * time.Minute
 
@@ -41,11 +45,13 @@ const autoResetExpirySpendDefaultMin = 60
 // 防上游 status 短暂滞后（use 已受理但槽位仍显示可用）导致同槽位双花
 const autoResetExpirySpendGap = 30 * time.Minute
 
-// autoResetExpiryEnabled 临期槽位自动消耗开关：未配置 = 开（与 sticky_sessions
-// 同款默认开语义），显式 0/false 关
+// autoResetExpiryEnabled 临期槽位自动消耗开关：默认关（显式 "1" 才开）。
+// "自动动用重置机会"整体是 opt-in——耗尽阈值路径与临期路径都不该在用户
+// 未表态时动槽位。历史版本此处默认开（fail-open），2026-10-09 按用户意图
+// 收紧为默认关
 func autoResetExpiryEnabled(db *DB) bool {
 	v, _ := db.GetSetting("auto_reset_expiry_enabled")
-	return v != "0" && v != "false"
+	return v == "1"
 }
 
 var autoResetState = struct {
@@ -55,7 +61,10 @@ var autoResetState = struct {
 	// 上一次临期消耗的槽位到期时间：gap 内出现"不同到期时间"的临期槽时，
 	// 锁内重拉列表即上游亲证是另一槽，gap 让位（否则第二个临期槽必死在 gap 内）
 	lastExpirySpendSlot map[int64]int64
-}{lastAttempt: map[int64]time.Time{}, lastExpirySpend: map[int64]time.Time{}, lastExpirySpendSlot: map[int64]int64{}}
+	// 临期心跳路径（冷却账号）每账号上次评估时刻：调度器每分钟 tick，
+	// 上游 status 调用须按账号节流（与 resetHistorySyncInterval 同级）
+	lastSweep map[int64]time.Time
+}{lastAttempt: map[int64]time.Time{}, lastExpirySpend: map[int64]time.Time{}, lastExpirySpendSlot: map[int64]int64{}, lastSweep: map[int64]time.Time{}}
 
 // autoResetShouldSpend 阈值判定（纯函数，供测试）：等待未知 = 花；
 // 等待已知且 >= 阈值 = 花；否则等自然恢复
@@ -113,13 +122,18 @@ func autoResetWait(a *Account) (int64, bool) {
 // trigger 仅用于日志定位（relay / quota / manual-check）。
 func (z *ZCodeAPI) MaybeAutoReset(a *Account, trigger string) {
 	// 两路开关：auto_reset_enabled 门控耗尽阈值消耗（默认关）；
-	// auto_reset_expiry_enabled 门控临期消耗（默认开，独立于主开关）
+	// auto_reset_expiry_enabled 门控临期消耗（默认关，独立于主开关）
 	expiryOn := autoResetExpiryEnabled(z.db)
 	autoOn := false
 	if v, _ := z.db.GetSetting("auto_reset_enabled"); v == "1" {
 		autoOn = true
 	}
 	if !autoOn && !expiryOn {
+		return
+	}
+	// 无 JWT 的账号（纯 API Key）不可能走 JWT 通道重置：不提前拦下，
+	// 每轮评估都会记一条"需要 ZCode JWT"失败日志，永无成功可能
+	if jwt, _, _ := a.credentialSnapshot(); jwt == "" {
 		return
 	}
 	// 锁保护读：a 可能正被并发额度刷新 goroutine 改写状态
@@ -248,11 +262,16 @@ func (z *ZCodeAPI) MaybeAutoReset(a *Account, trigger string) {
 	}
 
 	// 临期槽位经共享防双花闸门动笔（同步路径同闸门，见 spendExpiringSlotGuarded）；
-	// 阈值路径无临期语义，直接消耗。used/msg/err 由闭包带回走原记录逻辑
+	// 阈值路径无临期语义，直接消耗。used/msg/err 由闭包带回走原记录逻辑。
+	// 幂等键只在临期路径用确定性键（账号+槽位到期）：阈值路径的 expireAt 恒为
+	// 0（无槽位语义），确定性键会退化为 accountID 常量，把同一账号两次合法的
+	// 阈值消耗（今天的 five_hour 与下周的 week）撞成同键——上游幂等真生效时
+	// 第二次会被误拒。空键回落随机 UUID（UseReset 内）
+	idemKey := autoResetIdemKey(expiring, a.ID, expireAt)
 	var used bool
 	var msg string
 	spendOnce := func() error {
-		used, _, msg, err = z.UseReset(a, resetType)
+		used, _, msg, err = z.UseReset(a, resetType, idemKey)
 		if err != nil {
 			return err
 		}
@@ -262,11 +281,26 @@ func (z *ZCodeAPI) MaybeAutoReset(a *Account, trigger string) {
 		return nil
 	}
 	if expiring {
+		// 冷启动兜底先行：内存无印但账本 gap 内有成功重置（重启清印后的
+		// 重放形态）→ 与 slot=0 无归属同款保守拒绝
+		if z.expirySpendColdBlocked(a.ID) {
+			log.Printf("[auto-reset] %s: expiring slot deferred (recent ledger spend, cold guard)", a.DisplayNameOrEmail())
+			return
+		}
 		if spent, reason := spendExpiringSlotGuarded(a.ID, expireAt, spendOnce); !spent && reason == spendGuardGapRefused {
 			// 同步路径 gap 内已消耗同一槽位（上游 status 滞后）：让位，不重复动笔
+			log.Printf("[auto-reset] %s: expiring slot deferred (30min same-account spend guard)", a.DisplayNameOrEmail())
 			return
 		}
 	} else {
+		// 阈值路径防重放：任一路径 30 分钟内成功消耗过（暖印或冷启动账本）
+		// 都暂缓——上游 status 滞后时阈值路径会把幻影槽位当真再花一次。
+		// 进入此分支前 expiring 判定已确认窗口内无临期槽，暂缓不会错过
+		// 临期消耗（槽位真进窗口时由临期路径接管）
+		if z.thresholdSpendDeferred(a.ID) {
+			log.Printf("[auto-reset] %s: threshold spend deferred (recent spend within 30min guard)", a.DisplayNameOrEmail())
+			return
+		}
 		spendOnce()
 	}
 	// UsedAt 精确落本地执行时刻：同步去重优先精确匹配，免去 localtime
@@ -274,6 +308,11 @@ func (z *ZCodeAPI) MaybeAutoReset(a *Account, trigger string) {
 	record := &ClaimRecord{AccountID: a.ID, Email: a.Email, TaskType: "reset", UsedAt: time.Now().Unix()}
 	if err != nil || !used {
 		record.Message = fmt.Sprintf("自动重置执行失败(%s): %v %s", resetType, err, msg)
+		if errors.Is(err, errResetTransport) {
+			// 请求发出但响应未达：上游可能已受理消耗，账本必须如实标注，
+			// 否则一条"纯失败"记录会诱导后续把同一槽位再花一次
+			record.Message += "；响应未达，槽位可能已被上游消耗"
+		}
 		z.db.InsertClaimRecord(record)
 		z.db.SetAccountClaimResult(a.ID, "配额重置", record.Message)
 		log.Printf("[auto-reset] %s: %s", a.DisplayNameOrEmail(), record.Message)
@@ -289,6 +328,57 @@ func (z *ZCodeAPI) MaybeAutoReset(a *Account, trigger string) {
 		time.Sleep(2 * time.Second)
 		z.RefreshAccountQuota(a)
 	})
+}
+
+// SweepExpiringResetsTick 调度器每分钟心跳调用：为 refreshAll 跳过的冷却账号
+// （cooling_until 在未来）补上临期槽位评估心跳。refreshAll 跳过它们是为省额度
+// 接口调用，但 spendExpiringResetForSync 明确接受 cooling 账号——两处资格不
+// 一致曾让冷却中的临期槽位只能过期作废。每账号 10 分钟节流 + TryLock，上游
+// status 调用频率与同步路径同级；开关关/窗口 0 时整体零开销返回。
+// stop 为调度器停机通道：每账号之间探测，停机即刻让路——否则多账号轮询叠加
+// 网络超时会拖过 Stop 的 15s 有界等待，账本写库可能撞上已关闭的 db
+func (z *ZCodeAPI) SweepExpiringResetsTick(stop <-chan struct{}) {
+	if !autoResetExpiryEnabled(z.db) {
+		return
+	}
+	if windowSec := int64(settingInt(z.db, "auto_reset_expiry_spend_minutes", autoResetExpirySpendDefaultMin)) * 60; windowSec <= 0 {
+		return
+	}
+	accounts, err := z.db.ListAccounts("")
+	if err != nil {
+		return
+	}
+	now := time.Now()
+	for _, a := range accounts {
+		select {
+		case <-stop:
+			return
+		default:
+		}
+		if !a.Enabled || a.Status != StatusCooling || a.CoolingUntil <= now.Unix() {
+			continue
+		}
+		if jwt, _, _ := a.credentialSnapshot(); jwt == "" {
+			continue
+		}
+		autoResetState.Lock()
+		last := autoResetState.lastSweep[a.ID]
+		autoResetState.Unlock()
+		if now.Sub(last) < autoResetAttemptInterval {
+			continue
+		}
+		mu := z.claimLockFor(a.ID)
+		if !mu.TryLock() {
+			continue
+		}
+		// 印记在拿到 claim 锁后才落（MaybeAutoReset 同课：锁忙早退不是一次
+		// 真实评估，先盖印会让锁竞争吃掉整个节流窗口）
+		autoResetState.Lock()
+		autoResetState.lastSweep[a.ID] = now
+		autoResetState.Unlock()
+		z.spendExpiringResetForSync(a, nil)
+		mu.Unlock()
+	}
 }
 
 // settingInt 整数设置读取（非法/缺失回落默认）
@@ -326,6 +416,46 @@ func markExpirySpend(accountID int64, slot int64) {
 	autoResetState.Unlock()
 }
 
+// autoResetIdemKey 幂等键选择（纯函数，供测试）：临期路径用确定性键
+// "auto-expiry-<账号>-<槽位到期>"，同槽重试/重启重放同键，上游幂等可拦截
+// 同槽双花；阈值路径 expireAt 恒 0、无稳定槽位标识，必须返回空键（回落
+// 随机 UUID）——常量键会把同一账号先后两次合法阈值消耗误判为重放
+func autoResetIdemKey(expiring bool, accountID int64, expireAt int64) string {
+	if !expiring {
+		return ""
+	}
+	return fmt.Sprintf("auto-expiry-%d-%d", accountID, expireAt)
+}
+
+// thresholdSpendDeferred 阈值路径的防重放闸（G2）：任一路径 30 分钟内成功
+// 消耗过重置（暖内存印，或冷启动查账本）即暂缓。上游 status 滞后时，阈值
+// 路径会把幻影槽位当真再花一次——重启清空内存印后风险最高
+func (z *ZCodeAPI) thresholdSpendDeferred(accountID int64) bool {
+	autoResetState.Lock()
+	last := autoResetState.lastExpirySpend[accountID]
+	autoResetState.Unlock()
+	if time.Since(last) < autoResetExpirySpendGap {
+		return true
+	}
+	return z.expirySpendColdBlocked(accountID)
+}
+
+// expirySpendColdBlocked 临期消耗的冷启动账本兜底：防双花印本是内存态、进程
+// 重启清零——重启恰好落在上游 status 滞后窗口内时，同槽位可能被再花一次。
+// 内存无印（冷路径）时查账本：gap 内有过成功重置记录（无论哪条路径，槽位
+// 归属未知）按 slot=0 无归属同款语义拒绝；内存有印（热路径）零开销不查库。
+// 调用方必须已持该账号的 claim 锁（与闸门同前提），本检查→闸门→动笔全程原子
+func (z *ZCodeAPI) expirySpendColdBlocked(accountID int64) bool {
+	autoResetState.Lock()
+	last := autoResetState.lastExpirySpend[accountID]
+	autoResetState.Unlock()
+	if !last.IsZero() {
+		return false
+	}
+	ok, err := z.db.HasResetRecordSince(accountID, time.Now().Add(-autoResetExpirySpendGap).Unix())
+	return err == nil && ok
+}
+
 // spendExpiringSlotGuarded 临期槽位消耗的共享防双花闸门：gap 内同到期槽位拒绝，
 // 动笔成功才盖印（lastExpirySpend/lastExpirySpendSlot）。
 // MaybeAutoReset（耗尽路径）与 spendExpiringResetForSync（同步路径）都从这里
@@ -333,7 +463,7 @@ func markExpirySpend(accountID int64, slot int64) {
 // MaybeAutoReset；refreshFn → SyncResetHistoryFromUpstream → 临期消耗），上游
 // status 滞后时第二路径会把下一个稀缺槽位当"仍是旧槽"再花一次。
 // 调用方必须已持该账号的 claim 锁（两条路径各自持有），保证检查→动笔→盖印
-// 相对另一条路径原子。
+// 相对另一条路径原子；重启后的冷启动兜底见 expirySpendColdBlocked。
 func spendExpiringSlotGuarded(accountID int64, expireAt int64, spend func() error) (spent bool, reason string) {
 	autoResetState.Lock()
 	last := autoResetState.lastExpirySpend[accountID]
@@ -356,17 +486,31 @@ func spendExpiringSlotGuarded(accountID int64, expireAt int64, spend func() erro
 }
 
 // spendExpiringResetForSync 临期槽位消耗（非耗尽路径）：active/cooling/exhausted
-// 账号的槽位没有 402 触发点，只能靠周期评估在到期前花掉。由
-// SyncResetHistoryFromUpstream 在其账号级 claim 锁内调用（互斥手动/relay 路径）。
-// 预筛用锁外快照 st——只为绝大多数无临期槽位的账号省掉第二次 status 请求；
-// 真要动笔前必须锁内重拉 status 复核，防止快照滞后期间槽位已被 relay/手动消耗。
+// 账号的槽位没有 402 触发点，只能靠周期评估在到期前花掉。两条入口：
+//   - SyncResetHistoryFromUpstream（st 为预筛快照）：预筛只为绝大多数无临期槽位
+//     的账号省掉第二次 status 请求，真要动笔前必须锁内重拉 status 复核，
+//     防止快照滞后期间槽位已被 relay/手动消耗；
+//   - SweepExpiringResetsTick（st == nil，冷却账号心跳）：refreshAll 跳过
+//     cooling_until 在未来的账号，此处锁内拉取即复核。
+//
+// 两条入口都要求调用方已持该账号的 claim 锁（互斥手动/relay 路径）。
 func (z *ZCodeAPI) spendExpiringResetForSync(a *Account, st *ResetStatus) {
-	if st == nil {
-		return
-	}
-	// 独立开关（默认开）：临期消耗不依赖 auto_reset_enabled 主开关
+	// 独立开关（默认关）：临期消耗不依赖 auto_reset_enabled 主开关
 	if !autoResetExpiryEnabled(z.db) {
 		return
+	}
+	// 无 JWT 的账号重置必然失败：提前拦下，不给日志刷"需要 ZCode JWT"的机会
+	if jwt, _, _ := a.credentialSnapshot(); jwt == "" {
+		return
+	}
+	stFreshUnderLock := false
+	if st == nil {
+		st2, _, _, err := z.FetchResetStatus(a)
+		if err != nil {
+			return
+		}
+		st = st2
+		stFreshUnderLock = true
 	}
 	windowSec := int64(settingInt(z.db, "auto_reset_expiry_spend_minutes", autoResetExpirySpendDefaultMin)) * 60
 	if windowSec <= 0 {
@@ -393,19 +537,25 @@ func (z *ZCodeAPI) spendExpiringResetForSync(a *Account, st *ResetStatus) {
 	if _, busy := z.quotaRefreshInflight.Load(a.ID); busy {
 		return
 	}
-	// 锁内重拉复核（调用方已持 claim 锁）
-	st2, _, _, err := z.FetchResetStatus(fresh)
-	if err != nil {
-		return
+	// 锁内复核状态：预筛路径的 st 是锁外快照，动笔前必须重拉复核，防止快照
+	// 滞后期间槽位已被 relay/手动消耗；心跳路径的 st 已是锁内新取（调用方
+	// 持 claim 锁期间拉取），免二次上游往返
+	stFinal := st
+	if !stFreshUnderLock {
+		st2, _, _, err := z.FetchResetStatus(fresh)
+		if err != nil {
+			return
+		}
+		stFinal = st2
 	}
 	// 决策时钟必须重取：now 采集于预筛，两次 status 之间的网络往返可能跨过
 	// 槽位 expire_at——用旧值判定会花在上游已失效的槽上（注定失败还落成功记录）
 	now = time.Now().Unix()
 	resetType := ""
 	var expireAt int64
-	if at, soon := autoResetSlotExpiringSoon(now, windowSec, st2.AvailableFiveHourResets); soon {
+	if at, soon := autoResetSlotExpiringSoon(now, windowSec, stFinal.AvailableFiveHourResets); soon {
 		resetType, expireAt = "FIVE_HOUR", at
-	} else if at, soon := autoResetSlotExpiringSoon(now, windowSec, st2.AvailableWeekResets); soon {
+	} else if at, soon := autoResetSlotExpiringSoon(now, windowSec, stFinal.AvailableWeekResets); soon {
 		resetType, expireAt = "WEEK", at
 	} else {
 		return
@@ -413,12 +563,17 @@ func (z *ZCodeAPI) spendExpiringResetForSync(a *Account, st *ResetStatus) {
 	// 动笔走共享防双花闸门（MaybeAutoReset 同闸门）：30 分钟 gap 防上游列表
 	// 滞后双花；锁内重拉列表里出现"不同到期时间"的临期槽 = 上游亲证是另一槽，
 	// gap 让位（否则第二个临期槽必死在 gap 内）。useErr/useMsg 由闭包带回走原
-	// 失败记录格式；gap 拒绝保持静默（真正花掉的那条路径有自己的成功日志）
+	// 失败记录格式；gap 拒绝记一条暂缓日志（真正花掉的那条路径有自己的成功日志）。
+	// 确定性幂等键（账号+槽位到期，恒为临期语义）：同槽重试/重启重放同键
 	var useErr error
 	var useMsg string
 	var useOK bool
+	if z.expirySpendColdBlocked(fresh.ID) {
+		log.Printf("[auto-reset] %s: expiring slot deferred (recent ledger spend, cold guard)", fresh.DisplayNameOrEmail())
+		return
+	}
 	spent, reason := spendExpiringSlotGuarded(fresh.ID, expireAt, func() error {
-		useOK, _, useMsg, useErr = z.UseReset(fresh, resetType)
+		useOK, _, useMsg, useErr = z.UseReset(fresh, resetType, autoResetIdemKey(true, fresh.ID, expireAt))
 		if useErr != nil {
 			return useErr
 		}
@@ -429,8 +584,15 @@ func (z *ZCodeAPI) spendExpiringResetForSync(a *Account, st *ResetStatus) {
 	})
 	record := &ClaimRecord{AccountID: fresh.ID, Email: fresh.Email, TaskType: "reset", UsedAt: time.Now().Unix()}
 	if !spent {
-		if reason != spendGuardGapRefused {
+		switch reason {
+		case spendGuardGapRefused:
+			log.Printf("[auto-reset] %s: expiring %s slot deferred (30min same-account spend guard)", fresh.DisplayNameOrEmail(), resetType)
+		default:
 			record.Message = fmt.Sprintf("临期自动重置执行失败(%s): %v %s", resetType, useErr, useMsg)
+			if errors.Is(useErr, errResetTransport) {
+				// 响应未达：上游可能已受理，账本如实标注（同 MaybeAutoReset）
+				record.Message += "；响应未达，槽位可能已被上游消耗"
+			}
 			z.db.InsertClaimRecord(record)
 			log.Printf("[auto-reset] %s: %s", fresh.DisplayNameOrEmail(), record.Message)
 		}

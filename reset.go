@@ -3,10 +3,12 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -107,6 +109,44 @@ func (z *ZCodeAPI) resetRequest(a *Account, method, path string, body map[string
 	return v, resp.StatusCode, nil
 }
 
+// errResetTransport reset/use 请求未收到可解析响应（网络超时/连接中断）：
+// 上游可能已受理消耗。调用方据此在账本里如实标注"槽位可能已被消耗"，
+// 而不是留一条误导性的纯失败记录
+var errResetTransport = errors.New("reset response not received")
+
+// resetSlotMsWarned expire_at 毫秒量纲告警去重（每进程一次）
+var resetSlotMsWarned sync.Once
+
+// normalizeResetSlotUnits 归一 expire_at 量纲。单位已实证为毫秒：ZCode 客户端
+// app.asar 的重置状态机 vpt() 把 expireAt 与 Date.now()（毫秒）直接比较，
+// used_at 亦为毫秒（SyncResetHistoryFromUpstream 按 /1000 去重，prod live 验证）。
+// 本网关的时间数学全用 epoch 秒，故 >1e11（秒级 epoch 到公元 5138 年也到不了）
+// 的值按毫秒归一。若某日出现秒级值，说明上游改了线格式——告警一次
+func normalizeResetSlotUnits(st *ResetStatus) {
+	if st == nil {
+		return
+	}
+	const secEpochCeil = int64(100_000_000_000)
+	hit := false
+	for i := range st.AvailableFiveHourResets {
+		if st.AvailableFiveHourResets[i].ExpireAt > secEpochCeil {
+			st.AvailableFiveHourResets[i].ExpireAt /= 1000
+			hit = true
+		}
+	}
+	for i := range st.AvailableWeekResets {
+		if st.AvailableWeekResets[i].ExpireAt > secEpochCeil {
+			st.AvailableWeekResets[i].ExpireAt /= 1000
+			hit = true
+		}
+	}
+	if hit {
+		resetSlotMsWarned.Do(func() {
+			log.Printf("[reset] expire_at normalized from milliseconds (confirmed upstream unit, per ZCode client app.asar)")
+		})
+	}
+}
+
 // FetchResetStatus GET reset/status
 func (z *ZCodeAPI) FetchResetStatus(a *Account) (*ResetStatus, int, string, error) {
 	// 锁保护读：本副本可能正被并发刷新 goroutine setCredentials 改写
@@ -128,18 +168,25 @@ func (z *ZCodeAPI) FetchResetStatus(a *Account) (*ResetStatus, int, string, erro
 	raw, _ := json.Marshal(data)
 	var st ResetStatus
 	json.Unmarshal(raw, &st)
+	normalizeResetSlotUnits(&st)
 	return &st, status, "", nil
 }
 
 // UseReset POST reset/use {idempotency_key, reset_type}
-func (z *ZCodeAPI) UseReset(a *Account, resetType string) (bool, int64, string, error) {
+// idemKeys 可选：自动路径传确定性键（账号+槽位到期时间），同一槽位的重试/
+// 进程重启重放携带同键，上游幂等去重有机会拦截同槽双花；不传则每次随机
+// （手动路径保持随机，避免把不同时刻的手动重置误判为重放）
+func (z *ZCodeAPI) UseReset(a *Account, resetType string, idemKeys ...string) (bool, int64, string, error) {
 	idem := uuid.NewString()
+	if len(idemKeys) > 0 && idemKeys[0] != "" {
+		idem = idemKeys[0]
+	}
 	v, _, err := z.resetRequest(a, "POST", "/use", map[string]interface{}{
 		"idempotency_key": idem,
 		"reset_type":      resetType,
 	})
 	if err != nil {
-		return false, 0, "", err
+		return false, 0, "", fmt.Errorf("%w: %v", errResetTransport, err)
 	}
 	code := jsonInt(v, "code")
 	msg := firstNonEmpty(jsonStr(v, "msg"), jsonStr(v, "message"))
