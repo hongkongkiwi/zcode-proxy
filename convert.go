@@ -7,6 +7,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 
@@ -25,10 +26,10 @@ type StreamUsage struct {
 	CacheCreationTokens int // 上游缓存写入 token（cache_creation_input_tokens）
 	StopReason          string
 	ToolCalls           []map[string]interface{}
-	StreamError         string // 上游 SSE error 事件（overloaded_error 等）
-	ThinkingBlocks      []thinkingBlock // R6：本响应收集到的已签名思考块（重放缓存）
-	sigByBlock map[int]string           // content_block index → signature（逐块捕获态）
-	thinkBufs  map[int]*strings.Builder // content_block index → thinking 文本缓冲
+	StreamError         string                   // 上游 SSE error 事件（overloaded_error 等）
+	ThinkingBlocks      []thinkingBlock          // R6：本响应收集到的已签名思考块（重放缓存）
+	sigByBlock          map[int]string           // content_block index → signature（逐块捕获态）
+	thinkBufs           map[int]*strings.Builder // content_block index → thinking 文本缓冲
 }
 
 // initThinkState 惰性初始化思考块逐块捕获状态
@@ -365,6 +366,10 @@ func writeProtocolResponse(w http.ResponseWriter, rc *relayCtx, status int, cont
 		case "tool_use":
 			var input map[string]interface{}
 			json.Unmarshal(c.Input, &input)
+			if input == nil {
+				// input 缺失/字面量 null：客户端工具执行器期待对象，"null" 参数会砸坏它
+				input = map[string]interface{}{}
+			}
 			toolCalls = append(toolCalls, map[string]interface{}{
 				"id": c.ID, "name": c.Name, "input": input,
 			})
@@ -376,8 +381,28 @@ func writeProtocolResponse(w http.ResponseWriter, rc *relayCtx, status int, cont
 		StopReason:   resp.StopReason,
 		ToolCalls:    toolCalls,
 	}
-	if usage != nil && u.InputTokens == 0 {
-		u = usage
+	// 嗅探 usage 缺计数时从解析结果补齐；不能整体换掉 u——换掉会丢掉
+	// 本地解析出的 ToolCalls（嗅探侧常为 nil），OpenAI 客户端就会收到
+	// 没有 tool_calls 的助手回合
+	if usage != nil {
+		if u.InputTokens == 0 {
+			u.InputTokens = usage.InputTokens
+		}
+		if u.OutputTokens == 0 {
+			u.OutputTokens = usage.OutputTokens
+		}
+		if u.StopReason == "" {
+			u.StopReason = usage.StopReason
+		}
+		if len(u.ToolCalls) == 0 {
+			u.ToolCalls = usage.ToolCalls
+		}
+		if u.CacheReadTokens == 0 {
+			u.CacheReadTokens = usage.CacheReadTokens
+		}
+		if u.CacheCreationTokens == 0 {
+			u.CacheCreationTokens = usage.CacheCreationTokens
+		}
 	}
 	u.ThinkingBlocks = append(u.ThinkingBlocks, thinkBlocks...)
 	cacheThinkingForOutput(text, u)
@@ -924,6 +949,15 @@ func (z *ZCodeAPI) streamResponses(w http.ResponseWriter, flusher http.Flusher, 
 		case "content_block_start":
 			block, _ := ev.Data["content_block"].(map[string]interface{})
 			kind, _ := block["type"].(string)
+			if kind == "thinking" {
+				// R6：Responses 流式路径同样捕获签名思考块，否则重放缓存
+				// 在该端点上恒为空，下一轮工具循环因缺签名思考块而劣化
+				usage.initThinkState()
+				if sig, ok := block["signature"].(string); ok && sig != "" {
+					usage.sigByBlock[idx] = sig
+				}
+				usage.thinkBufs[idx] = &strings.Builder{}
+			}
 			if kind == "tool_use" {
 				for i := range blocks {
 					// 未正常关闭的 text/thinking 块先收尾，保证事件序列
@@ -942,6 +976,7 @@ func (z *ZCodeAPI) streamResponses(w http.ResponseWriter, flusher http.Flusher, 
 				blocks[idx] = &blockState{kind: kind}
 			}
 		case "content_block_stop":
+			usage.finishThinkBlock(idx)
 			blk, ok := blocks[idx]
 			if !ok {
 				return
@@ -964,6 +999,12 @@ func (z *ZCodeAPI) streamResponses(w http.ResponseWriter, flusher http.Flusher, 
 				blocks[idx] = blk
 			}
 			switch delta["type"] {
+			case "signature_delta":
+				// R6：签名增量追加到对应思考块（与 applyEventToUsage 同语义）
+				if s, ok := delta["signature"].(string); ok && s != "" {
+					usage.initThinkState()
+					usage.sigByBlock[idx] += s
+				}
 			case "thinking_delta":
 				if t, ok := delta["thinking"].(string); ok && t != "" {
 					if blk.kind == "" {
@@ -975,6 +1016,10 @@ func (z *ZCodeAPI) streamResponses(w http.ResponseWriter, flusher http.Flusher, 
 						return
 					}
 					thinks = append(thinks, t)
+					// R6：同步进逐块缓冲，供签名重放缓存取完整块文本
+					if buf, ok := usage.thinkBufs[idx]; ok {
+						buf.WriteString(t)
+					}
 					// 思考作为 reasoning 输出项流式发出：客户端事件序列可重放出
 					// 与 response.completed.output 一致的状态
 					if blk.itemID == "" {
@@ -1037,8 +1082,14 @@ func (z *ZCodeAPI) streamResponses(w http.ResponseWriter, flusher http.Flusher, 
 	}
 	parser.flush(handle)
 
-	// 关闭未完成的块（上游异常中断兜底）
+	// 关闭未完成的块（上游异常中断兜底）；map 遍历无序，按 index 排序保证
+	// output_index 单调（与正常路径的补收尾一致，客户端事件序列才可重放）
+	pending := make([]int, 0, len(blocks))
 	for idx := range blocks {
+		pending = append(pending, idx)
+	}
+	sort.Ints(pending)
+	for _, idx := range pending {
 		blk := blocks[idx]
 		if blk.kind == "tool" {
 			closeToolEvents(idx)

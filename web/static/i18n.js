@@ -622,6 +622,20 @@ const I18N_EN = {
   '模型名大小写不敏感（glm-5.3 → GLM-5.3），支持 <code>bigmodel/</code> 前缀路由到 BigModel 通道。': 'Model names are case-insensitive (glm-5.3 → GLM-5.3); the <code>bigmodel/</code> prefix routes to the BigModel channel.',
   'curl 示例': 'curl example',
   'curl http://127.0.0.1:8687/v1/chat/completions \\\n  -H "Authorization: Bearer sk-你的KEY" \\\n  -H "Content-Type: application/json" \\\n  -d \'{"model":"GLM-4.5-Flash","messages":[{"role":"user","content":"你好"}],"stream":true}\'': 'curl http://127.0.0.1:8687/v1/chat/completions \\\n  -H "Authorization: Bearer sk-YOUR_KEY" \\\n  -H "Content-Type: application/json" \\\n  -d \'{"model":"GLM-4.5-Flash","messages":[{"role":"user","content":"Hello"}],"stream":true}\'',
+  '付费通道回退（免费受限时无缝切到按量计费）': 'Paid-channel fallback (seamless switch to pay-as-you-go when the free tier is limited)',
+  '免费优先，受限后回退付费（推荐）': 'Free first, fall back to paid when limited (recommended)',
+  '均衡：同账号免费失败立刻试其付费通道': 'Balanced: try the same account\'s paid channel immediately after its free paths fail',
+  '仅免费（不使用付费通道，纯 API Key 账号除外）': 'Free only (never use paid channels; API-Key-only accounts excluded)',
+  '免费通道 = Coding Plan JWT（套餐额度）；付费通道 = api.z.ai API Key（按量计费）。免费侧并发满 / 限流 / 额度耗尽 / 风控均触发回退；各账号独立开关见账号列表。': 'Free channel = Coding Plan JWT (plan quota); paid channel = api.z.ai API Key (billed per token). Free-side saturation / rate limits / exhaustion / risk blocks all trigger fallback; per-account switches live in the account list.',
+  '付费通道每日 token 上限（0=不限制；超过后当日不再回退付费）': 'Paid-channel daily token cap (0 = unlimited; once hit, paid fallback pauses for the rest of the day)',
+  '付费通道冷却/余额不足（独立计时，不影响免费通道；到期自动恢复）': 'Paid channel cooling / out of balance (independent timer; the free channel is unaffected and it auto-recovers on expiry)',
+  '付费回退关': 'paid fallback off',
+  '付费冷却至 %s': 'paid cooling until %s',
+  '🚫 关闭付费回退': '🚫 Disable paid fallback',
+  '✅ 开启付费回退': '✅ Enable paid fallback',
+  '付费回退已开启': 'Paid fallback enabled',
+  '付费回退已关闭': 'Paid fallback disabled',
+  '操作失败: %s': 'Operation failed: %s',
 };
 
 // ---- 启动：解析语言并应用到静态 DOM（脚本位于 body 末尾，DOM 已就绪） ----

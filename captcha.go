@@ -31,6 +31,8 @@ import (
 // 并发模型：按出口代理分组的容量 1 信号量（组间互不阻塞），前台求解有界等待 45s、
 // 超时返回繁忙错误，后台刷新非阻塞 TryAcquire；浏览器操作全程有 context 上界，
 // 代理黑洞/页面卡死只会占用信号量到上限，不会永久占坑。
+// 总预算：重试循环受前台 45s / 后台 120s 总预算约束（首试必跑、超预算不再起新试），
+// 有头手动档 + 多次重试最坏也只会占住请求预算时长，不会拖到分钟级。
 
 const (
 	captchaCacheTTL       = 45 * time.Second
@@ -42,6 +44,12 @@ const (
 	captchaLaunchTimeout  = 30 * time.Second
 	captchaSolveRetries   = 4
 	captchaChromeUA       = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+
+	// 求解重试循环的总预算（首试必跑；超预算不再起新试，返回已累积的错误）。
+	// 前台预算 = 请求路径可接受的同步等待上限；后台预算给有头手动档
+	// 和完整重试留足时间（无人等待）
+	captchaSolveBudgetFront = 45 * time.Second
+	captchaSolveBudgetBack  = 120 * time.Second
 )
 
 // CaptchaConfig 验证码配置（client/configs 响应）
@@ -203,7 +211,7 @@ func (s *CaptchaService) refreshInBackground(a *Account) {
 		return
 	}
 	defer s.releaseSolve(sem)
-	s.doSolve(a)
+	s.doSolve(a, captchaSolveBudgetBack)
 }
 
 func (s *CaptchaService) solveOnce(a *Account) (string, string, error) {
@@ -222,10 +230,10 @@ func (s *CaptchaService) solveOnce(a *Account) (string, string, error) {
 		return p, r, nil
 	}
 	s.mu.Unlock()
-	return s.doSolve(a)
+	return s.doSolve(a, captchaSolveBudgetFront)
 }
 
-func (s *CaptchaService) doSolve(a *Account) (string, string, error) {
+func (s *CaptchaService) doSolve(a *Account, budget time.Duration) (string, string, error) {
 	key := s.cacheKey(a)
 	cc, err := s.fetchConfig(a)
 	if err != nil {
@@ -243,7 +251,15 @@ func (s *CaptchaService) doSolve(a *Account) (string, string, error) {
 	headless := mode != "manual" && !manual
 
 	var lastErr error
+	attempts := 0
+	start := time.Now()
 	for attempt := 1; attempt <= captchaSolveRetries; attempt++ {
+		// 总预算约束：首试必跑，之后超预算不再起新试——
+		// 有头手动档一次可耗尽 40s+30s，4 连试无预算会拖到分钟级
+		if attempt > 1 && time.Since(start) >= budget {
+			break
+		}
+		attempts = attempt
 		param, err := s.solveWithBrowser(cc, headless, a)
 		if err == nil && param != "" {
 			s.mu.Lock()
@@ -266,7 +282,10 @@ func (s *CaptchaService) doSolve(a *Account) (string, string, error) {
 		}
 	}
 	s.markFail(key)
-	return "", "", fmt.Errorf("验证码求解失败（%d 次尝试）: %v", captchaSolveRetries, lastErr)
+	if lastErr == nil {
+		lastErr = fmt.Errorf("求解器未返回参数") // 理论不可达：成功路径已提前 return
+	}
+	return "", "", fmt.Errorf("验证码求解失败（尝试 %d 次，预算 %v）: %v", attempts, budget, lastErr)
 }
 
 func (s *CaptchaService) markFail(key string) {
@@ -455,11 +474,15 @@ func (s *CaptchaService) fetchConfig(a *Account) (*CaptchaConfig, error) {
 
 // ---- rod 浏览器求解 ----
 
-// findRealBrowser 定位本机真实 Chrome/Edge（捆绑 Chromium 会被阿里云风控识别）
+// findRealBrowser 定位本机真实 Chrome/Edge（捆绑 Chromium 会被阿里云风控识别）。
+// Linux 覆盖 Debian/Ubuntu（chromium、google-chrome-stable）与 Alpine
+// Docker 镜像内 apk 安装的 chromium-browser
 func findRealBrowser() string {
 	if runtime.GOOS != "windows" {
 		for _, p := range []string{
-			"/usr/bin/google-chrome", "/usr/bin/chromium-browser",
+			"/usr/bin/google-chrome", "/usr/bin/google-chrome-stable",
+			"/usr/bin/chromium", "/usr/bin/chromium-browser",
+			"/usr/bin/microsoft-edge", "/usr/bin/microsoft-edge-stable",
 			"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
 		} {
 			if _, err := os.Stat(p); err == nil {

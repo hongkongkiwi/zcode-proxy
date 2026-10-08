@@ -2,7 +2,6 @@ package main
 
 import (
 	"database/sql"
-	"strings"
 	"time"
 )
 
@@ -71,7 +70,10 @@ func (db *DB) cacheSetting(key, value string) {
 
 // SetSetting 写入设置项（机密键落库前加密；加密失败中止写入；成功后同步读缓存）
 func (db *DB) SetSetting(key, value string) error {
-	if value != "" && vaultSecretSettingsSet[key] && !strings.HasPrefix(value, vaultPrefix) {
+	if value != "" && vaultSecretSettingsSet[key] {
+		// 统一走 vaultEncrypt：加密明文；带 vault1: 前缀的原值仅在其为当前钥匙
+		// 可解密文时透传（幂等再写）。绕过它直写解不开的脏密文会永久占位、
+		// 读回恒空，网关认证静默失效直到手工修库
 		enc, err := vaultEncrypt(value)
 		if err != nil {
 			return err

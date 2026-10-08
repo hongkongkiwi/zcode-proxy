@@ -98,22 +98,22 @@ func (db *DB) HasResetRecordNear(accountID int64, usedAtSec int64, kind string) 
 		`SELECT COUNT(1) FROM claim_records
 		 WHERE account_id=? AND task_type='reset' AND success=1
 		   AND plan_name LIKE ?
-		   AND ABS(strftime('%s',created_at)-?-?)<900`,
-		accountID, "%("+kind+")%", offset, usedAtSec).Scan(&n)
+		   AND (used_at = ? OR (used_at = 0 AND ABS(strftime('%s',created_at)-?-?)<900))`,
+		accountID, "%("+kind+")%", usedAtSec, offset, usedAtSec).Scan(&n)
 	return n > 0, err
 }
 
 func (db *DB) InsertClaimRecord(r *ClaimRecord) error {
 	_, err := db.conn.Exec(`
-		INSERT INTO claim_records (account_id, email, task_type, plan_id, plan_name, success, code, message, next_at)
-		VALUES (?,?,?,?,?,?,?,?,?)`,
+		INSERT INTO claim_records (account_id, email, task_type, plan_id, plan_name, success, code, message, next_at, used_at)
+		VALUES (?,?,?,?,?,?,?,?,?,?)`,
 		r.AccountID, r.Email, r.TaskType, r.PlanID, r.PlanName,
-		boolInt(r.Success), r.Code, r.Message, r.NextAt)
+		boolInt(r.Success), r.Code, r.Message, r.NextAt, r.UsedAt)
 	return err
 }
 
 func (db *DB) ListClaimRecords(limit int, accountID int64) ([]*ClaimRecord, error) {
-	query := `SELECT id, created_at, account_id, email, task_type, plan_id, plan_name, success, code, message, next_at
+	query := `SELECT id, created_at, account_id, email, task_type, plan_id, plan_name, success, code, message, next_at, used_at
 		FROM claim_records`
 	var args []interface{}
 	if accountID > 0 {
@@ -132,7 +132,7 @@ func (db *DB) ListClaimRecords(limit int, accountID int64) ([]*ClaimRecord, erro
 		var r ClaimRecord
 		var success int
 		if err := rows.Scan(&r.ID, &r.CreatedAt, &r.AccountID, &r.Email, &r.TaskType,
-			&r.PlanID, &r.PlanName, &success, &r.Code, &r.Message, &r.NextAt); err != nil {
+			&r.PlanID, &r.PlanName, &success, &r.Code, &r.Message, &r.NextAt, &r.UsedAt); err != nil {
 			return nil, err
 		}
 		r.Success = success == 1
@@ -147,12 +147,22 @@ func (db *DB) InsertUsageRecord(r *UsageRecord) error {
 	_, err := db.conn.Exec(`
 		INSERT INTO usage_records (account_id, email, model, prompt_tokens, completion_tokens,
 			total_tokens, cache_read_tokens, cache_creation_tokens, stream, status_code,
-			duration_ms, ttft_ms, gateway_key_id, key_name)
-		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+			duration_ms, ttft_ms, gateway_key_id, key_name, channel)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		r.AccountID, r.Email, r.Model, r.PromptTokens, r.CompletionTokens,
 		r.TotalTokens, r.CacheReadTokens, r.CacheCreationTokens, boolInt(r.Stream),
-		r.StatusCode, r.DurationMs, r.TtftMs, r.GatewayKeyID, r.KeyName)
+		r.StatusCode, r.DurationMs, r.TtftMs, r.GatewayKeyID, r.KeyName, r.Channel)
 	return err
+}
+
+// PaidTokensToday 当日（本地时区）付费通道 token 消耗合计，paid_daily_token_cap 限额判断用
+func (db *DB) PaidTokensToday() (int64, error) {
+	var n int64
+	err := db.conn.QueryRow(`
+		SELECT COALESCE(SUM(total_tokens), 0) FROM usage_records
+		WHERE channel = 'paid'
+		  AND created_at >= datetime('now','localtime','start of day')`).Scan(&n)
+	return n, err
 }
 
 func (db *DB) ListUsageRecords(limit int) ([]*UsageRecord, error) {

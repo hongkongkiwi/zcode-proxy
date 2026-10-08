@@ -368,7 +368,7 @@ function renderAccounts() {
             ${a.remark ? `<div style="font-size:11px;color:var(--c-text-lighter)">${tf('备注: %s', esc(a.remark))}</div>` : ''}</td>
         <td>${a.group ? `<span class="pill-group">${esc(a.group)}</span>` : '<span style="color:var(--c-text-lighter)">-</span>'}</td>
         <td><span class="badge ${a.auth_type === 'jwt' ? 'badge-info' : 'badge-purple'}">${a.auth_type === 'jwt' ? 'JWT' : 'API Key'}</span>
-            ${a.has_api_key && a.auth_type === 'jwt' ? `<div style="font-size:10.5px;color:var(--c-text-lighter);margin-top:3px">${t('+APIKey回退')}</div>` : ''}</td>
+            ${a.has_api_key && a.auth_type === 'jwt' ? `<div style="font-size:10.5px;color:var(--c-text-lighter);margin-top:3px">${t('+APIKey回退')}${paidStateText(a)}</div>` : ''}</td>
         <td>${statusBadge(a.status)}${!a.enabled ? ` <span class="badge badge-secondary">${t('停用')}</span>` : ''}
             ${a.last_error ? `<div style="font-size:10.5px;color:var(--c-danger);margin-top:3px;max-width:160px;overflow:hidden;text-overflow:ellipsis" title="${esc(a.last_error)}">${esc(a.last_error)}</div>` : ''}</td>
         <td style="min-width:190px;cursor:pointer" title="${t('点击查看套餐与额度构成')}" onclick="showQuotaModal(${a.id})">${quotaCell(a)}</td>
@@ -384,6 +384,25 @@ function renderAccounts() {
     </tbody></table></div>`;
 }
 
+// paidStateText 付费通道状态小字（双通道账号）：回退关闭 / 付费冷却中；正常时不显示
+function paidStateText(a) {
+  if (a.paid_fallback === false) return ' · ' + t('付费回退关');
+  if (a.paid_cooling_until && a.paid_cooling_until > Date.now() / 1000) {
+    return ' · ' + tf('付费冷却至 %s', new Date(a.paid_cooling_until * 1000).toLocaleTimeString());
+  }
+  return '';
+}
+
+// togglePaidFallback 开关单账号的付费通道回退（双通道账号：JWT 免费额度 + APIKey 按量计费）
+async function togglePaidFallback(id, enable) {
+  try {
+    await api(`/api/accounts/${id}`, { method: 'PUT', body: { paid_fallback: enable } });
+    toast(enable ? t('付费回退已开启') : t('付费回退已关闭'));
+    closeModal();
+    loadAccounts();
+  } catch (e) { toast(tf('操作失败: %s', e.message), 'error'); }
+}
+
 // showAccountActions 用模态菜单承载账号操作（表格内下拉会被 overflow 容器裁剪）
 function showAccountActions(id) {
   const a = (accountsCache || []).find(x => x.id === id);
@@ -393,6 +412,7 @@ function showAccountActions(id) {
       <button class="btn btn-secondary" style="justify-content:flex-start" onclick="detectNow(${id})">${t('🔍 检测活动')}</button>
       <button class="btn btn-secondary" style="justify-content:flex-start" onclick="activateNow(${id})">${t('⚡ 激活套餐')}</button>
       <button class="btn btn-secondary" style="justify-content:flex-start" onclick="resetQuota(${id})">${t('♻️ 配额重置（Coding Plan）')}</button>
+      ${a.has_jwt && a.has_api_key ? `<button class="btn btn-secondary" style="justify-content:flex-start" onclick="togglePaidFallback(${id}, ${a.paid_fallback ? 'false' : 'true'})">${a.paid_fallback ? t('🚫 关闭付费回退') : t('✅ 开启付费回退')}</button>` : ''}
       <button class="btn btn-secondary" style="justify-content:flex-start" onclick="editAccount(${id})">${t('✏️ 编辑分组 / 备注')}</button>
       ${a.has_creds_snapshot || a.has_jwt ? `<button class="btn btn-secondary" style="justify-content:flex-start" onclick="switchBack(${id})">${t('💾 切回本地客户端')}</button>` : ''}
       ${a.has_creds_snapshot ? `<button class="btn btn-secondary" style="justify-content:flex-start" onclick="restoreLocal(${id})">${t('↩️ 从快照还原本地')}</button>` : ''}
@@ -1110,6 +1130,8 @@ async function loadSettings() {
     document.getElementById('setAutoResetMinWait5h').value = s.auto_reset_min_wait_minutes || '60';
     document.getElementById('setAutoResetMinWaitWeek').value = s.auto_reset_min_wait_week_hours || '24';
     document.getElementById('setMaxConcurrent').value = s.max_concurrent_per_account || '3';
+    document.getElementById('setPaidFallback').value = s.paid_fallback_mode || 'free_first';
+    document.getElementById('setPaidCap').value = s.paid_daily_token_cap || '0';
     window._fpCurrent = s.fingerprint || 'chrome';
     window._ja3Current = s.custom_ja3 || '';
     loadGatewayKey();
@@ -1167,6 +1189,8 @@ async function saveStrategySettings() {
       auto_reset_min_wait_minutes: document.getElementById('setAutoResetMinWait5h').value || '60',
       auto_reset_min_wait_week_hours: document.getElementById('setAutoResetMinWaitWeek').value || '24',
       max_concurrent_per_account: document.getElementById('setMaxConcurrent').value || '3',
+      paid_fallback_mode: document.getElementById('setPaidFallback').value || 'free_first',
+      paid_daily_token_cap: document.getElementById('setPaidCap').value || '0',
     }});
     toast(t('策略已保存'));
   } catch (e) { toast(e.message, 'error'); }

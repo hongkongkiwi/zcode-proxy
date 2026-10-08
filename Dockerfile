@@ -22,6 +22,12 @@ RUN CGO_ENABLED=0 GOOS=linux \
 # healthcheck defined in docker-compose.yml.
 FROM alpine:3.20
 
+# Chromium for captcha solving (captcha.go findRealBrowser picks up
+# /usr/bin/chromium-browser). Without it every Aliyun captcha solve fails inside
+# the container and the relay silently degrades to captcha-less JWT-direct.
+# Headed-manual fallback still can't open a display here — headless only.
+RUN apk add --no-cache chromium
+
 RUN addgroup -g 10001 app && adduser -D -u 10001 -G app -H app \
     && mkdir -p /app/data \
     && chown -R app:app /app
