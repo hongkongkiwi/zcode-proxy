@@ -1158,7 +1158,7 @@ async function loadSettings() {
     document.getElementById('setAutoReset').checked = s.auto_reset_enabled === '1';
     document.getElementById('setAutoResetMinWait5h').value = s.auto_reset_min_wait_minutes || '60';
     document.getElementById('setAutoResetMinWaitWeek').value = s.auto_reset_min_wait_week_hours || '24';
-    document.getElementById('setAutoResetExpiry').checked = !(s.auto_reset_expiry_enabled === '0' || s.auto_reset_expiry_enabled === 'false');
+    document.getElementById('setAutoResetExpiry').checked = s.auto_reset_expiry_enabled === '1';
     document.getElementById('setAutoResetExpirySpend').value = s.auto_reset_expiry_spend_minutes ?? '60';
     document.getElementById('setMaxConcurrent').value = s.max_concurrent_per_account || '3';
     document.getElementById('setPaidFallback').value = s.paid_fallback_mode || 'free_first';

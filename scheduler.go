@@ -94,6 +94,10 @@ func (s *CronScheduler) Start() {
 			select {
 			case <-s.ticker.C:
 				s.checkAndRun()
+				// 冷却账号的临期槽位心跳：refreshAll 跳过 cooling_until 在未来的
+				// 账号，临期消耗只有这里够得着它们。goPlan 提供停机感知与
+				// panic 隔离，网络调用不阻塞 ticker 循环
+				s.goPlan(s.zapi.SweepExpiringResetsTick)
 			case <-s.stopCh:
 				log.Printf("[scheduler] stopped")
 				return

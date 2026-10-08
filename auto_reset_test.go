@@ -184,12 +184,131 @@ func TestExpirySpendGuardedGap(t *testing.T) {
 	}
 }
 
+// R: 防双花印本是内存态、进程重启清零——重启落在上游 status 滞后窗口内时，
+// 同槽位可能被再花一次。内存无印时必须以账本兜底：30 分钟内有成功重置记录
+// 即按 slot=0 无归属语义保守拒绝；记录老化出 gap 后恢复放行。
+// 闸门本身只认内存印（冻结契约），拦截责任在调用点的 expirySpendColdBlocked
+func TestSpendGuardDBBootstrap(t *testing.T) {
+	db, _ := newVaultTestDB(t)
+	z := &ZCodeAPI{db: db, claimLocks: map[int64]*sync.Mutex{}}
+	const id = int64(990105)
+	clean := func() {
+		autoResetState.Lock()
+		delete(autoResetState.lastExpirySpend, id)
+		delete(autoResetState.lastExpirySpendSlot, id)
+		autoResetState.Unlock()
+	}
+	clean()
+	defer clean()
+
+	calls := 0
+	spend := func() error { calls++; return nil }
+	if err := db.InsertClaimRecord(&ClaimRecord{
+		AccountID: id, Email: "bootstrap@test", TaskType: "reset",
+		PlanName: "配额重置(FIVE_HOUR)[自动]", Success: true, UsedAt: time.Now().Unix(),
+	}); err != nil {
+		t.Fatalf("insert recent reset record: %v", err)
+	}
+
+	// 内存无印 + 账本 30 分钟内有成功重置：冷启动兜底拦截（调用点据此不动笔）
+	if !z.expirySpendColdBlocked(id) {
+		t.Fatal("cold start with recent ledger spend must be blocked")
+	}
+
+	// 记录老化出 gap：放行（账本只兜底 gap 窗口，不永久封锁）
+	if _, err := db.conn.Exec(`UPDATE claim_records SET used_at=? WHERE account_id=?`,
+		time.Now().Add(-autoResetExpirySpendGap-time.Minute).Unix(), id); err != nil {
+		t.Fatalf("age record: %v", err)
+	}
+	if z.expirySpendColdBlocked(id) {
+		t.Fatal("aged ledger record must not block")
+	}
+	if spent, _ := spendExpiringSlotGuarded(id, 1000, spend); !spent || calls != 1 {
+		t.Fatalf("aged ledger record must allow spend: spent=%v calls=%d, want true/1", spent, calls)
+	}
+
+	// 热路径：内存有印时零开销短路，不查库（无归属印记照旧由闸门拒绝）
+	autoResetState.Lock()
+	autoResetState.lastExpirySpend[id] = time.Now()
+	autoResetState.lastExpirySpendSlot[id] = 0
+	autoResetState.Unlock()
+	if z.expirySpendColdBlocked(id) {
+		t.Fatal("warm memory stamp must skip ledger consult")
+	}
+	if _, reason := spendExpiringSlotGuarded(id, 9999, spend); reason != spendGuardGapRefused || calls != 1 {
+		t.Fatalf("warm slot=0 stamp: reason=%q calls=%d, want %s/1", reason, calls, spendGuardGapRefused)
+	}
+}
+
+// R: 临期消耗开关默认关（2026-10-09 收紧）——未配置/0/false 一律关，显式 "1" 才开。
+// "自动动用重置机会"整体 opt-in，默认态下任何路径都不得动槽位
+func TestAutoResetExpiryDefaultOff(t *testing.T) {
+	db, _ := newVaultTestDB(t)
+	if autoResetExpiryEnabled(db) {
+		t.Error("unset auto_reset_expiry_enabled must default to OFF")
+	}
+	for _, v := range []string{"0", "false", "garbage"} {
+		db.SetSetting("auto_reset_expiry_enabled", v)
+		if autoResetExpiryEnabled(db) {
+			t.Errorf("auto_reset_expiry_enabled=%q must be OFF", v)
+		}
+	}
+	db.SetSetting("auto_reset_expiry_enabled", "1")
+	if !autoResetExpiryEnabled(db) {
+		t.Error("auto_reset_expiry_enabled=1 must be ON")
+	}
+}
+
+// R: expire_at 量纲防御归一——同接口 used_at 实测毫秒；expire_at 若也是毫秒，
+// 与 epoch 秒比较的临期判定永不命中（use-it-or-lose-it 静默失效）。
+// >1e11 只可能是毫秒：归一到秒；秒级值与 0 一律原样保留
+func TestNormalizeResetSlotUnits(t *testing.T) {
+	ms := int64(1791478335000)
+	sec := int64(1791478335)
+	st := &ResetStatus{
+		AvailableFiveHourResets: []ResetSlot{{ExpireAt: ms}, {ExpireAt: sec}, {ExpireAt: 0}},
+		AvailableWeekResets:     []ResetSlot{{ExpireAt: ms + 60000}},
+	}
+	normalizeResetSlotUnits(st)
+	if st.AvailableFiveHourResets[0].ExpireAt != sec {
+		t.Errorf("ms value: got %d, want normalized %d", st.AvailableFiveHourResets[0].ExpireAt, sec)
+	}
+	if st.AvailableFiveHourResets[1].ExpireAt != sec {
+		t.Errorf("seconds value must pass through: got %d", st.AvailableFiveHourResets[1].ExpireAt)
+	}
+	if st.AvailableFiveHourResets[2].ExpireAt != 0 {
+		t.Errorf("zero (unknown expiry) must pass through: got %d", st.AvailableFiveHourResets[2].ExpireAt)
+	}
+	if st.AvailableWeekResets[0].ExpireAt != ms/1000+60 {
+		t.Errorf("week ms value: got %d, want %d", st.AvailableWeekResets[0].ExpireAt, ms/1000+60)
+	}
+	normalizeResetSlotUnits(nil) // 不得 panic
+}
+
+// R: 无 JWT 的账号（纯 API Key）永远走不了 JWT 通道重置——自动评估必须提前
+// 静默让路，否则每轮记一条"需要 ZCode JWT"失败日志且永无成功可能
+func TestMaybeAutoResetJWTLessAccountNoStamp(t *testing.T) {
+	db, _ := newVaultTestDB(t)
+	z := &ZCodeAPI{db: db, claimLocks: map[int64]*sync.Mutex{}}
+	db.SetSetting("auto_reset_expiry_enabled", "1") // 开关开着也必须被 JWT 门拦下
+	a := &Account{ID: 990106, Email: "nojwt@test", Status: StatusExhausted}
+	z.MaybeAutoReset(a, "test")
+	autoResetState.Lock()
+	_, stamped := autoResetState.lastAttempt[a.ID]
+	autoResetState.Unlock()
+	if stamped {
+		t.Error("JWT-less account must return before debouncing/stamping")
+	}
+}
+
 // R: 防抖印记不得在拿到 claim 锁之前落——锁忙早退不是一次真实评估，先盖印
 // 会让一次锁竞争吃掉整个 10 分钟评估窗口（耗尽账号不再有下一触发）
 func TestMaybeAutoResetLockBusyLeavesStaleStamp(t *testing.T) {
 	db, _ := newVaultTestDB(t)
 	z := &ZCodeAPI{db: db, claimLocks: map[int64]*sync.Mutex{}}
-	a := &Account{ID: 990103, Email: "busy-lock@test", Status: StatusExhausted}
+	// 临期开关显式开：默认态下函数在开关门就返回，到不了 TryLock，测试变空转
+	db.SetSetting("auto_reset_expiry_enabled", "1")
+	a := &Account{ID: 990103, Email: "busy-lock@test", Status: StatusExhausted, ZCodeJWT: "test-jwt"}
 	mu := z.claimLockFor(a.ID)
 	mu.Lock() // 模拟领取/手动流程并发持有 claim 锁
 	defer mu.Unlock()

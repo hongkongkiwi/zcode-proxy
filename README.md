@@ -141,8 +141,8 @@ Go 单二进制实现的 **ZCode（Z.AI / GLM Coding Plan）多账号管理 + OA
 
 - **自动领取活动**（`auto_claim_promos`，默认开）：后台常驻循环，每轮对全部账号领取最高优先级的可领活动；`auto_claim_interval_minutes` 默认 30 分钟（5-1440，0=仅手动），账号间 `auto_claim_delay_seconds` 默认 10s ± 40% 抖动；只领活动，绝不触碰额度重置；
 - **自动重置**（`auto_reset_enabled`，默认关）：额度耗尽且重置机会等待达门槛时自动消耗机会恢复配额（five_hour ≥ `auto_reset_min_wait_minutes` 默认 60 分钟；week ≥ `auto_reset_min_wait_week_hours` 默认 24 小时；等待时间未知按可花费处理）；
-- **到期即花**（`auto_reset_expiry_enabled`，默认开，独立于总开关）：机会临近到期（`auto_reset_expiry_spend_minutes` 默认 60 分钟，0=关闭）时即使未耗尽也先花掉；槽位间隔 30 分钟 + 同槽去重防双花；
-- 自动与手动重置共用账号级互斥锁与防双花印记。
+- **到期即花**（`auto_reset_expiry_enabled`，默认关，独立于总开关）：机会临近到期（`auto_reset_expiry_spend_minutes` 默认 60 分钟，0=关闭）时即使未耗尽也先花掉；槽位间隔 30 分钟 + 同槽去重防双花（印记重启后从账本还原）；
+- 自动与手动重置共用账号级互斥锁与防双花印记；冷却中的账号由调度器心跳补上临期评估（refreshAll 会跳过它们）；临期消耗携带确定性幂等键，响应丢失时账本如实标注"槽位可能已被上游消耗"。
 
 ### 人机验证 / 指纹 / 出口代理
 
@@ -292,7 +292,7 @@ Go 单二进制实现的 **ZCode（Z.AI / GLM Coding Plan）多账号管理 + OA
 ## 10. 配置参考
 
 `config/config.json`（首次运行生成）：`listen_addr`、`app_version`(空=注册表探测)、`models[]`、`upstream{zai,zai_fallback,bigmodel}`。
-`settings`（界面/`PUT /api/settings`）：`selection_strategy`、`quota_refresh_interval`(0=关闭)、`sticky_sessions`(会话粘滞，默认开)、`paid_fallback_mode`(free_first/balanced/never，默认 free_first)、`paid_daily_token_cap`(付费每日 token 上限，0=不限)、`max_concurrent_per_account`(1-32，默认 3)、`upstream_proxy`、`fingerprint`、`custom_ja3`、`captcha_mode`(auto/manual/off)、`captcha_prewarm`(0=关预热)、`gateway_models`、`model_catalog`(`client/configs` 目录缓存)、`api_key`、`password_hash`(bcrypt)、`prompt_cache_breakpoint`(1=system 末块加 ephemeral 缓存断点，默认关)、`usage_retention_days`(记录保留天数，默认 90，0=永久)、`async_enabled`(闲时通道开关，默认关)、`async_poll_interval_ms`(1000)、`async_keepalive_ms`(15000)、`async_max_retries`(3)、`async_max_wait_sec`(1800)、`auto_claim_promos`(自动领活动，默认开)、`auto_claim_interval_minutes`(默认 30，0=仅手动)、`auto_claim_delay_seconds`(默认 10)、`auto_reset_enabled`(自动重置，默认关)、`auto_reset_min_wait_minutes`(60)、`auto_reset_min_wait_week_hours`(24)、`auto_reset_expiry_enabled`(到期即花，默认开)、`auto_reset_expiry_spend_minutes`(60)。
+`settings`（界面/`PUT /api/settings`）：`selection_strategy`、`quota_refresh_interval`(0=关闭)、`sticky_sessions`(会话粘滞，默认开)、`paid_fallback_mode`(free_first/balanced/never，默认 free_first)、`paid_daily_token_cap`(付费每日 token 上限，0=不限)、`max_concurrent_per_account`(1-32，默认 3)、`upstream_proxy`、`fingerprint`、`custom_ja3`、`captcha_mode`(auto/manual/off)、`captcha_prewarm`(0=关预热)、`gateway_models`、`model_catalog`(`client/configs` 目录缓存)、`api_key`、`password_hash`(bcrypt)、`prompt_cache_breakpoint`(1=system 末块加 ephemeral 缓存断点，默认关)、`usage_retention_days`(记录保留天数，默认 90，0=永久)、`async_enabled`(闲时通道开关，默认关)、`async_poll_interval_ms`(1000)、`async_keepalive_ms`(15000)、`async_max_retries`(3)、`async_max_wait_sec`(1800)、`auto_claim_promos`(自动领活动，默认开)、`auto_claim_interval_minutes`(默认 30，0=仅手动)、`auto_claim_delay_seconds`(默认 10)、`auto_reset_enabled`(自动重置，默认关)、`auto_reset_min_wait_minutes`(60)、`auto_reset_min_wait_week_hours`(24)、`auto_reset_expiry_enabled`(到期即花，默认关)、`auto_reset_expiry_spend_minutes`(60)。
 
 账号 `priority` 字段：priority 策略下数值小者先用（1-9999，默认 100；导入后首次额度刷新发现促销档自动降为 50）。
 

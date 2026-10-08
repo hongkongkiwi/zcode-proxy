@@ -115,6 +115,19 @@ func (db *DB) HasResetRecordNear(accountID int64, usedAtSec int64, kind string) 
 	return n > 0, err
 }
 
+// HasResetRecordSince 该账号在 sinceUnix 之后是否有过成功重置记录（不限类型）。
+// 临期防双花闸门的冷启动兜底：防双花印本是内存态，进程重启清零——重启落在
+// 上游 status 滞后窗口内时，同槽位可能被再花一次。以账本为真源还原"最近
+// 刚消耗过"的事实，按 slot=0 无归属语义保守拒绝
+func (db *DB) HasResetRecordSince(accountID int64, sinceUnix int64) (bool, error) {
+	var n int
+	err := db.conn.QueryRow(
+		`SELECT COUNT(1) FROM claim_records
+		 WHERE account_id=? AND task_type='reset' AND success=1 AND used_at >= ?`,
+		accountID, sinceUnix).Scan(&n)
+	return n > 0, err
+}
+
 func (db *DB) InsertClaimRecord(r *ClaimRecord) error {
 	_, err := db.conn.Exec(`
 		INSERT INTO claim_records (account_id, email, task_type, plan_id, plan_name, success, code, message, next_at, used_at)

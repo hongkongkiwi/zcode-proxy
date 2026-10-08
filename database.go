@@ -501,10 +501,14 @@ func (db *DB) initSchema() error {
 		"auto_claim_promos":           "1",
 		"auto_claim_interval_minutes": "30",
 		"auto_claim_delay_seconds":    "10",
-		// 自动重置策略：默认关闭；开启后仅在"耗尽 && 自然窗口等待 > 阈值"时消耗
+		// 自动重置策略：默认关闭；开启后仅在"耗尽 && 自然窗口等待 > 阈值"时消耗。
+		// 临期消耗（use-it-or-lose-it）同为默认关：自动动用重置机会整体 opt-in，
+		// 需显式开 auto_reset_expiry_enabled
 		"auto_reset_enabled":             "0",
 		"auto_reset_min_wait_minutes":    "60",
 		"auto_reset_min_wait_week_hours": "24",
+		"auto_reset_expiry_enabled":      "0",
+		"auto_reset_expiry_spend_minutes": "60",
 		// 免费优先 / 付费回退：免费通道（JWT 套餐额度）先用，受限（并发满/限流/耗尽）
 		// 后无缝落到付费通道（api.z.ai 按量计费）；上限 0 = 不限
 		"paid_fallback_mode":   "free_first",
