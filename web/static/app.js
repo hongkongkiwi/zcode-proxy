@@ -1152,6 +1152,9 @@ async function loadSettings() {
     document.getElementById('setGatewayModels').value = s.gateway_models || '';
     document.getElementById('setSticky').checked = !(s.sticky_sessions === '0' || s.sticky_sessions === 'false');
     document.getElementById('setPromptCacheBreakpoint').checked = s.prompt_cache_breakpoint === '1';
+    document.getElementById('setAutoClaimPromos').checked = !(s.auto_claim_promos === '0' || s.auto_claim_promos === 'false');
+    document.getElementById('setAutoClaimInterval').value = s.auto_claim_interval_minutes || '30';
+    document.getElementById('setAutoClaimDelay').value = s.auto_claim_delay_seconds || '10';
     document.getElementById('setAutoReset').checked = s.auto_reset_enabled === '1';
     document.getElementById('setAutoResetMinWait5h').value = s.auto_reset_min_wait_minutes || '60';
     document.getElementById('setAutoResetMinWaitWeek').value = s.auto_reset_min_wait_week_hours || '24';
@@ -1213,6 +1216,9 @@ async function saveStrategySettings() {
       quota_refresh_interval: document.getElementById('setQuotaInterval').value,
       sticky_sessions: document.getElementById('setSticky').checked ? '1' : '0',
       prompt_cache_breakpoint: document.getElementById('setPromptCacheBreakpoint').checked ? '1' : '0',
+      auto_claim_promos: document.getElementById('setAutoClaimPromos').checked ? '1' : '0',
+      auto_claim_interval_minutes: document.getElementById('setAutoClaimInterval').value || '30',
+      auto_claim_delay_seconds: document.getElementById('setAutoClaimDelay').value || '10',
       auto_reset_enabled: document.getElementById('setAutoReset').checked ? '1' : '0',
       auto_reset_min_wait_minutes: document.getElementById('setAutoResetMinWait5h').value || '60',
       auto_reset_min_wait_week_hours: document.getElementById('setAutoResetMinWaitWeek').value || '24',

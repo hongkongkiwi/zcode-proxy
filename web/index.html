@@ -285,6 +285,14 @@
 <input type="number" id="setQuotaInterval" class="form-input" min="0" max="86400">
 </div>
 <div class="form-group" style="margin-bottom:16px">
+<label class="form-label" data-i18n="自动领取免费活动（默认开启）">自动领取免费活动（默认开启）</label>
+<div><label style="display:inline-flex;align-items:center;gap:6px;font-size:13px"><input type="checkbox" id="setAutoClaimPromos" style="width:auto" checked><span data-i18n="开启后：后台定时检测并领取所有账号可领的免费活动（含验证码求解）；自动覆盖每个启用且凭证有效的账号，无需单独配置">开启后：后台定时检测并领取所有账号可领的免费活动（含验证码求解）；自动覆盖每个启用且凭证有效的账号，无需单独配置</span></label></div>
+<div style="display:flex;gap:16px;margin-top:8px;flex-wrap:wrap">
+<div style="flex:1;min-width:180px"><label class="form-label" style="font-size:12px" data-i18n="领取间隔（分钟，5-1440，0=仅手动）">领取间隔（分钟，5-1440，0=仅手动）</label><input type="number" id="setAutoClaimInterval" class="form-input" min="0" max="1440" placeholder="30"></div>
+<div style="flex:1;min-width:180px"><label class="form-label" style="font-size:12px" data-i18n="账号间延迟（秒，防风控）">账号间延迟（秒，防风控）</label><input type="number" id="setAutoClaimDelay" class="form-input" min="0" max="600" placeholder="10"></div>
+</div>
+</div>
+<div class="form-group" style="margin-bottom:16px">
 <label class="form-label" data-i18n="自动重置（耗尽时按阈值消耗重置机会）">自动重置（耗尽时按阈值消耗重置机会）</label>
 <div><label style="display:inline-flex;align-items:center;gap:6px;font-size:13px"><input type="checkbox" id="setAutoReset" style="width:auto"><span data-i18n="开启后：配额耗尽且自然重置等待超过阈值时自动消耗重置机会；默认关闭，重置仍可随时手动触发">开启后：配额耗尽且自然重置等待超过阈值时自动消耗重置机会；默认关闭，重置仍可随时手动触发</span></label></div>
 <div style="margin-top:6px"><label style="display:inline-flex;align-items:center;gap:6px;font-size:13px"><input type="checkbox" id="setAutoResetExpiry" style="width:auto"><span data-i18n="临期自动消耗（默认开启）：重置机会距到期不足消耗窗口时自动花掉，避免槽位作废；独立于上面的自动重置开关">临期自动消耗（默认开启）：重置机会距到期不足消耗窗口时自动花掉，避免槽位作废；独立于上面的自动重置开关</span></label></div>
