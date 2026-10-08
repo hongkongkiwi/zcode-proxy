@@ -23,7 +23,8 @@ import (
 // 防抖：同账号自动评估最小间隔 10 分钟，失败/跳过都不因每条 402 反复打状态接口。
 //
 // ---- 临期槽位 use-it-or-lose-it ----
-// 重置机会槽位自带 expire_at（经 FetchResetStatus 归一为秒），到期未用即作废。
+// 重置机会槽位自带 expire_at（上游毫秒已实证——ZCode 客户端 app.asar 与
+// Date.now() 直接比较；经 FetchResetStatus 归一为秒），到期未用即作废。
 // 上面的阈值保留策略在"槽位先于下次耗尽到期"时会把槽位一直保留到作废——保留到
 // 作废不如到期前花掉。临期消耗由独立开关 auto_reset_expiry_enabled 控制
 // （默认关：自动动用重置机会整体是 opt-in，与本文件顶部的阈值主开关同款默认关

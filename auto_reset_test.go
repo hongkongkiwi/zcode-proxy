@@ -320,8 +320,9 @@ func TestAutoResetExpiryDefaultOff(t *testing.T) {
 	}
 }
 
-// R: expire_at 量纲防御归一——同接口 used_at 实测毫秒；expire_at 若也是毫秒，
-// 与 epoch 秒比较的临期判定永不命中（use-it-or-lose-it 静默失效）。
+// R: expire_at 量纲归一——上游毫秒已实证（ZCode 客户端 app.asar 的 vpt() 把
+// expireAt 与 Date.now() 毫秒直接比较；同接口 used_at 亦毫秒）。与 epoch 秒
+// 比较的临期判定必须归一，否则永不命中（use-it-or-lose-it 静默失效）。
 // >1e11 只可能是毫秒：归一到秒；秒级值与 0 一律原样保留
 func TestNormalizeResetSlotUnits(t *testing.T) {
 	ms := int64(1791478335000)

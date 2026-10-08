@@ -117,11 +117,11 @@ var errResetTransport = errors.New("reset response not received")
 // resetSlotMsWarned expire_at 毫秒量纲告警去重（每进程一次）
 var resetSlotMsWarned sync.Once
 
-// normalizeResetSlotUnits 防御归一 expire_at 量纲：同一 reset/status 接口的
-// used_at 实测为毫秒（SyncResetHistoryFromUpstream 按 /1000 去重），expire_at
-// 的单位从未实测过——若是毫秒，临期判定（与 epoch 秒比较）将永不命中，
-// use-it-or-lose-it 静默失效。秒级 epoch 到公元 5138 年也只 ~1e11，
-// 大于该阈值只可能是毫秒，归一到秒并告警一次
+// normalizeResetSlotUnits 归一 expire_at 量纲。单位已实证为毫秒：ZCode 客户端
+// app.asar 的重置状态机 vpt() 把 expireAt 与 Date.now()（毫秒）直接比较，
+// used_at 亦为毫秒（SyncResetHistoryFromUpstream 按 /1000 去重，prod live 验证）。
+// 本网关的时间数学全用 epoch 秒，故 >1e11（秒级 epoch 到公元 5138 年也到不了）
+// 的值按毫秒归一。若某日出现秒级值，说明上游改了线格式——告警一次
 func normalizeResetSlotUnits(st *ResetStatus) {
 	if st == nil {
 		return
@@ -142,7 +142,7 @@ func normalizeResetSlotUnits(st *ResetStatus) {
 	}
 	if hit {
 		resetSlotMsWarned.Do(func() {
-			log.Printf("[reset] expire_at came in as milliseconds; normalized to seconds (upstream unit drift?)")
+			log.Printf("[reset] expire_at normalized from milliseconds (confirmed upstream unit, per ZCode client app.asar)")
 		})
 	}
 }
