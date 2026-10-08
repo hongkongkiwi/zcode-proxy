@@ -79,16 +79,30 @@ func TestWriteSSEErrorEvent(t *testing.T) {
 func TestOffPeakWait(t *testing.T) {
 	keeps := 0
 	start := time.Now()
-	if !offPeakWait(context.Background(), 60*time.Millisecond, time.Hour, func() { keeps++ }, true) {
+	nextKA := time.Time{}
+	if !offPeakWait(context.Background(), 60*time.Millisecond, time.Hour, func() { keeps++ }, true, &nextKA) {
 		t.Fatal("should complete")
 	}
 	if keeps != 0 || time.Since(start) < 50*time.Millisecond {
 		t.Fatalf("keepalive fired early or sleep skipped: keeps=%d elapsed=%v", keeps, time.Since(start))
 	}
 
+	// 跨调用持有：保活期限不因多次调用重派而永不到期（秒级轮询下的
+	// 真实使用形态——keepalive=50ms、每次 sleep=10ms，共 6 次）
+	keeps = 0
+	nextKA = time.Time{}
+	for i := 0; i < 6; i++ {
+		if !offPeakWait(context.Background(), 10*time.Millisecond, 50*time.Millisecond, func() { keeps++ }, true, &nextKA) {
+			t.Fatal("should complete")
+		}
+	}
+	if keeps == 0 {
+		t.Fatal("keepalive should fire across repeated waits when deadline persists")
+	}
+
 	ctx, cancel := context.WithCancel(context.Background())
 	go func() { time.Sleep(30 * time.Millisecond); cancel() }()
-	if offPeakWait(ctx, 10*time.Second, time.Hour, func() {}, true) {
+	if offPeakWait(ctx, 10*time.Second, time.Hour, func() {}, true, &nextKA) {
 		t.Fatal("ctx cancel should return false")
 	}
 }

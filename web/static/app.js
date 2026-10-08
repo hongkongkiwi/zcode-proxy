@@ -34,6 +34,14 @@ function toast(msg, type = 'success') {
   toastTimer = setTimeout(() => el.classList.remove('show'), 3200);
 }
 
+// 视图加载失败的统一出口：会话过期（已跳登录页）保持静默，其余一律 toast——
+// 静默吞掉 500 时面板会永远停在"加载中…"或陈旧数据上，看起来像空库
+function reportLoadError(e) {
+  const login = document.getElementById('loginPage');
+  if (login && login.style.display !== 'none') return;
+  toast(tf('加载失败: %s', e.message), 'error');
+}
+
 function openModal(html) {
   document.getElementById('modalBox').innerHTML = html;
   document.getElementById('modalOverlay').classList.add('show');
@@ -242,7 +250,7 @@ async function loadDashboard() {
       <div style="display:flex;gap:8px;flex-wrap:wrap">
         ${Object.entries(gc).map(([k, v]) => `<span class="pill-group">${esc(k)} · ${v}</span>`).join('')}
       </div>`;
-  } catch (e) { /* 未登录时静默 */ }
+  } catch (e) { reportLoadError(e); }
 }
 
 // ---- 分组 ----
@@ -256,7 +264,7 @@ async function loadGroups() {
     const cur = sel.value;
     sel.innerHTML = `<option value="">${t('全部分组')}</option>` + groupCache.map(g => `<option value="${esc(g)}">${esc(g)}</option>`).join('');
     sel.value = cur;
-  } catch (e) { /* ignore */ }
+  } catch (e) { reportLoadError(e); }
 }
 
 function groupOptions(selected) {
@@ -318,7 +326,7 @@ function showQuotaModal(id) {
           <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;border:1px solid var(--c-border);border-radius:8px;padding:8px 12px;margin-bottom:6px;font-size:12.5px">
             <div><b>${esc(c.source)}</b> <span class="badge badge-secondary">${esc(c.plan_tier || '-')}</span>
               ${c.exhausted ? `<span class="badge badge-danger">${t('已耗尽')}</span>` : `<span class="badge badge-success">${t('有余量')}</span>`}</div>
-            <div>${t('剩余 %s', fmtNum(c.remaining))}${c.next_reset ? ` · ${tf('重置 %s', fmtT(c.next_reset))}` : ''}</div>
+            <div>${tf('剩余 %s', fmtNum(c.remaining))}${c.next_reset ? ` · ${tf('重置 %s', fmtT(c.next_reset))}` : ''}</div>
           </div>`).join('')}
       </div>` : ''}
       ${slots.map(s => `
@@ -725,7 +733,10 @@ function pollOAuth() {
       } else if (el && f.status === 'exchanging') {
         el.textContent = t('正在兑换 token 并提取 API Key…');
       }
-    } catch (e) { /* 流程过期 */ }
+    } catch (e) {
+      // 流程过期/会话失效：终止轮询，否则弹窗叠在登录页上 1.5s 一次打 401
+      clearInterval(oauthPollTimer);
+    }
   }, 1500);
 }
 
@@ -996,7 +1007,7 @@ async function pollRunning() {
         <div class="progress-track" style="flex:1;min-width:120px"><div class="progress-fill" style="width:${s.total ? s.done / s.total * 100 : 0}%"></div></div>
         <span class="rb-meta">${s.done}/${s.total} · ✅${s.success} ❌${s.fail}${s.current_account ? ' · ' + esc(s.current_account) : ''}</span>
       </div>`).join('');
-  } catch (e) { /* ignore */ }
+  } catch (e) { /* 5s 轮询：持续失败不占 toast（会盖掉用户操作反馈） */ }
 }
 
 async function loadClaimRecords() {
@@ -1015,7 +1026,7 @@ async function loadClaimRecords() {
         <td>${r.success ? `<span class="badge badge-success">${t('成功')}</span>` : `<span class="badge badge-danger">${t('失败')}</span>`}${r.code ? ` <span class="mono" style="font-size:11px">code=${r.code}</span>` : ''}</td>
         <td style="max-width:280px" title="${esc(r.message)}">${esc(r.message || '')}</td>
       </tr>`).join('')}</tbody></table></div>`;
-  } catch (e) { /* ignore */ }
+  } catch (e) { reportLoadError(e); }
 }
 
 async function loadPlanRuns() {
@@ -1035,7 +1046,7 @@ async function loadPlanRuns() {
         <td>${(r.duration_ms / 1000).toFixed(1)}s</td>
         <td style="max-width:320px" title="${esc(r.message)}">${esc(r.message || '')}</td>
       </tr>`).join('')}</tbody></table></div>`;
-  } catch (e) { /* ignore */ }
+  } catch (e) { reportLoadError(e); }
 }
 
 // ---- 使用记录 ----
@@ -1086,7 +1097,7 @@ async function loadUsageStats() {
         <td>${fmtNum(d.tokens)}</td>
         <td>${d.cache_read_tokens ? fmtNum(d.cache_read_tokens) : '-'}</td>
       </tr>`).join('')}</tbody></table></div>`;
-  } catch (e) { /* ignore */ }
+  } catch (e) { reportLoadError(e); }
 }
 
 async function loadUsageRecords() {
@@ -1111,7 +1122,7 @@ async function loadUsageRecords() {
         <td>${(r.duration_ms / 1000).toFixed(1)}s</td>
         <td>${r.ttft_ms ? r.ttft_ms + 'ms' : '-'}</td>
       </tr>`).join('')}</tbody></table></div>`;
-  } catch (e) { /* ignore */ }
+  } catch (e) { reportLoadError(e); }
 }
 
 // ---- 设置 ----
@@ -1139,7 +1150,7 @@ async function loadSettings() {
     loadCaptchaStatus();
     loadProxies();
     loadFingerprints();
-  } catch (e) { /* ignore */ }
+  } catch (e) { reportLoadError(e); }
 }
 
 // ---- TLS 指纹 ----
@@ -1160,7 +1171,7 @@ async function loadFingerprints() {
     const hint = document.getElementById('fpCurrentHint');
     if (hint) hint.textContent = tf('当前生效: %s（保存后新连接生效）', sel.value);
     fpModeChange();
-  } catch (e) { /* ignore */ }
+  } catch (e) { reportLoadError(e); }
 }
 
 function fpModeChange() {
@@ -1216,7 +1227,7 @@ async function loadModels() {
     document.getElementById('currentModels').innerHTML =
       t('当前生效: ') + (d.models || []).map(m => `<span class="pill-group" style="margin:2px">${esc(m)}</span>`).join('');
     loadCatalog();
-  } catch (e) { /* ignore */ }
+  } catch (e) { reportLoadError(e); }
 }
 
 async function loadCatalog() {
@@ -1228,7 +1239,7 @@ async function loadCatalog() {
     el.innerHTML = ms.length
       ? ms.map(m => `<span class="pill-group" style="margin:2px" title="${esc(`ctx=${m.contextWindow} prio=${m.priority}${m.vision ? ' vision' : ''}`)}">${esc(m.modelId)}</span>`).join('')
       : `<span style="color:var(--c-text-lighter)">${t('尚未同步，点击「同步官方目录」')}</span>`;
-  } catch (e) { /* ignore */ }
+  } catch (e) { reportLoadError(e); }
 }
 
 async function syncModelCatalog() {
@@ -1255,7 +1266,7 @@ async function loadGatewayKey() {
   try {
     const d = await api('/api/settings/api-key');
     document.getElementById('gatewayKeyDisplay').value = d.api_key || '';
-  } catch (e) { /* ignore */ }
+  } catch (e) { reportLoadError(e); }
 }
 
 async function generateAPIKey() {
@@ -1304,7 +1315,7 @@ async function loadCaptchaStatus() {
     el.innerHTML = c.has_param
       ? tf('当前参数: %s', c.fresh ? t('✅ 新鲜') : tf('⏳ 已过期 %ss', c.param_age_s)) + (c.config ? ' · scene=' + esc(c.config.scene_id) : '')
       : t('当前无缓存参数（下次请求时自动求解）');
-  } catch (e) { /* ignore */ }
+  } catch (e) { reportLoadError(e); }
 }
 
 async function solveCaptchaNow() {
@@ -1331,7 +1342,7 @@ async function loadProxies() {
     const d = await api('/api/proxies');
     proxiesCache = d.proxies || [];
     renderProxies();
-  } catch (e) { /* ignore */ }
+  } catch (e) { reportLoadError(e); }
 }
 
 function renderProxies() {
@@ -1518,7 +1529,7 @@ async function loadLlmKey() {
     const d = await api('/api/settings/api-key');
     const el = document.getElementById('llmKey');
     if (el) el.value = d.api_key || '';
-  } catch (e) { /* ignore */ }
+  } catch (e) { reportLoadError(e); }
 }
 
 // 从 SSE 行中提取增量文本（按协议）
@@ -1537,7 +1548,7 @@ function llmDeltaText(proto, data) {
       if (j.type === 'response.output_text.delta') return j.delta || '';
       return '';
     }
-  } catch (e) { /* ignore */ }
+  } catch (e) { /* 非 JSON 增量帧按空处理 */ }
   return '';
 }
 
@@ -1557,7 +1568,7 @@ function llmDeltaThink(proto, data) {
       if (j.type === 'response.reasoning_summary_text.delta') return j.delta || '';
       return '';
     }
-  } catch (e) { /* ignore */ }
+  } catch (e) { /* 非 JSON 增量帧按空处理 */ }
   return '';
 }
 
@@ -1692,8 +1703,10 @@ function initLlmPlaceholders() {
   };
   apply(document.getElementById('llmContent'), t('（尚未运行）'));
   const h = document.getElementById('llmHistory');
-  if (h && !llmHistory.length && h.dataset.placeholderLang !== undefined) {
-    h.innerHTML = t('（无）');
+  // undefined = 首次加载的空白元素：与 apply() 同路径写占位（原条件恒 false，
+  // 历史面板首次打开一直空白）
+  if (h && !llmHistory.length && h.dataset.placeholderLang === undefined) {
+    h.textContent = t('（无）');
     h.dataset.placeholderLang = CURRENT_LANG;
   }
 }

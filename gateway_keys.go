@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"log"
 	"net/http"
 	"strconv"
 	"sync"
@@ -47,7 +48,9 @@ func (am *AuthManager) resolveGatewayKey(key string) (*GatewayKey, *errorRespons
 	}
 	k, err := am.db.GetGatewayKeyByHash(HashGatewayKey(key))
 	if err != nil {
-		return nil, &errorResponse{status: http.StatusInternalServerError, msg: err.Error()}
+		// 认证前置路径，未认证方可触达：库错误文本（引擎/状态细节）不外泄
+		log.Printf("[auth] gateway key lookup: %v", err)
+		return nil, &errorResponse{status: http.StatusInternalServerError, msg: "internal error"}
 	}
 	if k == nil {
 		return nil, &errorResponse{status: http.StatusUnauthorized, msg: "invalid API key"}

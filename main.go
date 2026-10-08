@@ -12,6 +12,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -196,10 +197,18 @@ func main() {
 	listenAddr := cfg.GetListenAddr()
 	log.Printf("[main] zcode-proxy listening on http://%s", listenAddr)
 	log.Printf("[main] web UI: http://%s/web", listenAddr)
-	// 显式 Server：ReadHeaderTimeout 防 Slowloris；SSE 决定不设 WriteTimeout
+	// 显式 Server：ReadHeaderTimeout 防 Slowloris；SSE 决定不设 WriteTimeout。
+	// 在途请求计数：停机时先等处理器退出，再走 deferred 池停止与 db.Close()，
+	// 否则长 SSE 期间 usage/状态写库会撞上已关闭的库
+	var inFlight sync.WaitGroup
+	authed := limitBody(auth.Middleware(mux))
 	srv := &http.Server{
-		Addr:              listenAddr,
-		Handler:           limitBody(auth.Middleware(mux)),
+		Addr: listenAddr,
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			inFlight.Add(1)
+			defer inFlight.Done()
+			authed.ServeHTTP(w, r)
+		}),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
@@ -216,7 +225,41 @@ func main() {
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	if err := srv.Shutdown(shutdownCtx); err != nil {
-		log.Printf("[main] shutdown: %v", err)
+		// 排水超时（长 SSE 是常态）：强制断连，处理器在下次写响应时退出
+		log.Printf("[main] shutdown: %v; forcing close of active connections", err)
+		srv.Close()
+	}
+	// 给在途处理器一个有界退出窗口，避免 db.Close() 吃掉收尾写入
+	drained := make(chan struct{})
+	go func() {
+		inFlight.Wait()
+		close(drained)
+	}()
+	select {
+	case <-drained:
+	case <-time.After(30 * time.Second):
+		log.Printf("[main] shutdown: in-flight handlers still draining after 30s; proceeding")
+	}
+	// 先停掉后台任务派生者并等它们收尾（调度器计划、自动领取、额度刷新轮），
+	// 再等 relay 派生的后台任务——顺序是 WaitGroup 契约要求：bgw.Wait 与
+	// 计划 goroutine 里新 spawn 的 goBackground（Add）不得并发，否则计数归零
+	// 后的 Add 会撞上 Wait（-race 直接致命，且任务逃过等待撞上 db.Close）。
+	// 三者的 Stop 都幂等（stopOnce + 有界 join），末尾 defer 再调一次是空操作
+	scheduler.Stop()
+	autoClaim.Stop()
+	pool.Stop()
+	// relay 派生的后台任务（额度刷新/自动重置）会在 handler 返回后继续跑：
+	// 等它们收尾再做 deferred db.Close，否则终态写库（重置成功的
+	// claim record 等）撞上已关闭的库被静默吞掉——稀缺重置槽就白烧了
+	bgDone := make(chan struct{})
+	go func() {
+		zapi.bgw.Wait()
+		close(bgDone)
+	}()
+	select {
+	case <-bgDone:
+	case <-time.After(20 * time.Second):
+		log.Printf("[main] shutdown: background tasks still running after 20s; proceeding")
 	}
 }
 

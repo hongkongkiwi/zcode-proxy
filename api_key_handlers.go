@@ -138,7 +138,17 @@ func (s *APIServer) handleUpdateKey(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	k, _ := s.db.GetGatewayKey(id)
+	k, err := s.db.GetGatewayKey(id)
+	if err != nil {
+		// 更新已落库但回读失败：如实报错而不是 200 + key:null
+		writeAPIError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if k == nil {
+		// 保存期间被并发删除：0 行更新不报错，这里如实 404
+		writeAPIError(w, http.StatusNotFound, "gateway key was deleted during save")
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{"key": k})
 }
 

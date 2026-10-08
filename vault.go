@@ -333,6 +333,33 @@ func (db *DB) scanVaultCiphertext(seed string) (total, broken int, err error) {
 			broken++
 		}
 	}
+	// 代理节点密码同样是可用凭证（威胁模型与账号列一致）：不盘点会漏算——
+	// env 期写入的代理密文在 total==0 时会误触发"无密文→静默生成新 keyfile"，
+	// 之后代理密码永久解不开且无任何告警
+	prows, err := db.conn.Query(`SELECT password FROM proxy_nodes WHERE password LIKE '` + vaultPrefix + `%'`)
+	if err != nil {
+		return total, broken, fmt.Errorf("scan proxy_nodes: %w", err)
+	}
+	for prows.Next() {
+		var val string
+		if prows.Scan(&val) != nil {
+			total++
+			broken++
+			continue
+		}
+		if !strings.HasPrefix(val, vaultPrefix) {
+			continue
+		}
+		total++
+		if _, err := DecryptCredential(encPrefix+strings.TrimPrefix(val, vaultPrefix), seed); err != nil {
+			broken++
+		}
+	}
+	if rErr := prows.Err(); rErr != nil {
+		prows.Close()
+		return total, broken, fmt.Errorf("scan proxy_nodes rows: %w", rErr)
+	}
+	prows.Close()
 	return total, broken, nil
 }
 
@@ -423,6 +450,52 @@ func (db *DB) consolidateMixedVaultRows(keySeed, legacySeed string) (int, int, e
 		}
 		moved++
 	}
+	// 代理节点密码并入 keySeed（与盘点/轮换范围一致）
+	prows, err := tx.Query(`SELECT id, password FROM proxy_nodes WHERE password LIKE '` + vaultPrefix + `%'`)
+	if err != nil {
+		return moved, stuck, fmt.Errorf("consolidate query proxy_nodes: %w", err)
+	}
+	type pendingProxy struct {
+		id  int64
+		enc string
+	}
+	var proxyUpdates []pendingProxy
+	for prows.Next() {
+		var id int64
+		var val string
+		if err := prows.Scan(&id, &val); err != nil {
+			stuck++
+			continue
+		}
+		if !strings.HasPrefix(val, vaultPrefix) {
+			continue
+		}
+		body := encPrefix + strings.TrimPrefix(val, vaultPrefix)
+		if _, kerr := DecryptCredential(body, keySeed); kerr == nil {
+			continue // 已在 keyfile 种子下
+		}
+		plain, lerr := DecryptCredential(body, legacySeed)
+		if lerr != nil {
+			stuck++ // 两种种子都解不开：保持原样等钥匙恢复
+			continue
+		}
+		enc, err := EncryptCredential(plain, keySeed)
+		if err != nil {
+			prows.Close()
+			return moved, stuck, fmt.Errorf("consolidate encrypt proxy id=%d: %w", id, err)
+		}
+		proxyUpdates = append(proxyUpdates, pendingProxy{id: id, enc: vaultPrefix + strings.TrimPrefix(enc, encPrefix)})
+	}
+	prows.Close()
+	if rErr := prows.Err(); rErr != nil {
+		return moved, stuck, rErr
+	}
+	for _, up := range proxyUpdates {
+		if _, err := tx.Exec(`UPDATE proxy_nodes SET password = ? WHERE id = ?`, up.enc, up.id); err != nil {
+			return moved, stuck, fmt.Errorf("consolidate update proxy id=%d: %w", up.id, err)
+		}
+	}
+	moved += len(proxyUpdates)
 	return moved, stuck, tx.Commit()
 }
 
@@ -500,10 +573,53 @@ func (db *DB) reencryptVaultColumns(oldSeed, newSeed string) (int, error) {
 		}
 		moved++
 	}
+	// 代理节点密码一并轮换（与 scanVaultCiphertext 的盘点范围保持一致）
+	prows, err := tx.Query(`SELECT id, password FROM proxy_nodes WHERE password LIKE '` + vaultPrefix + `%'`)
+	if err != nil {
+		return 0, fmt.Errorf("reencrypt query proxy_nodes: %w", err)
+	}
+	type pendingProxy struct {
+		id  int64
+		enc string
+	}
+	var proxyUpdates []pendingProxy
+	for prows.Next() {
+		var id int64
+		var val string
+		if err := prows.Scan(&id, &val); err != nil {
+			prows.Close()
+			return 0, err
+		}
+		if !strings.HasPrefix(val, vaultPrefix) {
+			continue
+		}
+		plain, err := DecryptCredential(encPrefix+strings.TrimPrefix(val, vaultPrefix), oldSeed)
+		if err != nil {
+			prows.Close()
+			return 0, fmt.Errorf("reencrypt decrypt proxy id=%d: %w", id, err)
+		}
+		enc, err := EncryptCredential(plain, newSeed)
+		if err != nil {
+			prows.Close()
+			return 0, fmt.Errorf("reencrypt encrypt proxy id=%d: %w", id, err)
+		}
+		proxyUpdates = append(proxyUpdates, pendingProxy{id: id, enc: vaultPrefix + strings.TrimPrefix(enc, encPrefix)})
+	}
+	prows.Close()
+	if err := prows.Err(); err != nil {
+		return 0, err
+	}
+	for _, u := range proxyUpdates {
+		if _, err := tx.Exec(`UPDATE proxy_nodes SET password = ? WHERE id = ?`, u.enc, u.id); err != nil {
+			return 0, fmt.Errorf("reencrypt update proxy id=%d: %w", u.id, err)
+		}
+	}
+	moved += len(proxyUpdates)
 	return moved, tx.Commit()
 }
 
-// ProbeVaultHealth 启动收尾的健康检查：统计当前种子解不开的密文数量并大声告警
+// ProbeVaultHealth 启动收尾的健康检查：统计当前种子解不开的密文数量并大声告警。
+// 覆盖面 = scanVaultCiphertext（账号凭证列 + 设置机密项 + 代理节点密码），全量
 func (db *DB) ProbeVaultHealth() {
 	_, broken, err := db.scanVaultCiphertext(currentVaultSeed())
 	if err != nil {
@@ -513,17 +629,6 @@ func (db *DB) ProbeVaultHealth() {
 	if broken > 0 {
 		log.Printf("[vault] WARNING: %d credential values cannot be decrypted with the active key "+
 			"(set ZCODE_PROXY_VAULT_SECRET or restore data/vault.key); affected accounts will fail auth until fixed", broken)
-	}
-	// 设置表机密项（网关 sk- 密钥、口令哈希）不在 scanVaultCiphertext 覆盖内，单独体检
-	for _, key := range vaultSecretSettings {
-		var val string
-		if err := db.conn.QueryRow(`SELECT value FROM settings WHERE key = ?`, key).Scan(&val); err != nil || val == "" || !strings.HasPrefix(val, vaultPrefix) {
-			continue
-		}
-		if _, err := DecryptCredential(encPrefix+strings.TrimPrefix(val, vaultPrefix), currentVaultSeed()); err != nil {
-			log.Printf("[vault] WARNING: setting %s cannot be decrypted with the active key "+
-				"(wrong ZCODE_PROXY_VAULT_SECRET or mismatched vault.key); gateway auth and admin login may fail", key)
-		}
 	}
 }
 
@@ -654,6 +759,46 @@ func (db *DB) MigrateVault() error {
 		}
 		hadUpdates = true
 		log.Printf("[vault] encrypted setting %s", key)
+	}
+	// 存量明文代理节点密码一并入库加密（幂等；与账号列同一威胁模型）
+	prows, err := db.conn.Query(`SELECT id, password FROM proxy_nodes WHERE password != '' AND password NOT LIKE '` + vaultPrefix + `%'`)
+	if err != nil {
+		return fmt.Errorf("vault migrate query proxy_nodes: %w", err)
+	}
+	type pendingProxy struct {
+		id  int64
+		enc string
+	}
+	var proxyUpdates []pendingProxy
+	for prows.Next() {
+		var id int64
+		var val string
+		if err := prows.Scan(&id, &val); err != nil {
+			prows.Close()
+			return err
+		}
+		if val == "" || strings.HasPrefix(val, vaultPrefix) {
+			continue
+		}
+		enc, err := EncryptCredential(val, secret)
+		if err != nil {
+			prows.Close()
+			return fmt.Errorf("vault encrypt proxy id=%d: %w", id, err)
+		}
+		proxyUpdates = append(proxyUpdates, pendingProxy{id: id, enc: vaultPrefix + strings.TrimPrefix(enc, encPrefix)})
+	}
+	prows.Close()
+	if err := prows.Err(); err != nil {
+		return err
+	}
+	for _, u := range proxyUpdates {
+		if _, err := db.conn.Exec(`UPDATE proxy_nodes SET password = ? WHERE id = ?`, u.enc, u.id); err != nil {
+			return fmt.Errorf("vault update proxy id=%d: %w", u.id, err)
+		}
+	}
+	if len(proxyUpdates) > 0 {
+		log.Printf("[vault] encrypted %d plaintext proxy node password(s)", len(proxyUpdates))
+		hadUpdates = true
 	}
 	if hadUpdates {
 		// 迁移前的明文会残留在 WAL 与空闲页：checkpoint 截断 WAL，VACUUM 重写并清空 freelist

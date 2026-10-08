@@ -96,6 +96,7 @@ const I18N_EN = {
   '请选择目标账号': 'Please select a target account',
   '打开授权页': 'Open authorization page',
   '账号列表加载失败: %s': 'Failed to load account list: %s',
+  '加载失败: %s': 'Load failed: %s',
   '当前环境不支持自动复制，请手动复制': 'Automatic copy is not supported here; please copy manually',
   '复制失败，请手动复制': 'Copy failed; please copy manually',
   '检测': 'Check',

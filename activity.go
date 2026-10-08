@@ -482,10 +482,10 @@ func (z *ZCodeAPI) claimForAccountLocked(a *Account) *ClaimResult {
 
 	// 领取成功后异步刷新额度
 	if result.OK {
-		go func() {
+		z.goBackground("claim-quota-refresh", func() {
 			time.Sleep(2 * time.Second)
 			z.RefreshAccountQuota(a)
-		}()
+		})
 	}
 	return result
 }

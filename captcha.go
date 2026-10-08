@@ -78,10 +78,15 @@ type CaptchaService struct {
 	config   *CaptchaConfig
 	configAt time.Time
 
-	semMu  sync.Mutex
-	sems   map[string]chan struct{} // key = 出口代理组（容量 1 信号量，组间互不阻塞）
-	manual bool                     // 有头手动模式（自动失败后升级）
+	semMu    sync.Mutex
+	sems     map[string]chan struct{} // key = 出口代理组（容量 1 信号量，组间互不阻塞）
+	manual   bool                     // 有头手动模式（无头连续失败后升级）
+	manualAt time.Time                // 升级时刻（超时衰减回无头，见 captchaManualDecay）
 }
+
+// captchaManualDecay 手动档衰减：升级可能由基础设施类失败（代理抖动/启动超时）
+// 触发，而无显示环境有头启动必败——不衰减会让验证码通道死到进程重启
+const captchaManualDecay = 10 * time.Minute
 
 // NewCaptchaService 创建验证码服务
 func NewCaptchaService(cfg *FileConfig, db *DB, appVersion string) *CaptchaService {
@@ -247,6 +252,13 @@ func (s *CaptchaService) doSolve(a *Account, budget time.Duration) (string, stri
 	mode := s.getSetting("captcha_mode")
 	s.mu.Lock()
 	manual := s.manual
+	// 衰减：升级超 captchaManualDecay 后回到无头重试——基础设施类失败
+	// 不该把无头档永久钉死（无显示环境有头必败，通道会死到重启）
+	if manual && !s.manualAt.IsZero() && time.Since(s.manualAt) > captchaManualDecay {
+		manual = false
+		s.manual = false
+		log.Printf("[captcha] manual mode decayed, retrying headless")
+	}
 	s.mu.Unlock()
 	headless := mode != "manual" && !manual
 
@@ -277,6 +289,7 @@ func (s *CaptchaService) doSolve(a *Account, budget time.Duration) (string, stri
 			headless = false
 			s.mu.Lock()
 			s.manual = true
+			s.manualAt = time.Now()
 			s.mu.Unlock()
 			log.Printf("[captcha] switching to headed manual mode")
 		}
@@ -674,6 +687,10 @@ func browserProfileDirForGroup(group string) string {
 	}
 	sum := sha256.Sum256([]byte(group))
 	dir := filepath.Join(base, hex.EncodeToString(sum[:8]))
-	os.MkdirAll(dir, 0755)
+	// 建目录失败（只读/无权安装位置）静默继续会让每次启动都以晦涩的
+	// "启动浏览器失败"收场，且风控 cookie 持久化悄悄缺失
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		log.Printf("[captcha] browser profile dir %s: %v", dir, err)
+	}
 	return dir
 }

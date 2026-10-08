@@ -184,26 +184,37 @@ func accountPublicView(a *Account) map[string]interface{} {
 		"group": a.AccountGroup, "remark": a.Remark, "priority": accountPriority(a),
 		"plan_tier": a.PlanTier, "plan_expire": a.PlanExpire,
 		"total_units": a.TotalUnits, "used_units": a.UsedUnits, "remaining": a.Remaining,
-		"quota":           quota,
-		"use_count":       a.UseCount,
-		"fail_count":      a.FailCount,
-		"last_used_at":    a.LastUsedAt,
-		"last_checked_at": a.LastCheckedAt,
-		"cooling_until":   a.CoolingUntil,
-		"last_error":      a.LastError,
-		"paid_fallback":     a.PaidFallback,
+		"quota":              quota,
+		"use_count":          a.UseCount,
+		"fail_count":         a.FailCount,
+		"last_used_at":       a.LastUsedAt,
+		"last_checked_at":    a.LastCheckedAt,
+		"cooling_until":      a.CoolingUntil,
+		"last_error":         a.LastError,
+		"paid_fallback":      a.PaidFallback,
 		"paid_cooling_until": a.PaidCoolingUntil,
-		"last_claim_at":   a.LastClaimAt, "last_claim_plan": a.LastClaimPlan, "last_claim_msg": a.LastClaimMsg,
+		"last_claim_at":      a.LastClaimAt, "last_claim_plan": a.LastClaimPlan, "last_claim_msg": a.LastClaimMsg,
 		"created_at": a.CreatedAt, "updated_at": a.UpdatedAt,
 	}
 }
 
 func (s *APIServer) handleListAccounts(w http.ResponseWriter, r *http.Request) {
 	group := r.URL.Query().Get("group")
-	accounts, err := s.db.ListAccounts(group)
+	accounts, err := s.db.ListAccounts("")
 	if err != nil {
 		writeAPIError(w, http.StatusInternalServerError, err.Error())
 		return
+	}
+	// 组过滤走 matchAccountGroup：account_group 允许逗号分隔多组，SQL 精确等值
+	// 会漏掉 "eu,failover" 这类账号（转发/计划/闲时选择均按该语义）
+	if group != "" {
+		filtered := make([]*Account, 0, len(accounts))
+		for _, a := range accounts {
+			if matchAccountGroup(a, group) {
+				filtered = append(filtered, a)
+			}
+		}
+		accounts = filtered
 	}
 	out := make([]map[string]interface{}, 0, len(accounts))
 	for _, a := range accounts {
@@ -562,15 +573,18 @@ func (s *APIServer) handleUpdateAccount(w http.ResponseWriter, r *http.Request) 
 	if body.PaidFallback != nil {
 		paidFallback = *body.PaidFallback
 	}
+	// 全部入参先校验再动笔：否则 priority 非法时 400，但 group/remark/enabled
+	// 已落库——面板以为保存失败，重试时静默保留了上一次"失败"的修改。
+	// 0 不是有效值（accountPriority 会把 0 归一化回默认值，API 却显示保存成功）
+	if body.Priority != nil && (*body.Priority < 1 || *body.Priority > 9999) {
+		writeAPIError(w, http.StatusBadRequest, "priority 取值范围 1-9999")
+		return
+	}
 	if err := s.db.UpdateAccountFields(id, group, remark, enabled, paidFallback); err != nil {
 		writeAPIError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 	if body.Priority != nil {
-		if *body.Priority < 0 || *body.Priority > 9999 {
-			writeAPIError(w, http.StatusBadRequest, "priority 取值范围 1-9999")
-			return
-		}
 		if err := s.db.UpdateAccountPriority(id, *body.Priority); err != nil {
 			writeAPIError(w, http.StatusInternalServerError, err.Error())
 			return
@@ -777,12 +791,16 @@ func (s *APIServer) handlePlanRuns(w http.ResponseWriter, r *http.Request) {
 
 func (s *APIServer) handleClaimRecords(w http.ResponseWriter, r *http.Request) {
 	limit := queryInt(r, "limit", 100)
-	// account_id=0 语义是"不过滤"，不能走 queryInt（会把 0 夹成 1）
+	// account_id 不传 = 不过滤；显式传了就必须是正整数，否则 400
+	// （静默吞掉会让脚本消费者在不知情下拿到全账号数据）
 	accountID := int64(0)
 	if v := r.URL.Query().Get("account_id"); v != "" {
-		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
-			accountID = n
+		n, err := strconv.ParseInt(v, 10, 64)
+		if err != nil || n <= 0 {
+			writeAPIError(w, http.StatusBadRequest, "account_id 须为正整数")
+			return
 		}
+		accountID = n
 	}
 	records, err := s.db.ListClaimRecords(limit, accountID)
 	if err != nil {
@@ -829,7 +847,7 @@ var settingsWhitelist = map[string]bool{
 	"auto_reset_enabled": true, "auto_reset_min_wait_minutes": true, "auto_reset_min_wait_week_hours": true,
 	"max_concurrent_per_account": true,
 	// 免费优先 / 付费回退策略
-	"paid_fallback_mode":   true, "paid_daily_token_cap": true,
+	"paid_fallback_mode": true, "paid_daily_token_cap": true,
 	// 闲时免费通道（off-peak ticket queue）
 	"async_enabled": true, "async_poll_interval_ms": true,
 	"async_keepalive_ms": true, "async_max_retries": true, "async_max_wait_sec": true,
@@ -1010,17 +1028,8 @@ func (s *APIServer) handleSaveProxy(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	// 编辑时密码留空 = 保持原密码
-	if n.ID > 0 && n.Password == "" {
-		if old, err := s.db.ListProxyNodes(); err == nil {
-			for _, o := range old {
-				if o.ID == n.ID {
-					n.Password = o.Password
-					break
-				}
-			}
-		}
-	}
+	// 空密码 = 保持原密码：由 SaveProxyNode 直接跳过密码列实现（读回明文
+	// 再回写会在钥匙缺失期把解不开的密文冲成 ''，永久销毁）
 	id, err := s.db.SaveProxyNode(&n)
 	if err != nil {
 		writeAPIError(w, http.StatusInternalServerError, err.Error())
@@ -1123,7 +1132,14 @@ func (s *APIServer) handleCaptchaSolve(w http.ResponseWriter, r *http.Request) {
 	}
 	var a *Account
 	if body.AccountID > 0 {
-		a, _ = s.db.GetAccount(body.AccountID)
+		var err error
+		a, err = s.db.GetAccount(body.AccountID)
+		// 静默降级到全局代理会在错误的出口 IP 下解题并缓存，后续该组账号
+		// 重放必然触发风控：显式 404 而不是 nil 账号继续
+		if err != nil || a == nil {
+			writeAPIError(w, http.StatusNotFound, "account not found")
+			return
+		}
 	}
 	param, region, err := s.captcha.GetVerifyParam(a)
 	if err != nil {

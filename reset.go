@@ -41,15 +41,17 @@ type ResetStatus struct {
 	HasUnreadHistory        bool        `json:"has_unread_history"`
 }
 
-// resetHeaders AC() 移植：双凭证 + 团队上下文
+// resetHeaders AC() 移植：双凭证 + 团队上下文。
+// 凭证走锁保护快照：本副本可能同时被刷新 goroutine setCredentials 改写
 func (z *ZCodeAPI) resetHeaders(a *Account) map[string]string {
+	jwt, apiKey, _ := a.credentialSnapshot()
 	h := map[string]string{
-		"Authorization": "Bearer " + a.ZCodeJWT,
+		"Authorization": "Bearer " + jwt,
 		"User-Agent":    "ZCode/" + z.appVersion,
 		"accept":        "application/json",
 	}
-	if a.APIKey != "" {
-		h["X-Bigmodel-Authorization"] = a.APIKey
+	if apiKey != "" {
+		h["X-Bigmodel-Authorization"] = apiKey
 	}
 	// 团队上下文：账号备注/分组中以 team:orgId:projId 形式声明时启用
 	if org, proj, ok := parseTeamContext(a); ok {
@@ -107,7 +109,8 @@ func (z *ZCodeAPI) resetRequest(a *Account, method, path string, body map[string
 
 // FetchResetStatus GET reset/status
 func (z *ZCodeAPI) FetchResetStatus(a *Account) (*ResetStatus, int, string, error) {
-	if a.ZCodeJWT == "" {
+	// 锁保护读：本副本可能正被并发刷新 goroutine setCredentials 改写
+	if jwt, _, _ := a.credentialSnapshot(); jwt == "" {
 		return nil, 0, "", fmt.Errorf("需要 ZCode JWT")
 	}
 	v, status, err := z.resetRequest(a, "GET", "/status", nil)
@@ -165,6 +168,7 @@ func (z *ZCodeAPI) ResetForAccount(a *Account) *ClaimResult {
 }
 
 func (z *ZCodeAPI) resetForAccountLocked(a *Account) *ClaimResult {
+	// UsedAt 在成功时精确落执行时刻（见下方成功分支），供同步去重精确匹配
 	record := &ClaimRecord{AccountID: a.ID, Email: a.Email, TaskType: "reset"}
 	st, _, bizMsg, err := z.FetchResetStatus(a)
 	if err != nil {
@@ -204,13 +208,14 @@ func (z *ZCodeAPI) resetForAccountLocked(a *Account) *ClaimResult {
 	record.Success = true
 	record.PlanName = "配额重置(" + resetType + ")"
 	record.Message = "重置成功，配额已恢复"
+	record.UsedAt = time.Now().Unix() // 同步去重走精确匹配（localtime 墙钟回退在 DST 期会漂移）
 	z.db.InsertClaimRecord(record)
 	z.db.SetAccountClaimResult(a.ID, record.PlanName, record.Message)
 	log.Printf("[reset] account %s quota reset via %s", a.Email, resetType)
-	go func() {
+	z.goBackground("reset-quota-refresh", func() {
 		time.Sleep(2 * time.Second)
 		z.RefreshAccountQuota(a)
-	}()
+	})
 	return &ClaimResult{OK: true, PlanName: record.PlanName, Message: record.Message}
 }
 

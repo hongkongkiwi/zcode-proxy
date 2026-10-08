@@ -25,6 +25,7 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -556,7 +557,9 @@ func (z *ZCodeAPI) offPeakBridge(w http.ResponseWriter, r *http.Request, a *Acco
 			}
 			z.pool.MarkInvalid(a, msg)
 		case strings.Contains(s, "HTTP 429"):
-			z.pool.MarkCooling(a, msg, 30)
+			// 取票 429 = 队列饱和（与转发路径 3105 同性质），不是账号健康问题：
+			// 全局冷却会把 /async 的拥塞传染给主 /v1 免费通道（账号物理健康）
+			log.Printf("[async] account %s take rate-limited (queue saturation), no cooldown: %s", a.DisplayNameOrEmail(), truncate(msg, 120))
 		case strings.Contains(s, "HTTP"):
 			z.pool.MarkFailed(a, msg)
 		default:
@@ -600,6 +603,7 @@ func (z *ZCodeAPI) offPeakBridge(w http.ResponseWriter, r *http.Request, a *Acco
 	log.Printf("[async] account %s took ticket %s… state=%s pos=%d", a.DisplayNameOrEmail(), safePrefixLog(ticket.ID, 8), ticket.State, ticket.Position)
 
 	pollFailures := 0
+	nextKeepalive := time.Time{} // 跨轮询迭代持有：保活到期不因每次调用重派而失效
 	for attempt := 0; ; attempt++ {
 		// WAIT：票未就绪时轮询 + 保活
 		for !offPeakStateReady(ticket.State) && !offPeakStateTerminal(ticket.State) {
@@ -614,7 +618,18 @@ func (z *ZCodeAPI) offPeakBridge(w http.ResponseWriter, r *http.Request, a *Acco
 			if ticket.NextPollSec > 0 {
 				sleep = time.Duration(ticket.NextPollSec) * time.Second
 			}
-			if !offPeakWait(ctx, sleep, keepalive, func() { fmt.Fprint(w, ": keepalive\n\n"); flushWriter(w) }, opts.clientStream) {
+			// 服务端建议的轮询间隔是变量（官方客户端钳制 5s~5min）：
+			// 不设上界时一条 next_poll_after=3600 能把 30min 预算顶穿 2 倍，
+			// max_wait_sec=0 时更完全不设限；且 sleep 须让位于硬截止
+			if sleep > 5*time.Minute {
+				sleep = 5 * time.Minute
+			}
+			if !hardDeadline.IsZero() {
+				if d := time.Until(hardDeadline); d < sleep {
+					sleep = d
+				}
+			}
+			if !offPeakWait(ctx, sleep, keepalive, func() { fmt.Fprint(w, ": keepalive\n\n"); flushWriter(w) }, opts.clientStream, &nextKeepalive) {
 				settleCur()
 				return outcomeUpstreamError
 			}
@@ -681,10 +696,14 @@ func (z *ZCodeAPI) offPeakBridge(w http.ResponseWriter, r *http.Request, a *Acco
 }
 
 // offPeakWait 等待 min(sleep) 或保活周期；emitKeepalive 在保活到期时被调用。
+// nextKeepalive 由调用方跨调用持有（零值 = 首次，按 keepalive 初始化）——
+// 在函数内重派会让秒级轮询下保活永不触发，中间设备空闲超时掐断连接
 // 返回 false 表示客户端已断开。
-func offPeakWait(ctx context.Context, sleep, keepalive time.Duration, emitKeepalive func(), stream bool) bool {
+func offPeakWait(ctx context.Context, sleep, keepalive time.Duration, emitKeepalive func(), stream bool, nextKeepalive *time.Time) bool {
 	deadline := time.Now().Add(sleep)
-	nextKeepalive := time.Now().Add(keepalive)
+	if nextKeepalive != nil && nextKeepalive.IsZero() {
+		*nextKeepalive = time.Now().Add(keepalive)
+	}
 	if !stream {
 		timer := time.NewTimer(time.Until(deadline))
 		defer timer.Stop()
@@ -710,9 +729,9 @@ func offPeakWait(ctx context.Context, sleep, keepalive time.Duration, emitKeepal
 		timer := time.NewTimer(wait)
 		select {
 		case <-timer.C:
-			if !time.Now().Before(nextKeepalive) && time.Now().Before(deadline) {
+			if !time.Now().Before(*nextKeepalive) && time.Now().Before(deadline) {
 				emitKeepalive()
-				nextKeepalive = time.Now().Add(keepalive)
+				*nextKeepalive = time.Now().Add(keepalive)
 			}
 			timer.Stop()
 		case <-ctx.Done():
@@ -779,6 +798,13 @@ func (z *ZCodeAPI) offPeakForward(w http.ResponseWriter, r *http.Request, a *Acc
 
 	switch {
 	case resp.StatusCode == 401 || resp.StatusCode == 403:
+		// Cloudflare/WAF 挑战页与凭证失效同状态码：先按挑战分类（与主转发
+		// relay 同款），不能掉进下方 401/403 分支把健康账号误标 invalid
+		chalBody, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+		if isCloudflareChallenge(resp.Header, string(chalBody)) {
+			z.pool.MarkCooling(a, fmt.Sprintf("Cloudflare/WAF 挑战 HTTP %d（闲时通道）", resp.StatusCode), 300)
+			return outcomeNextAccount
+		}
 		// 与主转发/取票路径同一恢复优先策略：先试 refresh_token 兑换
 		if ok, inflight := z.tryRefreshAccount(a); ok || inflight {
 			return outcomeNextAccount
@@ -800,12 +826,13 @@ func (z *ZCodeAPI) offPeakForward(w http.ResponseWriter, r *http.Request, a *Acc
 				}
 			}
 			log.Printf("[async] 429/3105 upstream saturation; same-ticket retry in %s", wait)
+			nextKA := time.Time{}
 			if !offPeakWait(r.Context(), wait, 15*time.Second, func() {
 				if opts.clientStream {
 					fmt.Fprint(w, ": keepalive\n\n")
 					flushWriter(w)
 				}
-			}, opts.clientStream) {
+			}, opts.clientStream, &nextKA) {
 				return outcomeUpstreamError
 			}
 			return outcomeTicketRetry
@@ -1010,8 +1037,15 @@ func aggregateAnthropicStream(r io.Reader) ([]byte, *StreamUsage, error) {
 		case "content_block_stop":
 			idx := toInt(ev.Data["index"])
 			if b, ok := agg.toolJSON[idx]; ok {
-				var parsed interface{}
-				if err := json.Unmarshal([]byte(b.String()), &parsed); err == nil {
+				// 仅在有增量缓冲时覆盖：上游常在 start 帧自带完整 input（已落盘
+				// 兜底），空缓冲解不出东西，覆盖会把合法 input 冲成 {}
+				if raw := b.String(); raw != "" {
+					var parsed interface{}
+					if err := json.Unmarshal([]byte(raw), &parsed); err != nil || parsed == nil {
+						// 解析失败或字面量 "null"（Unmarshal 成功但得 nil）：一律空对象，
+						// 客户端工具执行器期待 input 为对象
+						parsed = map[string]interface{}{}
+					}
 					agg.blocks[idx]["input"] = parsed
 				}
 				delete(agg.toolJSON, idx)
@@ -1070,6 +1104,32 @@ func aggregateAnthropicStream(r io.Reader) ([]byte, *StreamUsage, error) {
 		}
 	}
 	p.flush(onEvent)
+	// 干净 EOF 但缺 content_block_stop（上游违例）：冲刷残留的工具参数缓冲，
+	// 否则完整 JSON 被丢弃、合成出 input:{} 的 tool_use（客户端空参执行工具）
+	if len(agg.toolJSON) > 0 {
+		idxs := make([]int, 0, len(agg.toolJSON))
+		for idx := range agg.toolJSON {
+			idxs = append(idxs, idx)
+		}
+		sort.Ints(idxs)
+		for _, idx := range idxs {
+			if b, ok := agg.toolJSON[idx]; ok {
+				if idx >= len(agg.blocks) || agg.blocks[idx] == nil {
+					delete(agg.toolJSON, idx)
+					continue
+				}
+				// 同 content_block_stop：空缓冲不覆盖 start 帧自带的合法 input
+				if raw := b.String(); raw != "" {
+					var parsed interface{}
+					if err := json.Unmarshal([]byte(raw), &parsed); err != nil || parsed == nil {
+						parsed = map[string]interface{}{}
+					}
+					agg.blocks[idx]["input"] = parsed
+				}
+				delete(agg.toolJSON, idx)
+			}
+		}
+	}
 	content := make([]interface{}, 0, len(agg.blocks))
 	for _, b := range agg.blocks {
 		if b != nil {
@@ -1078,6 +1138,11 @@ func aggregateAnthropicStream(r io.Reader) ([]byte, *StreamUsage, error) {
 	}
 	if agg.streamError != "" {
 		return nil, partialUsage(agg), fmt.Errorf("%s", agg.streamError)
+	}
+	// 零事件的干净 EOF（裸注释帧后直接关闭）：聚合成 200 空 message 同样是
+	// "把死流伪装成成功"——不满足 message_start 必至的一律按失败处理
+	if agg.id == "" && len(agg.blocks) == 0 {
+		return nil, partialUsage(agg), fmt.Errorf("upstream stream ended without any events")
 	}
 	sr := agg.stopReason
 	if sr == "" {
@@ -1124,7 +1189,9 @@ func newUsageSniffReader(r io.Reader) *usageSniffReader { return &usageSniffRead
 
 func (u *usageSniffReader) usage() *StreamUsage {
 	u.flushPeek()
-	if u.acc.InputTokens == 0 && u.acc.OutputTokens == 0 {
+	// 无 usage 帧但有内联错误：照样返回——否则 ERR: 标记随 nil 丢失，
+	// 失败流会被记成干净的 200 成功
+	if u.acc.InputTokens == 0 && u.acc.OutputTokens == 0 && !strings.HasPrefix(u.acc.StopReason, "ERR:") {
 		return nil
 	}
 	cp := u.acc
@@ -1158,13 +1225,17 @@ func (u *usageSniffReader) sniffLine(line string) {
 		} `json:"error"`
 		Message struct {
 			Usage struct {
-				InputTokens  int `json:"input_tokens"`
-				OutputTokens int `json:"output_tokens"`
+				InputTokens              int `json:"input_tokens"`
+				OutputTokens             int `json:"output_tokens"`
+				CacheReadInputTokens     int `json:"cache_read_input_tokens"`
+				CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
 			} `json:"usage"`
 		} `json:"message"`
 		Usage struct {
-			InputTokens  int `json:"input_tokens"`
-			OutputTokens int `json:"output_tokens"`
+			InputTokens              int `json:"input_tokens"`
+			OutputTokens             int `json:"output_tokens"`
+			CacheReadInputTokens     int `json:"cache_read_input_tokens"`
+			CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
 		} `json:"usage"`
 		Delta struct {
 			StopReason string `json:"stop_reason"`
@@ -1181,9 +1252,22 @@ func (u *usageSniffReader) sniffLine(line string) {
 		} else if u.acc.StopReason == "" || !strings.HasPrefix(u.acc.StopReason, "ERR:") {
 			u.acc.StopReason = "ERR:upstream stream error"
 		}
+	default:
+		// 无 type 但带 error 键的帧（网关封套形状不一，与 isErrorEnvelope
+		// 同理）：同样记 ERR 标记，失败流不得被记成干净的 200 成功
+		if v.Type == "" && v.Error.Message != "" {
+			u.acc.StopReason = "ERR:" + v.Error.Message
+		}
 	case "message_start":
 		if v.Message.Usage.InputTokens > u.acc.InputTokens {
 			u.acc.InputTokens = v.Message.Usage.InputTokens
+		}
+		// R3 缓存计量：与主路径同 max 语义（否则闲时流的缓存 token 恒为 0）
+		if v.Message.Usage.CacheReadInputTokens > u.acc.CacheReadTokens {
+			u.acc.CacheReadTokens = v.Message.Usage.CacheReadInputTokens
+		}
+		if v.Message.Usage.CacheCreationInputTokens > u.acc.CacheCreationTokens {
+			u.acc.CacheCreationTokens = v.Message.Usage.CacheCreationInputTokens
 		}
 	case "message_delta":
 		if v.Usage.OutputTokens > 0 {
@@ -1191,6 +1275,12 @@ func (u *usageSniffReader) sniffLine(line string) {
 		}
 		if v.Usage.InputTokens > u.acc.InputTokens {
 			u.acc.InputTokens = v.Usage.InputTokens
+		}
+		if v.Usage.CacheReadInputTokens > u.acc.CacheReadTokens {
+			u.acc.CacheReadTokens = v.Usage.CacheReadInputTokens
+		}
+		if v.Usage.CacheCreationInputTokens > u.acc.CacheCreationTokens {
+			u.acc.CacheCreationTokens = v.Usage.CacheCreationInputTokens
 		}
 		// 已标记的内联错误（ERR: 前缀）不被后续 delta 的 stop_reason 掩盖
 		if v.Delta.StopReason != "" && !strings.HasPrefix(u.acc.StopReason, "ERR:") {

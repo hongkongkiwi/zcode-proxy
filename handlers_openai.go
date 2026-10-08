@@ -305,8 +305,12 @@ func openaiToAnthropic(body map[string]interface{}) (map[string]interface{}, err
 				}
 				switch pm["type"] {
 				case "text":
+					// 与字符串形态同理：空 text 块会被 Anthropic schema 拒绝（"at least 1 character"），
+					// 数组形态的 text:""/null 也必须跳过而不是转发整单 400
 					t, _ := pm["text"].(string)
-					blocks = append(blocks, map[string]interface{}{"type": "text", "text": t})
+					if t != "" {
+						blocks = append(blocks, map[string]interface{}{"type": "text", "text": t})
+					}
 				case "image_url":
 					iu, _ := pm["image_url"].(map[string]interface{})
 					u, _ := iu["url"].(string)
@@ -329,6 +333,11 @@ func openaiToAnthropic(body map[string]interface{}) (map[string]interface{}, err
 						// 与客户端发送的不一致
 						return nil, errString("image_url must be an object with a data: base64 URL; other image forms are not supported by the upstream")
 					}
+				default:
+					// 未知 part 类型显式报错（与 image_url fail-closed 同理）：
+					// 静默跳过 = 纯该类消息整体消失，多轮对话模型看到缺块对话
+					pt, _ := pm["type"].(string)
+					return nil, errString("unsupported content part type: " + pt + "; the upstream supports only text and image_url parts")
 				}
 			}
 		}
@@ -374,13 +383,9 @@ func openaiToAnthropic(body map[string]interface{}) (map[string]interface{}, err
 			blocks = replayThinkingBlocks(blocks)
 		}
 		if len(blocks) > 0 {
-			item := map[string]interface{}{"role": role, "content": blocks}
-			if role == "assistant" {
-				if name, ok := msg["name"].(string); ok && name != "" {
-					item["name"] = name
-				}
-			}
-			messages = append(messages, item)
+			// 不转发 OpenAI 的 message.name：Anthropic messages schema 只有 role/content，
+			// 未知字段会被上游整单拒绝
+			messages = append(messages, map[string]interface{}{"role": role, "content": blocks})
 		}
 	}
 
@@ -391,16 +396,17 @@ func openaiToAnthropic(body map[string]interface{}) (map[string]interface{}, err
 	if len(systemParts) > 0 {
 		out["system"] = strings.Join(systemParts, "\n\n")
 	}
-	if mt, ok := body["max_tokens"]; ok && mt != nil {
-		out["max_tokens"] = mt
-	} else if mct, ok := body["max_completion_tokens"]; ok && mct != nil {
+	if mct, ok := body["max_completion_tokens"]; ok && mct != nil {
+		// 新字段优先（OpenAI 语义）：请求模板残留的旧 max_tokens 不得覆盖调用方显式设置
 		out["max_tokens"] = mct
-	} else if mt == nil && mct == nil {
+	} else if mt, ok := body["max_tokens"]; ok && mt != nil {
+		out["max_tokens"] = mt
+	} else if mct == nil && mt == nil {
 		// 显式 null 等同未提供：交给 normalizeBody 补默认值，而不是 400
 		out["max_tokens"] = float64(4096)
 	}
 	if t, ok := body["temperature"]; ok && t != nil {
-		out["temperature"] = t
+		out["temperature"] = clampOpenAITemperature(t)
 	}
 	if tp, ok := body["top_p"]; ok && tp != nil {
 		out["top_p"] = tp
@@ -519,10 +525,30 @@ func asBlockList(v interface{}) []map[string]interface{} {
 
 // ---- 请求体转换：OpenAI Responses → Anthropic Messages ----
 
-func responsesContentToText(content interface{}) string {
+// clampOpenAITemperature OpenAI 规格允许 [0,2]，Anthropic/Z.ai 上游只收 0..1：
+// 超范围值是确定性 400，且会记到健康账号头上（MarkFailed 计失败）。
+// 夹紧而非拒绝，保持 OpenAI 客户端兼容
+func clampOpenAITemperature(v interface{}) interface{} {
+	tv, ok := v.(float64)
+	if !ok {
+		return v
+	}
+	if tv > 1 {
+		return float64(1)
+	}
+	if tv < 0 {
+		return float64(0)
+	}
+	return tv
+}
+
+// responsesContentToText 提取文本部分；图片 part（input_image）显式报错而非静默丢弃——
+// 否则纯图片消息整体消失（"input must contain at least one message"），多轮对话里
+// 模型看到的是缺图的对话（与 chat 路径对不支持图片形态的 fail-closed 处理一致）
+func responsesContentToText(content interface{}) (string, error) {
 	switch c := content.(type) {
 	case string:
-		return c
+		return c, nil
 	case []interface{}:
 		var parts []string
 		for _, p := range c {
@@ -530,15 +556,18 @@ func responsesContentToText(content interface{}) string {
 			if !ok {
 				continue
 			}
+			if pm["type"] == "input_image" {
+				return "", errString("input_image parts are not supported on /v1/responses by the upstream; use /v1/chat/completions with a data: base64 image_url instead")
+			}
 			for _, k := range []string{"text", "input_text", "output_text"} {
 				if s, ok := pm[k].(string); ok && s != "" {
 					parts = append(parts, s)
 				}
 			}
 		}
-		return strings.Join(parts, "\n")
+		return strings.Join(parts, "\n"), nil
 	}
-	return ""
+	return "", nil
 }
 
 func responsesToAnthropic(body map[string]interface{}) (map[string]interface{}, error) {
@@ -566,7 +595,10 @@ func responsesToAnthropic(body map[string]interface{}) (map[string]interface{}, 
 			role, _ := im["role"].(string)
 			switch {
 			case itemType == "message" || role == "user" || role == "assistant" || role == "system" || role == "developer":
-				text := responsesContentToText(im["content"])
+				text, err := responsesContentToText(im["content"])
+				if err != nil {
+					return nil, err
+				}
 				if text == "" {
 					if s, ok := im["content"].(string); ok {
 						text = s
@@ -581,7 +613,10 @@ func responsesToAnthropic(body map[string]interface{}) (map[string]interface{}, 
 				}
 			case itemType == "function_call_output":
 				callID := firstNonEmpty(jsonStr(im, "call_id"), jsonStr(im, "tool_call_id"))
-				output := responsesContentToText(im["output"])
+				output, err := responsesContentToText(im["output"])
+				if err != nil {
+					return nil, err
+				}
 				if callID != "" {
 					messages = append(messages, map[string]interface{}{
 						"role": "tool", "tool_call_id": callID, "content": output,
@@ -626,7 +661,7 @@ func responsesToAnthropic(body map[string]interface{}) (map[string]interface{}, 
 		chatBody["max_tokens"] = mt
 	}
 	if t, ok := body["temperature"]; ok && t != nil {
-		chatBody["temperature"] = t
+		chatBody["temperature"] = clampOpenAITemperature(t)
 	}
 	if tp, ok := body["top_p"]; ok && tp != nil {
 		chatBody["top_p"] = tp

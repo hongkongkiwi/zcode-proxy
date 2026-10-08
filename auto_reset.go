@@ -36,15 +36,20 @@ func autoResetShouldSpend(waitKnown bool, waitSeconds int64, thresholdSeconds in
 	return waitSeconds >= thresholdSeconds
 }
 
-// autoResetWait 从账号额度快照取自然窗口重置等待（秒）；未知返回 ok=false
+// autoResetWait 从账号额度快照取自然窗口重置等待（秒）；未知返回 ok=false。
+// QuotaJSON 由额度刷新 goroutine 持锁改写（setQuota），必须锁内取快照：
+// string 头两字非原子，撕裂读取会 segfault 或喂错重置决策
 func autoResetWait(a *Account) (int64, bool) {
-	if a.QuotaJSON == "" {
+	a.mu.Lock()
+	quotaJSON := a.QuotaJSON
+	a.mu.Unlock()
+	if quotaJSON == "" {
 		return 0, false
 	}
 	var ov struct {
 		NextReset int64 `json:"next_reset"`
 	}
-	if json.Unmarshal([]byte(a.QuotaJSON), &ov) != nil || ov.NextReset <= 0 {
+	if json.Unmarshal([]byte(quotaJSON), &ov) != nil || ov.NextReset <= 0 {
 		return 0, false
 	}
 	wait := ov.NextReset - time.Now().Unix()
@@ -60,7 +65,8 @@ func (z *ZCodeAPI) MaybeAutoReset(a *Account, trigger string) {
 	if v, _ := z.db.GetSetting("auto_reset_enabled"); v != "1" {
 		return
 	}
-	if a.Status != StatusExhausted {
+	// 锁保护读：a 可能正被并发额度刷新 goroutine 改写状态
+	if status, _ := a.statusError(); status != StatusExhausted {
 		return
 	}
 
@@ -108,8 +114,29 @@ func (z *ZCodeAPI) MaybeAutoReset(a *Account, trigger string) {
 		return
 	}
 
+	// 动笔前以库内最新状态复核：402 触发时 relay 同时拉起配额刷新，
+	// 瞬时误报可能已被并发刷新恢复 active——此时绝不消耗重置槽位
+	fresh, ferr := z.db.GetAccount(a.ID)
+	if ferr != nil {
+		log.Printf("[auto-reset] %s re-read: %v", a.DisplayNameOrEmail(), ferr)
+		return
+	}
+	if fresh.Status != StatusExhausted {
+		log.Printf("[auto-reset] %s: no longer exhausted (concurrent refresh recovered), keeping reset slot", a.DisplayNameOrEmail())
+		return
+	}
+
+	// 配额刷新仍在单飞中：等下一轮 debounce 再评估。刷新可能恰好把账号恢复
+	// active——此刻烧重置就是白烧一个稀缺槽位（fresh 重读只覆盖已落库的恢复）
+	if _, busy := z.quotaRefreshInflight.Load(a.ID); busy {
+		log.Printf("[auto-reset] %s: quota refresh in flight, deferring", a.DisplayNameOrEmail())
+		return
+	}
+
 	used, _, msg, err := z.UseReset(a, resetType)
-	record := &ClaimRecord{AccountID: a.ID, Email: a.Email, TaskType: "reset"}
+	// UsedAt 精确落本地执行时刻：同步去重优先精确匹配，免去 localtime
+	// 墙钟换算（DST 切换时窗口会漂移出重复行）
+	record := &ClaimRecord{AccountID: a.ID, Email: a.Email, TaskType: "reset", UsedAt: time.Now().Unix()}
 	if err != nil || !used {
 		record.Message = fmt.Sprintf("自动重置执行失败(%s): %v %s", resetType, err, msg)
 		z.db.InsertClaimRecord(record)
@@ -123,10 +150,10 @@ func (z *ZCodeAPI) MaybeAutoReset(a *Account, trigger string) {
 	z.db.InsertClaimRecord(record)
 	z.db.SetAccountClaimResult(a.ID, record.PlanName, record.Message)
 	log.Printf("[auto-reset] %s: quota restored via %s (trigger=%s)", a.DisplayNameOrEmail(), resetType, trigger)
-	go func() {
+	z.goBackground("auto-reset-quota", func() {
 		time.Sleep(2 * time.Second)
 		z.RefreshAccountQuota(a)
-	}()
+	})
 }
 
 // settingInt 整数设置读取（非法/缺失回落默认）

@@ -69,10 +69,19 @@ var errSSEOverflow = errors.New("sse buffer overflow")
 
 // sseParser 增量 SSE 帧解析器（处理跨 chunk 断帧，兼容 LF/CRLF）
 type sseParser struct {
-	buf strings.Builder
+	buf     strings.Builder
+	bomDone bool
 }
 
 func (p *sseParser) feed(chunk []byte, fn func(sseEvent)) error {
+	if !p.bomDone {
+		p.bomDone = true
+		// 首帧 BOM 不剥离会让 "data:" 前缀匹配失败，丢掉携带 usage 的
+		// message_start（该流用量全记 0）
+		if len(chunk) >= 3 && chunk[0] == 0xEF && chunk[1] == 0xBB && chunk[2] == 0xBF {
+			chunk = chunk[3:]
+		}
+	}
 	p.buf.Write(chunk)
 	p.drain(fn)
 	// 缓冲上限：上游持续不发空行分隔时防止无界增长（OOM 面），按流失败处理
@@ -299,6 +308,11 @@ func finalizeToolCalls(usage *StreamUsage) {
 		if raw != "" {
 			var parsed map[string]interface{}
 			if json.Unmarshal([]byte(raw), &parsed) == nil {
+				if parsed == nil {
+					// 字面量 "null"：Unmarshal 成功但得 nil，客户端工具执行器
+					// 期待对象（与非流式路径的 input 缺省修复同因）
+					parsed = map[string]interface{}{}
+				}
 				call["input"] = parsed
 			}
 		}
@@ -651,8 +665,13 @@ func (z *ZCodeAPI) streamOpenAI(w http.ResponseWriter, flusher http.Flusher, res
 				writeChunk(map[string]interface{}{"reasoning_content": t}, nil, nil)
 			case "input_json_delta":
 				srcIdx := toInt(ev.Data["index"])
+				// 未开过工具块的 index 收到参数增量（上游协议违例）：忽略本事件，
+				// 否则按零值落 index 0、污染第一个工具的累计参数
+				toolIdx, isTool := toolIndices[srcIdx]
+				if !isTool {
+					return
+				}
 				toolArgsSeen[srcIdx] = true
-				toolIdx := toolIndices[srcIdx]
 				pj, _ := delta["partial_json"].(string)
 				writeChunk(map[string]interface{}{
 					"tool_calls": []map[string]interface{}{{
@@ -721,7 +740,29 @@ func (z *ZCodeAPI) streamOpenAI(w http.ResponseWriter, flusher http.Flusher, res
 	if first {
 		writeChunk(map[string]interface{}{"role": "assistant", "content": ""}, nil, nil)
 	}
-	writeChunk(map[string]interface{}{}, openaiFinish(usage.StopReason), nil)
+	// 干净 EOF 但缺 content_block_stop（上游违例）：补发 start 自带的完整参数，
+	// 否则客户端拿到 arguments:"" 且 finish_reason:tool_calls，json.loads 直接炸
+	pending := make([]int, 0, len(toolIndices))
+	for srcIdx := range toolIndices {
+		if !toolArgsSeen[srcIdx] {
+			pending = append(pending, srcIdx)
+		}
+	}
+	sort.Ints(pending)
+	for _, srcIdx := range pending {
+		toolArgsSeen[srcIdx] = true
+		args := toolStartArgs[srcIdx]
+		if args == "" {
+			args = "{}"
+		}
+		writeChunk(map[string]interface{}{
+			"tool_calls": []map[string]interface{}{{
+				"index":    toolIndices[srcIdx],
+				"function": map[string]interface{}{"arguments": args},
+			}},
+		}, nil, nil)
+	}
+	writeChunk(map[string]interface{}{}, openaiFinish(usage.StopReason, len(usage.ToolCalls) > 0), nil)
 	if includeUsage {
 		finalUsage := map[string]interface{}{
 			"prompt_tokens":     usage.InputTokens,
@@ -906,7 +947,9 @@ func (z *ZCodeAPI) streamResponses(w http.ResponseWriter, flusher http.Flusher, 
 			arguments = "{}"
 		}
 		var parsed map[string]interface{}
-		if json.Unmarshal([]byte(arguments), &parsed) != nil {
+		if err := json.Unmarshal([]byte(arguments), &parsed); err != nil || parsed == nil {
+			// 解析失败或字面量 "null"（Unmarshal 成功但得 nil）：一律空对象，
+			// 客户端工具执行器期待 input 为对象
 			parsed = map[string]interface{}{}
 		}
 		usage.ToolCalls = append(usage.ToolCalls, map[string]interface{}{
@@ -959,9 +1002,14 @@ func (z *ZCodeAPI) streamResponses(w http.ResponseWriter, flusher http.Flusher, 
 				usage.thinkBufs[idx] = &strings.Builder{}
 			}
 			if kind == "tool_use" {
+				// 未正常关闭的 text/thinking 块先收尾，保证事件序列的 output_index
+				// 单调（上游违例交错的兜底）；map 遍历无序，按 index 排序
+				stale := make([]int, 0, len(blocks))
 				for i := range blocks {
-					// 未正常关闭的 text/thinking 块先收尾，保证事件序列
-					// 的 output_index 单调（上游违例交错的兜底）
+					stale = append(stale, i)
+				}
+				sort.Ints(stale)
+				for _, i := range stale {
 					if blocks[i].kind == "text" && blocks[i].itemID != "" {
 						closeMessageEvents(i)
 					} else if blocks[i].kind == "thinking" && blocks[i].itemID != "" {
@@ -1142,11 +1190,19 @@ func (z *ZCodeAPI) streamResponses(w http.ResponseWriter, flusher http.Flusher, 
 
 // ---- OpenAI 响应构造 ----
 
-func openaiFinish(stopReason string) string {
+// openaiFinish stop_reason → OpenAI finish_reason。空 reason 但携带工具调用
+// 时按 tool_calls 收尾（上游缺 message_delta 的违例流）：Agents 类客户端以
+// finish_reason 驱动工具循环，错报 "stop" 会让会话无错卡死
+func openaiFinish(stopReason string, hasToolCalls bool) string {
 	switch stopReason {
 	case "max_tokens":
 		return "length"
+	case "refusal":
+		return "content_filter"
 	case "tool_use":
+		return "tool_calls"
+	}
+	if hasToolCalls {
 		return "tool_calls"
 	}
 	return "stop"
@@ -1178,8 +1234,10 @@ func openaiResponse(model, text, thinking string, usage *StreamUsage) map[string
 	}
 	in, out := 0, 0
 	stop := ""
+	hasTools := false
 	if usage != nil {
 		in, out, stop = usage.InputTokens, usage.OutputTokens, usage.StopReason
+		hasTools = len(usage.ToolCalls) > 0
 	}
 	return map[string]interface{}{
 		"id":      "chatcmpl-" + randomHex(12),
@@ -1187,7 +1245,7 @@ func openaiResponse(model, text, thinking string, usage *StreamUsage) map[string
 		"created": time.Now().Unix(),
 		"model":   model,
 		"choices": []map[string]interface{}{{
-			"index": 0, "message": message, "finish_reason": openaiFinish(stop),
+			"index": 0, "message": message, "finish_reason": openaiFinish(stop, hasTools),
 		}},
 		"usage": map[string]interface{}{
 			"prompt_tokens": in, "completion_tokens": out, "total_tokens": in + out,

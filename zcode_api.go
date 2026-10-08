@@ -8,6 +8,8 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -42,9 +44,27 @@ type ZCodeAPI struct {
 
 	quotaRefreshInflight sync.Map // 账号ID → 刷新中（单飞，防并发请求对 billing 形成风暴）
 
+	bgw sync.WaitGroup // relay 派生的后台任务（停机时 db.Close 前有界等待）
+
 	asyncRotation atomic.Int64 // 闲时通道轮转起点（并发请求分摊账号）
 
 	tokenRefreshInflight sync.Map // 账号ID → refresh_token 兑换中（单飞）
+}
+
+// goBackground 转发路径派生的后台任务（额度刷新/自动重置）：panic 隔离 +
+// 停机计数。main 在 HTTP 排水后、db.Close 前等待 bgw，终态写库（如重置成功
+// 后的 claim record）才不会撞上已关闭的连接被静默吞掉。
+func (z *ZCodeAPI) goBackground(name string, fn func()) {
+	z.bgw.Add(1)
+	go func() {
+		defer z.bgw.Done()
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("[bg] %s panic: %v\n%s", name, r, debug.Stack())
+			}
+		}()
+		fn()
+	}()
 }
 
 // NewZCodeAPI 创建上游 API 封装，并把额度刷新函数注入账号池
@@ -126,7 +146,9 @@ func (z *ZCodeAPI) applyQuotaResult(a *Account, ov *QuotaOverview) {
 	// 促销账号先于付费账号被消费。仅首次（UseCount==0 且仍为默认值）生效，
 	// 不覆盖用户在账号编辑里的手动调整。
 	if ov.PlanTier != "" && a.UseCount == 0 && accountPriority(a) == DefaultPriority && isPromoTier(ov.PlanTier) {
+		a.mu.Lock()
 		a.Priority = PromoPriority
+		a.mu.Unlock()
 		if err := z.db.UpdateAccountPriority(a.ID, PromoPriority); err != nil {
 			log.Printf("[quota] auto promo priority %s: %v", a.Email, err)
 		} else {
@@ -373,7 +395,22 @@ func estimateMessagesTokens(raw json.RawMessage) int {
 
 // HandleModels GET /v1/models — 同时兼容 OpenAI 与 Anthropic 字段
 func (z *ZCodeAPI) HandleModels(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeAPIError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
 	models := z.effectiveModels()
+	// 命名 Key 的白名单同样作用于目录：不允许调用的模型不应出现在其可见
+	// 列表里（转发层本就 403，这里只是不再误导客户端）
+	if gk := gatewayKeyFromCtx(r.Context()); gk != nil {
+		filtered := make([]string, 0, len(models))
+		for _, m := range models {
+			if gk.modelAllowed(strings.ToLower(strings.TrimSpace(m))) {
+				filtered = append(filtered, m)
+			}
+		}
+		models = filtered
+	}
 	now := time.Now().Unix()
 	data := make([]map[string]interface{}, 0, len(models))
 	for _, m := range models {
@@ -393,8 +430,22 @@ func (z *ZCodeAPI) HandleModelRetrieve(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, http.StatusNotFound, "not found: "+r.URL.Path)
 		return
 	}
+	// 与聊天通道同规范：百分号解码 + 别名映射 + 大小写不敏感比较
+	// （/v1/models/glm-5.3 对 /v1/chat/completions 有效，单查不该 404）
+	if un, err := url.PathUnescape(id); err == nil {
+		id = un
+	}
+	if official, ok := modelNameMap[strings.ToLower(strings.TrimSpace(id))]; ok {
+		id = official
+	}
+	// 命名 Key 的白名单同样作用于单查：不允许调用的模型按不存在处理
+	// （与列表过滤同语义，否则受限 Key 可借单查探测模型目录）
+	if gk := gatewayKeyFromCtx(r.Context()); gk != nil && !gk.modelAllowed(strings.ToLower(strings.TrimSpace(id))) {
+		writeAPIError(w, http.StatusNotFound, "model not found: "+id)
+		return
+	}
 	for _, m := range z.effectiveModels() {
-		if m == id {
+		if strings.EqualFold(m, id) {
 			writeJSON(w, http.StatusOK, modelObject(m, time.Now().Unix()))
 			return
 		}

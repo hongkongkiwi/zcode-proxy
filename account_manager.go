@@ -258,10 +258,16 @@ func (m *AccountManager) importLocalClient(f localClientFiles, group, remark str
 	log.Printf("[import] local client account imported: %s (id=%d, jwt=%v, apikey=%v)",
 		email, id, zcodeJWT != "", apiKey != "")
 
-	// 异步刷新额度
+	// 异步刷新额度：在库内新副本上刷新——本副本随即被 handler 无锁序列化
+	// （accountPublicView），共享实例就地写会撕裂字符串字段（-race/segfault 面）
 	go func() {
 		time.Sleep(500 * time.Millisecond)
-		if err := m.zapi.RefreshAccountQuota(a); err != nil {
+		fresh, err := m.db.GetAccount(id)
+		if err != nil {
+			log.Printf("[import] quota refresh %s: %v", email, err)
+			return
+		}
+		if err := m.zapi.RefreshAccountQuota(fresh); err != nil {
 			log.Printf("[import] quota refresh %s: %v", email, err)
 		}
 	}()
@@ -336,9 +342,15 @@ func (m *AccountManager) ImportPasted(provider, name, secret, group string) (*Ac
 	a.ID = id
 	m.ensureAccountIdentity(a)
 
+	// 异步刷新额度：与本地导入同纪律——在库内新副本上刷新，本副本随即被
+	// handler 无锁序列化（accountPublicView），共享实例并发写会撕裂字符串字段
 	go func() {
 		time.Sleep(500 * time.Millisecond)
-		m.zapi.RefreshAccountQuota(a)
+		fresh, err := m.db.GetAccount(id)
+		if err != nil {
+			return
+		}
+		m.zapi.RefreshAccountQuota(fresh)
 	}()
 	return a, nil
 }
@@ -517,7 +529,10 @@ func exeDir() string {
 	return filepath.Dir(exe)
 }
 
-// RestoreLocalFromSnapshot 用导入时的快照还原本地客户端（撤销切回）
+// RestoreLocalFromSnapshot 用导入时的快照还原本地客户端（撤销切回）。
+// 与切回同一不可逆纪律：先备份现网凭证再动笔；多实例快照以实例目录推导密钥，
+// 而还原目标恒为主 home——先按主 home 密钥预检每个 enc:v1 值可解密，
+// 避免把别的实例目录加密的快照盖到主目录后客户端全体解密失败、登录态尽失。
 func (m *AccountManager) RestoreLocalFromSnapshot(accountID int64) error {
 	a, err := m.db.GetAccount(accountID)
 	if err != nil {
@@ -531,6 +546,33 @@ func (m *AccountManager) RestoreLocalFromSnapshot(accountID int64) error {
 		return fmt.Errorf("快照解析失败: %w", err)
 	}
 	f := resolveLocalClientFiles()
+	secret := DefaultCredentialSecret(f.home)
+	// 预检：全部密文快照值必须能在目标 home 密钥下解密才动笔
+	for name, content := range snapshot {
+		if content == "" || !IsEncryptedValue(content) {
+			continue
+		}
+		if _, err := DecryptCredential(content, secret); err != nil {
+			return fmt.Errorf("快照 %s 无法在本地客户端密钥下解密（可能来自多实例实例目录），拒绝还原以免登出本地客户端: %w", name, err)
+		}
+	}
+	// 备份现网凭证：还原是覆盖性写入，备份是唯一可逆手段（与切回一致）
+	backupDir := filepath.Join(exeDir(), "data", "backups")
+	if err := os.MkdirAll(backupDir, 0755); err != nil {
+		return fmt.Errorf("创建备份目录失败: %w", err)
+	}
+	stamp := time.Now().Format("20060102-150405")
+	for _, p := range []string{f.credentials, f.config} {
+		if data, err := os.ReadFile(p); err == nil {
+			bak := filepath.Join(backupDir, filepath.Base(p)+".restore."+stamp+".bak")
+			if err := os.WriteFile(bak, data, 0600); err != nil {
+				return fmt.Errorf("备份 %s 失败: %w", filepath.Base(p), err)
+			}
+			if err := os.Chmod(bak, 0600); err != nil {
+				return fmt.Errorf("收紧备份权限失败: %w", err)
+			}
+		}
+	}
 	targets := map[string]string{
 		"credentials.json": f.credentials,
 		"config.json":      f.config,
@@ -551,6 +593,13 @@ func (m *AccountManager) RestoreLocalFromSnapshot(accountID int64) error {
 		}
 		if err := os.Rename(tmp, path); err != nil {
 			return err
+		}
+	}
+	if _, hasCreds := snapshot["credentials.json"]; hasCreds {
+		if _, hasCfg := snapshot["config.json"]; !hasCfg {
+			// 快照缺 config.json（导入时不可读）：切回写入的 provider keys
+			// 会与快照登录态混装，如实告警而不是静默半还原
+			log.Printf("[switch-back] WARNING: snapshot of account %s has credentials.json but no config.json; provider keys written by switch-back remain in config.json", a.Email)
 		}
 	}
 	os.Remove(f.cache)

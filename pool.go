@@ -39,8 +39,9 @@ const (
 )
 
 // 通道（免费优先 / 付费回退）
-//   free: zcode.z.ai JWT 通道（Coding Plan / Start Plan 套餐额度，无按量成本）
-//   paid: api.z.ai API Key 通道（按量计费，真实扣费）
+//
+//	free: zcode.z.ai JWT 通道（Coding Plan / Start Plan 套餐额度，无按量成本）
+//	paid: api.z.ai API Key 通道（按量计费，真实扣费）
 const (
 	ChannelFree = "free"
 	ChannelPaid = "paid"
@@ -84,6 +85,7 @@ type AccountPool struct {
 	refreshFn func(a *Account) error // 由 ZCodeAPI 注入的额度刷新函数
 	stopCh    chan struct{}
 	stopOnce  sync.Once
+	loopDone  chan struct{} // refreshLoop 退出标记（Stop 有界等待）
 }
 
 // slotKey 并发闸门键：账号×通道。免费与付费是两条上游链路，各自有独立并发上限；
@@ -122,6 +124,7 @@ func NewAccountPool(db *DB, cfg *FileConfig, appVersion string) *AccountPool {
 		paidRateLast:    make(map[int64]int),
 		paidRiskStrikes: make(map[int64][]time.Time),
 		stopCh:          make(chan struct{}),
+		loopDone:        make(chan struct{}),
 	}
 }
 
@@ -137,12 +140,21 @@ func (p *AccountPool) Start() {
 	go p.refreshLoop()
 }
 
-// Stop 停止后台循环
+// Stop 停止后台循环（幂等）：关停信号 + 有界等当前刷新轮收尾——
+// 额度快照/状态写库必须先于 main 的 db.Close（错过写自愈，但没必要错过）
 func (p *AccountPool) Stop() {
 	p.stopOnce.Do(func() { close(p.stopCh) })
+	if p.loopDone != nil {
+		select {
+		case <-p.loopDone:
+		case <-time.After(20 * time.Second):
+			log.Printf("[pool] stop: refresh round still running after 20s")
+		}
+	}
 }
 
 func (p *AccountPool) refreshLoop() {
+	defer close(p.loopDone)
 	// 启动后先等 5 秒（让 HTTP 服务先起来）
 	select {
 	case <-p.stopCh:
@@ -241,6 +253,12 @@ func (p *AccountPool) refreshAll() {
 			}()
 			// 每账号随机延迟 0-2s，模拟人工行为
 			time.Sleep(time.Duration(rand.Intn(2000)) * time.Millisecond)
+			// 停机感知：Stop 之后不再打上游/写库（sleep 期间可能已停机）
+			select {
+			case <-p.stopCh:
+				return
+			default:
+			}
 			if err := fn(acc); err != nil {
 				log.Printf("[pool] refresh quota %s: %v", acc.Email, err)
 			}
@@ -481,6 +499,18 @@ func (p *AccountPool) selectableByIDChannel(id int64, provider, group string, sk
 	return a
 }
 
+// ForgetSticky 会话粘滞失效：账号持续上游报错时解绑——粘滞命中会无条件刷新
+// TTL，不解绑就把整个会话域钉死在不健康账号上直到 1h TTL（系统提示词派生
+// 键会把爆炸半径放大到同一 agent 配置的全部会话）
+func (p *AccountPool) ForgetSticky(sessionKey string) {
+	if sessionKey == "" {
+		return
+	}
+	p.mu.Lock()
+	delete(p.sticky, sessionKey)
+	p.mu.Unlock()
+}
+
 func (p *AccountPool) rememberSticky(sessionKey string, accountID int64) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -525,8 +555,10 @@ func (p *AccountPool) accountSlotCap() int {
 
 // AcquireAccountSlot 占用一个在途名额（阻塞至 timeout）；false = 排队超时。
 // 闸门按（账号×通道）隔离：免费与付费是两条上游链路，免费侧打满不得堵死付费回退。
-// 上限设置变更时重建闸门（旧名额 token 作废由 Release 的幂等保护兜底）。
-func (p *AccountPool) AcquireAccountSlot(a *Account, channel string, timeout time.Duration) bool {
+// 返回绑定式 release：名额始终归还给"获取时"的那把闸门。上限设置变更会重建
+// 闸门对象——若按"当前对象"释放，旧持有者会错放新闸门的 token，在途计数被
+// 放空后并发上限失守（恰是本闸门要防的 1302 条件）。
+func (p *AccountPool) AcquireAccountSlot(a *Account, channel string, timeout time.Duration) (func(), bool) {
 	capNow := p.accountSlotCap()
 	key := slotKey{id: a.ID, channel: channel}
 	p.mu.Lock()
@@ -538,35 +570,32 @@ func (p *AccountPool) AcquireAccountSlot(a *Account, channel string, timeout tim
 	ch := as.ch
 	p.mu.Unlock()
 
+	// 释放恰好一次：多余的调用不偷走其他持有者的 token（匿名 token 下
+	// 双重释放会永久压缩闸门有效容量——恰是 1302 条件）
+	var once sync.Once
+	release := func() {
+		once.Do(func() {
+			select {
+			case <-ch:
+			default:
+			}
+		})
+	}
 	if timeout <= 0 {
 		select {
 		case ch <- struct{}{}:
-			return true
+			return release, true
 		default:
-			return false
+			return func() {}, false
 		}
 	}
 	timer := time.NewTimer(timeout)
 	defer timer.Stop()
 	select {
 	case ch <- struct{}{}:
-		return true
+		return release, true
 	case <-timer.C:
-		return false
-	}
-}
-
-// ReleaseAccountSlot 释放在途名额（幂等：多余释放忽略）
-func (p *AccountPool) ReleaseAccountSlot(a *Account, channel string) {
-	p.mu.Lock()
-	as := p.slots[slotKey{id: a.ID, channel: channel}]
-	p.mu.Unlock()
-	if as == nil {
-		return
-	}
-	select {
-	case <-as.ch:
-	default:
+		return func() {}, false
 	}
 }
 
@@ -576,7 +605,9 @@ func nextRateLimitCooldown(a *Account) int {
 	switch {
 	case strings.Contains(a.LastError, "冷却 120s"), strings.Contains(a.LastError, "冷却 300s"):
 		return 300
-	case strings.Contains(a.LastError, "限流"), strings.Contains(a.LastError, "Rate limit"):
+	case strings.Contains(a.LastError, "冷却 30s"):
+		// 只认免费侧自己写入的冷却标记升级：付费通道的限流 reason 也落
+		// last_error（含"限流"字样），此前会错把免费首档 30s 直接抬到 120s
 		return 120
 	default:
 		return 30
