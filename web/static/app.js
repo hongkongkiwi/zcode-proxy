@@ -809,6 +809,7 @@ function showKeyModal(id) {
       <div class="form-group"><label>${t('总配额（tokens，0=不限）')}</label><input type="number" id="keyQuota" class="form-input" min="0" value="${k.quota_total ?? ''}" placeholder="${t('0=不限')}"></div>
     </div>
     <div class="form-group"><label>${t('模型白名单（逗号分隔，留空=全部）')}</label><input type="text" id="keyModels" class="form-input mono" value="${esc(k.models || '')}" placeholder="${t('glm-5.3,glm-5.2 留空=全部')}"></div>
+    ${id ? '' : `<div class="form-group"><label>${t('管理员密码（创建需口令验证）')}</label><input type="password" id="keyVerifyPwd" class="form-input" autocomplete="off"></div>`}
     <div class="actions"><button class="btn btn-secondary" onclick="closeModal()">${t('取消')}</button>
     <button class="btn btn-primary" onclick="saveKey(${id || 0})">${t('保存')}</button></div>`);
 }
@@ -822,6 +823,11 @@ async function saveKey(id) {
     quota_total: Number(document.getElementById('keyQuota').value || 0),
     models: document.getElementById('keyModels').value.trim(),
   };
+  if (!id) {
+    // 创建即回明文：服务端要求口令步进（ stolen session 不得铸无限制 Key）
+    body.verify_password = document.getElementById('keyVerifyPwd').value;
+    if (!body.verify_password) return toast(t('需要管理员密码'), 'error');
+  }
   try {
     if (id) {
       await api('/api/keys/' + id, { method: 'PUT', body });
@@ -893,13 +899,13 @@ function renderPlans() {
         <td class="mono">${esc(p.cron_expr)}</td>
         <td>${p.target_type === 'single_account' ? tf('账号#%s', p.account_id) : p.target_type === 'group' ? tf('分组: %s', esc(p.account_group)) : t('全部账号')}</td>
         <td>${p.delay_seconds}s</td>
-        <td style="font-size:12px">${esc(p.next_run_at || '-')}</td>
+        <td style="font-size:12px">${p.task_type === 'reset' ? '-' : esc(p.next_run_at || '-')}</td>
         <td style="font-size:12px">${esc(p.last_run_at || '-')}<div style="color:var(--c-text-lighter);font-size:11px;max-width:200px;overflow:hidden;text-overflow:ellipsis" title="${esc(p.last_run_msg || '')}">${esc(p.last_run_msg || '')}</div></td>
-        <td>${p.is_active ? `<span class="badge badge-success">${t('启用')}</span>` : `<span class="badge badge-secondary">${t('停用')}</span>`}
+        <td>${p.task_type === 'reset' ? `<span class="badge badge-warning">${t('重置仅支持手动执行，请删除此计划')}</span>` : p.is_active ? `<span class="badge badge-success">${t('启用')}</span>` : `<span class="badge badge-secondary">${t('停用')}</span>`}
             ${p.last_run_status ? `<div style="margin-top:3px">${p.last_run_status === 'success' ? '✅' : '❌'}</div>` : ''}</td>
         <td class="actions-cell">
-          <button class="btn btn-sm btn-primary" onclick="runPlan(${p.id})">${t('立即运行')}</button>
-          <button class="btn btn-sm btn-secondary" onclick="showPlanModal(${p.id})">${t('编辑')}</button>
+          <button class="btn btn-sm btn-primary" onclick="runPlan(${p.id})" ${p.task_type === 'reset' ? 'disabled' : ''}>${t('立即运行')}</button>
+          <button class="btn btn-sm btn-secondary" onclick="showPlanModal(${p.id})" ${p.task_type === 'reset' ? 'disabled' : ''}>${t('编辑')}</button>
           <button class="btn btn-sm btn-danger" onclick="deletePlan(${p.id})">${t('删除')}</button>
         </td>
       </tr>`).join('')}</tbody></table></div>`;
@@ -907,6 +913,7 @@ function renderPlans() {
 
 async function showPlanModal(id) {
   const p = plansCache.find(x => x.id === id) || {};
+  if (p.task_type === 'reset') { toast(t('重置仅支持手动执行，请删除此计划'), 'error'); return; }
   // 账号缓存为空（如启动后直接进入活动页）、或缓存带着分组筛选而当前计划的
   // 目标账号不在其中时，拉取全量列表：否则 single_account 计划编辑时看不到
   // 真实目标，保存也会被拒
@@ -932,7 +939,6 @@ async function showPlanModal(id) {
         <option value="claim" ${p.task_type === 'claim' ? 'selected' : ''}>${t('一键领取（检测+验证码+领取）')}</option>
         <option value="detect" ${p.task_type === 'detect' ? 'selected' : ''}>${t('仅检测活动')}</option>
         <option value="activate" ${p.task_type === 'activate' ? 'selected' : ''}>${t('激活套餐（上报激活事件）')}</option>
-        <option value="reset" ${p.task_type === 'reset' ? 'selected' : ''}>${t('配额重置（耗尽时恢复窗口配额）')}</option>
       </select></div>
     <div class="form-group"><label>${t('cron 表达式（分 时 日 月 周）')}</label>
       <input type="text" id="planCron" class="mono" value="${esc(p.cron_expr || '0 9 * * *')}" placeholder="0 9 * * *">
@@ -997,6 +1003,7 @@ async function deletePlan(id) {
 }
 
 async function runPlan(id) {
+  if (plansCache.find(p => p.id === id)?.task_type === 'reset') { toast(t('重置仅支持手动执行，请删除此计划'), 'error'); return; }
   try { await api(`/api/plans/${id}/run`, { method: 'POST' }); toast(t('已开始执行，见顶部进度'), 'info'); }
   catch (e) { toast(e.message, 'error'); }
 }
@@ -1273,25 +1280,81 @@ async function applyCatalogToGateway() {
   } catch (e) { toast(e.message, 'error'); }
 }
 
+// ---- 网关根 Key：GET 只回存在性/脱敏形状，明文需口令步进重认证 ----
+// 与导出账号包同一威胁模型：stolen session 不得直接读走根 Key，
+// 显示明文必须先过 POST /api/settings/api-key/reveal 的管理员密码验证
+
+let gatewayKeyHas = false; // 最近一次 GET /api/settings/api-key 的存在性（安全页）
+let llmKeyHas = false;     // LLM 测试页同一份远端事实，两处各自显示
+
+// applyKeyDisplay 只读输入框统一渲染：未揭示显示占位提示，揭示后填明文
+function applyKeyDisplay(inputId, hasKey, revealed) {
+  const el = document.getElementById(inputId);
+  if (!el) return;
+  el.value = revealed || '';
+  el.placeholder = hasKey ? t('已设置（点「显示 Key」验证管理员密码后查看）') : t('尚未生成');
+}
+
+// ensureRevealKeyBtn 在只读输入框旁注入「显示 Key」按钮（index.html 静态结构不含
+// 此按钮，由 JS 补齐；幂等）。data-i18n + applyI18n 让语言切换时文案跟随。
+function ensureRevealKeyBtn(inputId, target) {
+  const el = document.getElementById(inputId);
+  if (!el || document.getElementById('revealKeyBtn-' + target)) return;
+  const btn = document.createElement('button');
+  btn.id = 'revealKeyBtn-' + target;
+  btn.className = 'btn btn-secondary';
+  btn.setAttribute('data-i18n', '显示 Key');
+  btn.onclick = () => showRevealKeyModal(target);
+  el.parentElement.appendChild(btn);
+  if (typeof applyI18n === 'function') applyI18n();
+}
+
+function showRevealKeyModal(target) {
+  openModal(`<h3>${t('显示网关 Key')}</h3>
+    <p style="font-size:13px;color:var(--c-text-light);margin-bottom:12px">${t('为防止会话被窃取后直接拿到根 Key，显示前需再次验证管理员密码。')}</p>
+    <div class="form-group"><label>${t('管理员密码（确认身份）')}</label><input type="password" id="revealKeyPass" autocomplete="current-password"></div>
+    <div class="actions"><button class="btn btn-secondary" onclick="closeModal()">${t('取消')}</button>
+    <button class="btn btn-primary" onclick="doRevealKey('${target}')">${t('显示 Key')}</button></div>`);
+}
+
+async function doRevealKey(target) {
+  const pw = document.getElementById('revealKeyPass').value;
+  if (!pw) return toast(t('请输入管理员密码'), 'error');
+  try {
+    const d = await api('/api/settings/api-key/reveal', { method: 'POST', body: { verify_password: pw } });
+    closeModal();
+    if (target === 'llm') { llmKeyHas = !!d.has_api_key; applyKeyDisplay('llmKey', llmKeyHas, d.api_key || ''); }
+    else { gatewayKeyHas = !!d.has_api_key; applyKeyDisplay('gatewayKeyDisplay', gatewayKeyHas, d.api_key || ''); }
+    toast(t('已显示网关 Key'));
+  } catch (e) { toast(e.message, 'error'); }
+}
+
 async function loadGatewayKey() {
   try {
     const d = await api('/api/settings/api-key');
-    document.getElementById('gatewayKeyDisplay').value = d.api_key || '';
+    gatewayKeyHas = !!d.has_api_key;
+    applyKeyDisplay('gatewayKeyDisplay', gatewayKeyHas, '');
+    ensureRevealKeyBtn('gatewayKeyDisplay', 'gateway');
   } catch (e) { reportLoadError(e); }
 }
 
 async function generateAPIKey() {
-  if (!confirm(t('重新生成后旧 Key 立即失效，确认？'))) return;
+  // 生成即轮换并回明文：服务端要求管理员口令步进（纯 session 不得铸新根 Key）
+  const pw = prompt(t('重新生成后旧 Key 立即失效；请输入管理员密码确认'));
+  if (pw === null) return;
+  if (!pw) return toast(t('需要管理员密码'), 'error');
   try {
-    const d = await api('/api/settings/api-key/generate', { method: 'POST' });
-    document.getElementById('gatewayKeyDisplay').value = d.api_key;
+    const d = await api('/api/settings/api-key/generate', { method: 'POST', body: { verify_password: pw } });
+    // 新建即展示一次（与命名网关 Key 的「立即保存」同一模型）
+    gatewayKeyHas = true;
+    applyKeyDisplay('gatewayKeyDisplay', true, d.api_key || '');
     toast(t('已生成新 API Key'));
   } catch (e) { toast(e.message, 'error'); }
 }
 
 function copyGatewayKey() {
   const v = document.getElementById('gatewayKeyDisplay').value;
-  if (!v) return toast(t('尚未生成'), 'error');
+  if (!v) return toast(t(gatewayKeyHas ? 'Key 已设置，请先「显示 Key」' : '尚未生成'), 'error');
   copyToClipboard(v);
 }
 
@@ -1538,8 +1601,9 @@ let llmHistory = [];
 async function loadLlmKey() {
   try {
     const d = await api('/api/settings/api-key');
-    const el = document.getElementById('llmKey');
-    if (el) el.value = d.api_key || '';
+    llmKeyHas = !!d.has_api_key;
+    applyKeyDisplay('llmKey', llmKeyHas, '');
+    ensureRevealKeyBtn('llmKey', 'llm');
   } catch (e) { reportLoadError(e); }
 }
 
@@ -1601,7 +1665,10 @@ async function runLlmTest() {
   const btn = document.getElementById('llmRunBtn');
   const resultEl = document.getElementById('llmResult');
   const contentEl = document.getElementById('llmContent');
-  if (!key) { toast(t('缺少网关 Key，点击「刷新 Key」'), 'error'); return; }
+  if (!key) {
+    toast(t(llmKeyHas ? 'Key 已设置，请先「显示 Key」' : '缺少网关 Key，点击「刷新 Key」'), 'error');
+    return;
+  }
 
   const path = proto === 'messages' ? '/v1/messages' : proto === 'chat' ? '/v1/chat/completions' : '/v1/responses';
   let body;

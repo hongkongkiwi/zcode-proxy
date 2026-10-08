@@ -355,7 +355,7 @@ func channelSelectable(a *Account, channel string, now int64) bool {
 	case ChannelPaid:
 		return paidChannelAvailable(a, now)
 	case ChannelPaidOnly:
-		return a.ZCodeJWT == "" && a.APIKey != "" && accountSelectable(a, now)
+		return a.ZCodeJWT == "" && a.APIKey != "" && now >= a.PaidCoolingUntil && accountSelectable(a, now)
 	}
 	return accountSelectable(a, now)
 }
@@ -586,8 +586,9 @@ func (p *AccountPool) rememberSticky(sessionKey string, accountID int64) {
 
 // accountSlots 每账号并发闸门：与其打满并发再吃上游 429/1302，不如在网关侧排队
 type accountSlots struct {
-	cap int
-	ch  chan struct{}
+	cap     int
+	ch      chan struct{}
+	changed chan struct{}
 }
 
 // accountSlotCap 读取并发上限设置（1-32，默认 3）
@@ -606,51 +607,69 @@ func (p *AccountPool) accountSlotCap() int {
 // AcquireAccountSlot 占用一个在途名额（阻塞至 timeout）；false = 排队超时或客户端已断开。
 // 闸门按（账号×通道）隔离：免费与付费是两条上游链路，免费侧打满不得堵死付费回退。
 // ctx 取消（客户端断开）与超时同路返回——断开的请求不得继续占用队列坑位。
-// 返回绑定式 release：名额始终归还给"获取时"的那把闸门。上限设置变更会重建
-// 闸门对象——若按"当前对象"释放，旧持有者会错放新闸门的 token，在途计数被
-// 放空后并发上限失守（恰是本闸门要防的 1302 条件）。
+// Keep one occupancy channel across cap changes; release remains bound and idempotent.
 func (p *AccountPool) AcquireAccountSlot(ctx context.Context, a *Account, channel string, timeout time.Duration) (func(), bool) {
-	capNow := p.accountSlotCap()
 	key := slotKey{id: a.ID, channel: channel}
 	p.mu.Lock()
 	as := p.slots[key]
-	if as == nil || as.cap != capNow {
-		as = &accountSlots{cap: capNow, ch: make(chan struct{}, capNow)}
+	if as == nil {
+		as = &accountSlots{ch: make(chan struct{}, slotMaxCap), changed: make(chan struct{})}
 		p.slots[key] = as
 	}
-	ch := as.ch
 	p.mu.Unlock()
 
-	// 释放恰好一次：多余的调用不偷走其他持有者的 token（匿名 token 下
-	// 双重释放会永久压缩闸门有效容量——恰是 1302 条件）
 	var once sync.Once
 	release := func() {
 		once.Do(func() {
-			select {
-			case <-ch:
-			default:
-			}
+			p.mu.Lock()
+			defer p.mu.Unlock()
+			<-as.ch
+			close(as.changed)
+			as.changed = make(chan struct{})
 		})
 	}
-	if timeout <= 0 {
-		select {
-		case ch <- struct{}{}:
-			return release, true
-		case <-ctx.Done():
-			return func() {}, false
-		default:
+	var deadline <-chan time.Time
+	if timeout > 0 {
+		timer := time.NewTimer(timeout)
+		defer timer.Stop()
+		deadline = timer.C
+	}
+	for {
+		// Refresh on every wake without holding p.mu across the DB lookup.
+		capNow := p.accountSlotCap()
+		p.mu.Lock()
+		if as.cap != capNow {
+			as.cap = capNow
+			close(as.changed)
+			as.changed = make(chan struct{})
+		}
+		if ctx.Err() != nil {
+			p.mu.Unlock()
 			return func() {}, false
 		}
-	}
-	timer := time.NewTimer(timeout)
-	defer timer.Stop()
-	select {
-	case ch <- struct{}{}:
-		return release, true
-	case <-ctx.Done():
-		return func() {}, false
-	case <-timer.C:
-		return func() {}, false
+		select {
+		case <-deadline:
+			p.mu.Unlock()
+			return func() {}, false
+		default:
+		}
+		if len(as.ch) < as.cap {
+			as.ch <- struct{}{}
+			p.mu.Unlock()
+			return release, true
+		}
+		changed := as.changed
+		p.mu.Unlock()
+		if timeout <= 0 {
+			return func() {}, false
+		}
+		select {
+		case <-changed:
+		case <-ctx.Done():
+			return func() {}, false
+		case <-deadline:
+			return func() {}, false
+		}
 	}
 }
 
@@ -823,9 +842,13 @@ func (p *AccountPool) PaidFallbackPolicy() string {
 	return PaidModeFreeFirst
 }
 
-// paidDailyTokenCap 付费通道每日 token 上限（0 = 不限）
+// paidDailyTokenCap 付费通道每日 token 上限（0 = 不限，-1 = 读取失败）
 func (p *AccountPool) paidDailyTokenCap() int64 {
-	v, _ := p.db.GetSetting("paid_daily_token_cap")
+	v, err := p.db.GetSetting("paid_daily_token_cap")
+	if err != nil {
+		log.Printf("[pool] paid daily token cap: %v; failing closed", err)
+		return -1
+	}
 	n, err := strconv.ParseInt(strings.TrimSpace(v), 10, 64)
 	if err != nil || n < 0 {
 		return 0

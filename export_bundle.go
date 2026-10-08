@@ -8,7 +8,6 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	"log"
 	"strings"
 
 	"golang.org/x/crypto/pbkdf2"
@@ -156,7 +155,7 @@ func (m *AccountManager) ImportBundle(password, bundle string) (int, error) {
 		return 0, fmt.Errorf("不支持的账号包版本 %d（当前最高支持 v1，请升级本网关）", payload.Version)
 	}
 	count := 0
-	for _, it := range payload.Accounts {
+	for i, it := range payload.Accounts {
 		if it.UserID == "" || (it.ZCodeJWT == "" && it.APIKey == "") {
 			continue
 		}
@@ -170,9 +169,7 @@ func (m *AccountManager) ImportBundle(password, bundle string) (int, error) {
 			Status: StatusActive, Enabled: true,
 		}
 		if _, err := m.db.UpsertAccount(a); err != nil {
-			// 静默跳过会让导入方以为全部成功（如 vault 拒写的脏字段）
-			log.Printf("[bundle] import %s skipped: %v", it.UserID, err)
-			continue
+			return count, fmt.Errorf("第 %d 个账号导入失败；已导入 %d 个。请检查数据库及 vault 状态后重试", i+1, count)
 		}
 		count++
 	}

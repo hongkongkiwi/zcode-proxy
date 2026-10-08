@@ -315,6 +315,17 @@ func humanizeWait(waitSeconds int64, known bool) string {
 // "拒绝动笔"（不落记录）与"动笔失败"（落失败记录）
 const spendGuardGapRefused = "gap-refused"
 
+// markExpirySpend 防双花盖印（无条件跟随每一次成功消耗）：slot=0 表示无归属
+// （调用方不知道 expireAt，如手动/阈值路径），闸门谓词对其保守拒绝 gap 内一切
+// 临期消耗。必须由 UseReset 的成功路径调用——只靠闸门盖印时，手动消耗 + 上游
+// status 滞后会把同一槽位再花一次（评审 F3）。
+func markExpirySpend(accountID int64, slot int64) {
+	autoResetState.Lock()
+	autoResetState.lastExpirySpend[accountID] = time.Now()
+	autoResetState.lastExpirySpendSlot[accountID] = slot
+	autoResetState.Unlock()
+}
+
 // spendExpiringSlotGuarded 临期槽位消耗的共享防双花闸门：gap 内同到期槽位拒绝，
 // 动笔成功才盖印（lastExpirySpend/lastExpirySpendSlot）。
 // MaybeAutoReset（耗尽路径）与 spendExpiringResetForSync（同步路径）都从这里
@@ -328,7 +339,10 @@ func spendExpiringSlotGuarded(accountID int64, expireAt int64, spend func() erro
 	last := autoResetState.lastExpirySpend[accountID]
 	lastSlot := autoResetState.lastExpirySpendSlot[accountID]
 	autoResetState.Unlock()
-	if time.Since(last) < autoResetExpirySpendGap && expireAt == lastSlot {
+	// lastSlot == 0 = 无归属盖印（UseReset 对手动/阈值路径的消耗无条件盖印，
+	// 归属槽位未知）：保守视为可能同槽，gap 内拒绝一切临期消耗——手动消耗后
+	// 上游 status 滞后复述旧槽会双花；代价只是另一真实槽位的临期消耗暂缓 ≤gap
+	if time.Since(last) < autoResetExpirySpendGap && (lastSlot == 0 || expireAt == lastSlot) {
 		return false, spendGuardGapRefused
 	}
 	if err := spend(); err != nil {
@@ -384,6 +398,9 @@ func (z *ZCodeAPI) spendExpiringResetForSync(a *Account, st *ResetStatus) {
 	if err != nil {
 		return
 	}
+	// 决策时钟必须重取：now 采集于预筛，两次 status 之间的网络往返可能跨过
+	// 槽位 expire_at——用旧值判定会花在上游已失效的槽上（注定失败还落成功记录）
+	now = time.Now().Unix()
 	resetType := ""
 	var expireAt int64
 	if at, soon := autoResetSlotExpiringSoon(now, windowSec, st2.AvailableFiveHourResets); soon {

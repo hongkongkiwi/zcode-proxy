@@ -103,7 +103,7 @@ Go 单二进制实现的 **ZCode（Z.AI / GLM Coding Plan）多账号管理 + OA
   账号级互斥锁保证 UI 手动与 cron 计划并发不双领；
 - **激活**：上报 `event/report`（app_launch + app_daily_active，含 device_mid/user_id）触发服务端授予 Start Plan；
 - **配额重置**：`coding-plan/reset/status` 查 five_hour/week 重置机会 → `reset/use {idempotency_key, reset_type}` 消耗机会恢复配额；
-- **调度**：cron 计划（分钟级去重 + per-plan 互斥 + 账号间随机延迟防风控），任务类型 detect/claim/activate/reset，运行记录可查。
+- **调度**：cron 计划（分钟级去重 + per-plan 互斥 + 账号间随机延迟防风控），任务类型 detect/claim/activate，运行记录可查；配额重置仅支持账号页手动执行，旧 reset 计划不可运行。
 
 ### 多账号路由（负载均衡 / 优先级级联 / 会话粘滞）
 
@@ -194,7 +194,7 @@ Go 单二进制实现的 **ZCode（Z.AI / GLM Coding Plan）多账号管理 + OA
 |---|---|---|
 | `accounts` | `user_id`(自然键, UNIQUE), `auth_type`, `zcode_jwt`, `api_key`, `access_token`, `device_mid`, `creds_raw`, `status`, `enabled`, `account_group`, `quota_json`, `plan_tier/expire`, `total/used/remaining`, `cooling_until`, `use/fail_count` | 账号+凭证+额度快照；upsert 用 `COALESCE(NULLIF(excluded.x,''), x)` 保留 device_mid/creds_raw |
 | `settings` | KV | 策略/刷新间隔/代理/指纹/验证码模式/模型清单/口令哈希/api_key |
-| `claim_plans` | cron_expr, task_type(detect/claim/activate/reset), target_type, delay_seconds, last_run_* | 活动/重置计划 |
+| `claim_plans` | cron_expr, task_type(detect/claim/activate), target_type, delay_seconds, last_run_* | 活动计划（旧 reset 计划仅可删除） |
 | `claim_records` | account_id, task_type, plan_id, success, code, next_at | 领取/检测/重置历史 |
 | `usage_records` | account_id, model, in/out/total tokens, stream, status_code, duration_ms, ttft_ms | 用量与延迟 |
 | `proxy_nodes` | type/host/port/auth, is_default, group_name, check_* | 分组出口代理 |
@@ -241,7 +241,7 @@ Go 单二进制实现的 **ZCode（Z.AI / GLM Coding Plan）多账号管理 + OA
 
 - **Anthropic→OpenAI chat**：`message_start→首 chunk(role)`、`content_block_delta.text_delta→delta.content`、`thinking_delta→delta.reasoning_content`、`tool_use→delta.tool_calls[index]`、`message_delta→finish_reason`、末尾 `usage chunk(include_usage)` + `[DONE]`。
 - **Anthropic→Responses**：`response.created/output_item.added/reasoning_summary_part.added/reasoning_summary_text.delta/reasoning_summary_text.done/reasoning_summary_part.done/content_part.added/output_text.delta/function_call_arguments.delta/output_text.done/output_item.done/response.completed`（思考以 `type:reasoning` 输出项流式发出，`response.completed.output` 与事件序列一致）；错误/断流发 `response.failed`。
-- **OpenAI→Anthropic 请求**：system/developer→`system` 串；tool→`tool_result`；assistant.tool_calls→`tool_use`；image_url 仅接受 data: base64（其余形态返回 400，不静默丢弃）；tool_choice auto/required/name 映射。reasoning_effort 透传至 GLM-5.3 思考档位，非 5.3 模型丢弃。
+- **OpenAI→Anthropic 请求**：system/developer→`system` 串；tool→`tool_result`；assistant.tool_calls→`tool_use`；image_url 仅接受 data: base64（其余形态返回 400，不静默丢弃）；tool_choice auto/required/name 映射。reasoning_effort 透传至 GLM-5.3 思考档位，非 5.3 模型丢弃。 不按助手输出从全局缓存回填签名思考块，避免跨用户/会话泄露；需重放签名思考块的客户端应使用 Anthropic 原生接口并显式携带原始块。
 - **Responses→Anthropic**：instructions→system；input[] 的 message/function_call/function_call_output 映射；reasoning.effort→reasoning_effort。
 - **健壮性**：SSE 解析缓冲上限 16MB（超限按流失败处理，不静默清空）、跨 chunk 断帧兼容 LF/CRLF；命名 `event:error`、匿名 `data:` 错误帧（顶层 `error` 字段或 `type=error`）与 `err!=io.EOF` 均按失败处理（不伪装成功）。
 

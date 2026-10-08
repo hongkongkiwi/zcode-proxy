@@ -148,11 +148,17 @@ func (z *ZCodeAPI) UseReset(a *Account, resetType string) (bool, int64, string, 
 	}
 	data, _ := v["data"].(map[string]interface{})
 	if d, ok := data["used"].(bool); ok {
+		if d {
+			// 防双花盖印：无归属（0）跟随每一次成功消耗——手动/阈值路径不经过
+			// spendExpiringSlotGuarded，不盖印会让临期路径把同一槽位再花一次
+			markExpirySpend(a.ID, 0)
+		}
 		return d, 0, msg, nil
 	}
 	// 业务码 0 但响应未带 used 字段（响应形状逆向自 app.asar，无法保证该字段）：
 	// 视为已消耗并告警——按失败记录会诱导上层重复消耗一次真实重置机会
 	log.Printf("[reset] use %s: code=0 but data.used missing (msg=%q); treating as consumed", resetType, msg)
+	markExpirySpend(a.ID, 0)
 	return true, 0, msg, nil
 }
 

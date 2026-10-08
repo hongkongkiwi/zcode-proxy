@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/url"
 	"os"
@@ -51,7 +52,11 @@ func (e *EgressProxy) ProxyURLForAccount(a *Account) string {
 		return e.GlobalProxyURL()
 	}
 	node, err := e.db.ProxyNodeForGroup(a.AccountGroup)
-	if err == nil && node != nil {
+	if err != nil {
+		// 解析失败静默回退会让钉住组的出口 IP 悄悄换成全局/直连——
+		// 恰是触发上游风控阶梯的模式，必须留痕
+		log.Printf("[egress] WARNING: group %q proxy node lookup failed: %v — falling back to global/direct", a.AccountGroup, err)
+	} else if node != nil {
 		if u := ProxyURLForNode(node); u != "" {
 			return u
 		}

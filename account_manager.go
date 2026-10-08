@@ -405,16 +405,34 @@ func (m *AccountManager) SwitchBackToLocal(accountID int64, killClient bool) err
 			if err := os.Chmod(bak, 0600); err != nil {
 				return fmt.Errorf("收紧备份权限失败: %w", err)
 			}
+		} else if !os.IsNotExist(err) {
+			return fmt.Errorf("读取 %s 备份失败: %w", filepath.Base(p), err)
 		}
 	}
 
 	// 2. 重建 credentials.json：保留无关键（bot/web-remote-control 等），只替换登录态
 	var creds map[string]string
 	if data, err := os.ReadFile(f.credentials); err == nil {
-		json.Unmarshal(data, &creds)
+		if err := json.Unmarshal(data, &creds); err != nil {
+			return fmt.Errorf("解析 credentials.json 失败: %w", err)
+		}
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("读取 credentials.json 失败: %w", err)
 	}
 	if creds == nil {
 		creds = map[string]string{}
+	}
+	// 配置也先读完校验，避免解析失败后已经切换部分身份。
+	var cfg map[string]interface{}
+	if data, err := os.ReadFile(f.config); err == nil {
+		if err := json.Unmarshal(data, &cfg); err != nil {
+			return fmt.Errorf("解析 config.json 失败: %w", err)
+		}
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("读取 config.json 失败: %w", err)
+	}
+	if cfg == nil {
+		cfg = map[string]interface{}{}
 	}
 	provider := a.Provider
 	if provider == "" {
@@ -445,9 +463,13 @@ func (m *AccountManager) SwitchBackToLocal(accountID int64, killClient bool) err
 	creds["zcodejwttoken"] = zcodeEnc
 	if accessEnc != "" {
 		creds["oauth:"+provider+":access_token"] = accessEnc
+	} else {
+		delete(creds, "oauth:"+provider+":access_token")
 	}
 	if userEnc != "" {
 		creds["oauth:"+provider+":user_info"] = userEnc
+	} else {
+		delete(creds, "oauth:"+provider+":user_info")
 	}
 	creds["oauth:active_provider"] = providerEnc
 	if err := atomicWriteJSON(f.credentials, creds); err != nil {
@@ -455,15 +477,6 @@ func (m *AccountManager) SwitchBackToLocal(accountID int64, killClient bool) err
 	}
 
 	// 3. 更新 config.json provider
-	var cfg map[string]interface{}
-	if data, err := os.ReadFile(f.config); err == nil {
-		if json.Unmarshal(data, &cfg) != nil {
-			cfg = nil
-		}
-	}
-	if cfg == nil {
-		cfg = map[string]interface{}{}
-	}
 	providers, _ := cfg["provider"].(map[string]interface{})
 	if providers == nil {
 		providers = map[string]interface{}{}
@@ -484,9 +497,7 @@ func (m *AccountManager) SwitchBackToLocal(accountID int64, killClient bool) err
 		p["enabled"] = enable
 	}
 	setProviderKey("builtin:"+provider+"-start-plan", a.ZCodeJWT, true)
-	if a.APIKey != "" {
-		setProviderKey("builtin:"+provider+"-coding-plan", a.APIKey, true)
-	}
+	setProviderKey("builtin:"+provider+"-coding-plan", a.APIKey, a.APIKey != "")
 	if err := atomicWriteJSON(f.config, cfg); err != nil {
 		return fmt.Errorf("写回 config.json 失败: %w", err)
 	}
@@ -544,10 +555,82 @@ func exeDir() string {
 	return filepath.Dir(exe)
 }
 
+// checkSnapshotDecryptable 预检单个快照文件内容：进入 JSON 内部逐值验证 enc 密文
+// 在目标 home 密钥下可解，任何失败整体拒绝。整串 enc 前缀判定对快照永远不命中
+// （快照值是 JSON 文档），必须深入 JSON 查值。内层 JSON 解析失败同样拒绝——
+// 解析不了的快照无从确认密文归属，不是安全的覆盖来源。明文值（无 enc: 前缀）合法。
+func checkSnapshotDecryptable(name, content, secret string) error {
+	check := func(field, v string) error {
+		if !strings.HasPrefix(v, "enc:") {
+			return nil
+		}
+		if !IsEncryptedValue(v) {
+			// enc: 前缀但非 enc:v1 格式：本地客户端同样解不开，一并拒绝
+			return fmt.Errorf("快照 %s 的 %s 是无法识别的加密格式（可能来自多实例实例目录），拒绝还原以免登出本地客户端", name, field)
+		}
+		if _, err := DecryptCredential(v, secret); err != nil {
+			return fmt.Errorf("快照 %s 的 %s 无法在本地客户端密钥下解密（可能来自多实例实例目录），拒绝还原以免登出本地客户端: %w", name, field, err)
+		}
+		return nil
+	}
+	var doc interface{}
+	if err := json.Unmarshal([]byte(content), &doc); err != nil {
+		return fmt.Errorf("快照 %s 内层 JSON 解析失败，拒绝还原（解析不了的快照不安全覆盖现网文件）: %w", name, err)
+	}
+	switch name {
+	case "credentials.json":
+		// 递归下探每个字符串值：形状比导入的 map[string]string 更宽也照查，
+		// 密文藏在任何嵌套层都不能漏
+		var walkErr error
+		var walk func(path string, v interface{})
+		walk = func(path string, v interface{}) {
+			if walkErr != nil {
+				return
+			}
+			switch t := v.(type) {
+			case map[string]interface{}:
+				for k, vv := range t {
+					kpath := k
+					if path != "" {
+						kpath = path + "." + k
+					}
+					walk(kpath, vv)
+				}
+			case []interface{}:
+				for i, vv := range t {
+					walk(fmt.Sprintf("%s[%d]", path, i), vv)
+				}
+			case string:
+				walkErr = check(path, t)
+			}
+		}
+		walk("", doc)
+		return walkErr
+	case "config.json":
+		// 与导入路径（importLocalClient 提取 apiKey）同形遍历 provider.options.apiKey
+		var cfg struct {
+			Provider map[string]struct {
+				Options struct {
+					APIKey string `json:"apiKey"`
+				} `json:"options"`
+			} `json:"provider"`
+		}
+		if err := json.Unmarshal([]byte(content), &cfg); err != nil {
+			return fmt.Errorf("快照 %s 内层 JSON 解析失败，拒绝还原（解析不了的快照不安全覆盖现网文件）: %w", name, err)
+		}
+		for id, p := range cfg.Provider {
+			if err := check(id+"/options.apiKey", p.Options.APIKey); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
 // RestoreLocalFromSnapshot 用导入时的快照还原本地客户端（撤销切回）。
 // 与切回同一不可逆纪律：先备份现网凭证再动笔；多实例快照以实例目录推导密钥，
-// 而还原目标恒为主 home——先按主 home 密钥预检每个 enc:v1 值可解密，
-// 避免把别的实例目录加密的快照盖到主目录后客户端全体解密失败、登录态尽失。
+// 而还原目标恒为主 home——先深入快照 JSON 内部、按主 home 密钥预检每个 enc 密文值
+// 可解密，避免把别的实例目录加密的快照盖到主目录后客户端全体解密失败、登录态尽失。
 func (m *AccountManager) RestoreLocalFromSnapshot(accountID int64) error {
 	a, err := m.db.GetAccount(accountID)
 	if err != nil {
@@ -562,13 +645,16 @@ func (m *AccountManager) RestoreLocalFromSnapshot(accountID int64) error {
 	}
 	f := resolveLocalClientFiles()
 	secret := DefaultCredentialSecret(f.home)
-	// 预检：全部密文快照值必须能在目标 home 密钥下解密才动笔
-	for name, content := range snapshot {
-		if content == "" || !IsEncryptedValue(content) {
+	// 预检：进入快照 JSON 内部逐个密文值验证目标 home 密钥可解，全部通过才动笔。
+	// 整串 enc:v1 前缀判定对快照永远不命中（快照值是 { 开头的 JSON 文档），
+	// 旧写法等同没有预检；只扫 targets 白名单内的文件，与写入范围一致
+	for _, name := range []string{"credentials.json", "config.json"} {
+		content, ok := snapshot[name]
+		if !ok || content == "" {
 			continue
 		}
-		if _, err := DecryptCredential(content, secret); err != nil {
-			return fmt.Errorf("快照 %s 无法在本地客户端密钥下解密（可能来自多实例实例目录），拒绝还原以免登出本地客户端: %w", name, err)
+		if err := checkSnapshotDecryptable(name, content, secret); err != nil {
+			return err
 		}
 	}
 	// 备份现网凭证：还原是覆盖性写入，备份是唯一可逆手段（与切回一致）

@@ -1,10 +1,12 @@
 package main
 
 import (
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -43,6 +45,7 @@ func (s *APIServer) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/auth/check", s.auth.HandleCheckAuth)
 	mux.HandleFunc("POST /api/auth/password", s.auth.HandleChangePassword)
 	mux.HandleFunc("GET /api/settings/api-key", s.auth.HandleGetAPIKey)
+	mux.HandleFunc("POST /api/settings/api-key/reveal", s.auth.HandleRevealAPIKey)
 	mux.HandleFunc("POST /api/settings/api-key/generate", s.auth.HandleGenerateAPIKey)
 
 	// 仪表盘
@@ -139,7 +142,15 @@ func (s *APIServer) handleDashboard(w http.ResponseWriter, r *http.Request) {
 		groupCount[g]++
 		totalRemaining += a.Remaining
 	}
-	stats, _ := s.db.UsageStats(7)
+	stats, statsErr := s.db.UsageStats(7)
+	if statsErr != nil {
+		// 部分分节失败不得洗成"零用量"：透传警示（UsageStats 已附 stats_errors
+		// 分节明细），前端可区分"没数据"与"查询失败"
+		log.Printf("[api] usage stats partial: %v", statsErr)
+		if stats != nil {
+			stats["stats_warning"] = statsErr.Error()
+		}
+	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"account_total":      len(accounts),
 		"account_selectable": s.pool.SelectableCount(""),
@@ -304,7 +315,10 @@ func (s *APIServer) handleImportBundle(w http.ResponseWriter, r *http.Request) {
 	}
 	count, err := s.acctMgr.ImportBundle(body.Password, body.Bundle)
 	if err != nil {
-		writeAPIError(w, http.StatusBadRequest, err.Error())
+		writeJSON(w, http.StatusBadRequest, map[string]interface{}{
+			"success": false, "imported": count,
+			"error": map[string]string{"message": err.Error(), "type": "api_error"},
+		})
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{"success": true, "imported": count})
@@ -699,7 +713,10 @@ func (s *APIServer) handleSavePlan(w http.ResponseWriter, r *http.Request) {
 		p.TaskType = "claim"
 	}
 	switch p.TaskType {
-	case "claim", "detect", "activate", "reset":
+	case "claim", "detect", "activate":
+	case "reset":
+		writeAPIError(w, http.StatusBadRequest, "重置仅支持在账号页面手动执行，不支持计划任务")
+		return
 	default:
 		writeAPIError(w, http.StatusBadRequest, "无效任务类型: "+p.TaskType)
 		return
@@ -752,6 +769,19 @@ func (s *APIServer) handleRunPlan(w http.ResponseWriter, r *http.Request) {
 	id, err := pathID(r)
 	if err != nil {
 		writeAPIError(w, http.StatusBadRequest, "invalid id")
+		return
+	}
+	plan, err := s.db.GetClaimPlan(id)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			writeAPIError(w, http.StatusNotFound, "计划不存在")
+		} else {
+			writeAPIError(w, http.StatusInternalServerError, "计划查询失败")
+		}
+		return
+	}
+	if plan.TaskType == "reset" {
+		writeAPIError(w, http.StatusBadRequest, "重置仅支持在账号页面手动执行，不支持计划任务")
 		return
 	}
 	if err := s.scheduler.RunPlanNow(id); err != nil {
@@ -864,9 +894,35 @@ func (s *APIServer) handleGetSettings(w http.ResponseWriter, r *http.Request) {
 		all["has_api_key"] = "1"
 		delete(all, "api_key")
 	}
+	// upstream_proxy 已入 vault 机密表。GET 只回剥离凭据的显示形状
+	// （scheme://host:port + upstream_proxy_has_auth 标记）：user:pass 是凭据，
+	// 纯 session 可读等于 stolen session 直接拿走出口代理凭据（与根 Key 脱敏
+	// 同一模型）。读取出错时删键而非回传密文
+	if _, ok := all["upstream_proxy"]; ok {
+		if v, err := s.db.GetSetting("upstream_proxy"); err == nil {
+			all["upstream_proxy"] = stripProxyUserinfo(v)
+			if u, perr := url.Parse(v); perr == nil && u.User != nil {
+				all["upstream_proxy_has_auth"] = "1"
+			}
+		} else {
+			delete(all, "upstream_proxy")
+		}
+	}
 	all["app_version"] = s.zapi.appVersion
 	all["listen_addr"] = s.cfg.GetListenAddr()
 	writeJSON(w, http.StatusOK, all)
+}
+
+// stripProxyUserinfo 代理 URL 剥离内嵌凭据（scheme://user:pass@host:port →
+// scheme://host:port），供 settings GET 展示；解析失败原样返回（非法值由
+// PUT 的校验拦截，展示层不做二次裁决）
+func stripProxyUserinfo(proxyURL string) string {
+	u, err := url.Parse(proxyURL)
+	if err != nil || u.User == nil {
+		return proxyURL
+	}
+	u.User = nil
+	return u.String()
 }
 
 func (s *APIServer) handlePutSettings(w http.ResponseWriter, r *http.Request) {
@@ -964,6 +1020,13 @@ func (s *APIServer) handlePutSettings(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			v = trimmed // 校验通过后存 trimmed 值，保证"所存即可解析"
+			// 脱敏回写保护：GET 只回剥离凭据的形状，UI 原样回传等于"没改"——
+			// 当新值落库会静默抹掉已存的 user:pass。与库存量值的剥离形状一致
+			// 即跳过该项保留原值。取舍：想清掉凭据但保留主机需清空整个字段重填
+			// （单独"去凭据"与脱敏形状无法区分）
+			if cur, gerr := s.db.GetSetting("upstream_proxy"); gerr == nil && cur != "" && stripProxyUserinfo(cur) == v {
+				continue
+			}
 		}
 		pending = append(pending, settingKV{k, v})
 	}

@@ -378,9 +378,8 @@ func openaiToAnthropic(body map[string]interface{}) (map[string]interface{}, err
 					"type": "tool_use", "id": id, "name": name, "input": toolInput,
 				})
 			}
-			// R6：OpenAI 客户端重放助手回合时丢失签名思考块，
-			// 按其可见输出（文本 + 工具调用）查缓存静默回填；未命中不变
-			blocks = replayThinkingBlocks(blocks)
+			// No authenticated caller/conversation scope here: matching public
+			// output must not recover another request's private signed thinking.
 		}
 		if len(blocks) > 0 {
 			// 不转发 OpenAI 的 message.name：Anthropic messages schema 只有 role/content，

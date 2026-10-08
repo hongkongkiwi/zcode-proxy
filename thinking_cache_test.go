@@ -111,9 +111,9 @@ func TestThinkingReplayKeyStable(t *testing.T) {
 	}
 }
 
-// TestOpenAIToAnthropicThinkingReplay 集成：预存签名块后，
-// OpenAI assistant 回合（文本 + tool_call）转换时签名思考块被回填到 content 首位
-func TestOpenAIToAnthropicThinkingReplay(t *testing.T) {
+// Matching global cache entries must not inject another request's thinking.
+// Assistant text and tool calls must survive conversion unchanged.
+func TestOpenAIToAnthropicDoesNotReplayGlobalThinking(t *testing.T) {
 	text := "replay-integration-unique-text"
 	input := map[string]interface{}{"city": "HK"}
 	tools := []map[string]interface{}{{"id": "call_1", "name": "get_weather", "input": input}}
@@ -153,15 +153,15 @@ func TestOpenAIToAnthropicThinkingReplay(t *testing.T) {
 		t.Fatalf("expected assistant message, got %+v", asst)
 	}
 	blocks, ok := asst["content"].([]map[string]interface{})
-	if !ok || len(blocks) != 3 {
-		t.Fatalf("expected 3 content blocks, got %+v", asst["content"])
+	if !ok || len(blocks) != 2 {
+		t.Fatalf("expected only text and tool blocks, no cached thinking: %+v", asst["content"])
 	}
-	first := blocks[0]
-	if first["type"] != "thinking" || first["signature"] != "sig123" || first["thinking"] != "chain of thought" {
-		t.Fatalf("thinking block not replayed first: %+v", first)
+	if blocks[0]["type"] != "text" || blocks[0]["text"] != text {
+		t.Fatalf("original text must survive: %+v", blocks[0])
 	}
-	if blocks[1]["type"] != "text" || blocks[2]["type"] != "tool_use" {
-		t.Fatalf("original blocks must follow: %+v", blocks[1:])
+	toolInput, _ := blocks[1]["input"].(map[string]interface{})
+	if blocks[1]["type"] != "tool_use" || blocks[1]["id"] != "call_1" || blocks[1]["name"] != "get_weather" || len(toolInput) != 1 || toolInput["city"] != "HK" {
+		t.Fatalf("original tool call must survive: %+v", blocks[1])
 	}
 
 	// 无缓存命中时不得注入/不改写

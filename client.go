@@ -318,7 +318,13 @@ func ProxyURLForNode(n *ProxyNode) string {
 // NewUpstreamHTTPClient 标准库 TLS 客户端（含 HTTP/2），用于 api.z.ai / open.bigmodel.cn
 // 等非 ESA WAF 保护的端点（实测 api.z.ai 协商 h2）。
 // cachedTransport 取共享 transport（不存在则构建并缓存）。同一 (代理, 类型, 指纹)
-// 的所有 client 共用连接池；指纹/代理设置变更由 CloseIdleClients 整体失效
+// 的所有 client 共用连接池；指纹/代理设置变更由 CloseIdleClients 整体失效。
+//
+// 复查结论（评审 F8，无需改码）：缓存键（"std|"+proxyURL / "fp|"+mode|ja3|proxyURL）
+// 与 build 闭包捕获的配置来自同一份入参——配置变更后新请求算出新键必然 miss
+// 重建，CloseIdleClients 与 LoadOrStore 的竞争最多留下一个孤儿旧 transport
+// （不可达，GC 回收），绝不会把旧代理/旧指纹的 transport 发给变更后的请求。
+// 因此不需要代际计数器；CloseIdleClients 清掉的只是旧键条目 + 空闲连接。
 func cachedTransport(key string, build func() *http.Transport) *http.Transport {
 	if v, ok := transportCache.Load(key); ok {
 		return v.(*http.Transport)

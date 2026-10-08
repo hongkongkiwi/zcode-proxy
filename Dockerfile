@@ -34,8 +34,10 @@ RUN addgroup -g 10001 app && adduser -D -u 10001 -G app -H app \
 
 COPY --from=build /out/zcode-proxy /app/zcode-proxy
 
-# SQLite DB and the auto-generated vault.key (written next to the DB file,
-# see vault.go) both live here.
+# SQLite DB, the auto-generated vault.key and the bootstrap admin password
+# file initial_admin_password (0600; written on first start instead of being
+# logged, see auth.go) all live here. Bind mounts must be chown'd 10001:10001
+# or the app cannot write them (see docker-compose.yml header).
 VOLUME ["/app/data"]
 
 # Documentation only — the real port comes from listen_addr in config/config.json

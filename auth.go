@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -36,16 +37,27 @@ type sessionEntry struct {
 
 // AuthManager 认证管理器
 type AuthManager struct {
-	mu          sync.RWMutex
-	sessions    map[string]*sessionEntry
-	fallbackPwd string
-	db          *DB
+	mu              sync.RWMutex
+	sessions        map[string]*sessionEntry
+	fallbackPwd     string
+	passwordVersion uint64 // mu 保护；改密成功后递增，拒绝在途旧口令验证
+	db              *DB
 
 	failMu   sync.Mutex
 	failures map[string]*loginFail // 登录失败限速：key = ip|user
 
+	// 锁定旁路验证冷却：key = rateKey → 上次真实口令验证时刻。锁定中每次
+	// 都跑 bcrypt 等于把猜测速率拉到 bcrypt 吞吐（无上限爆破），冷却把它压回
+	// 每窗口一次；正确口令在冷却过后的首个验证即放行（治疗性旁路保留）
+	bypassMu        sync.Mutex
+	lastBypassCheck map[string]time.Time
+
 	gwRPM gwRPMTracker // 命名网关 Key 的 RPM 滑动窗口（R1）
 }
+
+// loginBypassCooldown 锁定中两次真实口令验证之间的最小间隔（打包级变量便于
+// 测试收缩）。只挡验证次数，不挡正确口令最终登录
+var loginBypassCooldown = 30 * time.Second
 
 type loginFail struct {
 	count       int
@@ -102,7 +114,14 @@ func NewAuthManager(db *DB, password string) *AuthManager {
 				} else {
 					db.SetDefaultPasswordFlag(true)
 				}
-				log.Printf("[auth] initial admin password: %s (change it in the web UI)", pw)
+				// 口令明文不再进日志（Docker 里日志长期留存等于永久泄露）：
+				// 写入数据目录 0600 文件，日志只给路径。尽力而为——文件写不了
+				// 时必须回落日志明文，宁可泄露也不能把全新安装静默锁在门外
+				if path, ok := writeInitialAdminPasswordFile(db, pw); ok {
+					log.Printf("[auth] initial admin password written to %s (0600; change it in the web UI)", path)
+				} else {
+					log.Printf("[auth] initial admin password: %s (change it in the web UI)", pw)
+				}
 			} else {
 				log.Printf("[auth] generate admin password failed: %v", err)
 			}
@@ -119,6 +138,27 @@ func NewAuthManager(db *DB, password string) *AuthManager {
 // maxPasswordBytes bcrypt 只取前 72 字节，超长口令在 x/crypto 中直接报错；
 // 请求路径上必须在哈希前拒绝，而不是让服务进程退出
 const maxPasswordBytes = 72
+
+// initialAdminPasswordFile 引导口令落盘文件名（数据目录内，0600）
+const initialAdminPasswordFile = "initial_admin_password"
+
+// writeInitialAdminPasswordFile 把引导管理口令写入数据目录（vault.key 同目录）。
+// 返回 (文件路径, true)；数据目录不可定位/写入失败返回 false（调用方回落日志明文）。
+// 已有同名文件（如上次安装残留）直接覆盖：里面是旧库的失效口令，保留只会误导。
+func writeInitialAdminPasswordFile(db *DB, pw string) (string, bool) {
+	dir := vaultDataDir(db)
+	if dir == "" {
+		return "", false
+	}
+	path := filepath.Join(dir, initialAdminPasswordFile)
+	if err := os.WriteFile(path, []byte(pw+"\n"), 0600); err != nil {
+		log.Printf("[auth] WARNING: write %s failed: %v", path, err)
+		return "", false
+	}
+	// umask 可能放宽权限，显式收紧（与 writeVaultKeyFile 同一处理）
+	os.Chmod(path, 0600)
+	return path, true
+}
 
 // hashPassword bcrypt 哈希（新口令）；输入超长返回错误而非崩溃
 func hashPassword(pwd string) (string, error) {
@@ -146,7 +186,15 @@ func cookieSecureOverride() bool {
 }
 
 // verifyPassword 校验口令；旧 SHA-256 哈希命中后透明升级为 bcrypt
-func (am *AuthManager) verifyPassword(pwd string) bool {
+func (am *AuthManager) verifyPassword(pwd string) (valid bool) {
+	am.mu.RLock()
+	version, fallback := am.passwordVersion, am.fallbackPwd
+	am.mu.RUnlock()
+	defer func() {
+		am.mu.RLock()
+		valid = valid && version == am.passwordVersion
+		am.mu.RUnlock()
+	}()
 	stored := ""
 	if am.db != nil {
 		stored, _ = am.db.GetPasswordHash()
@@ -160,12 +208,21 @@ func (am *AuthManager) verifyPassword(pwd string) bool {
 			// 透明升级为 bcrypt；超长口令无法哈希时保持旧哈希（下次登录再试），
 			// 登录本身仍以 legacy 比对结果为准
 			if hash, err := hashPassword(pwd); err == nil {
-				am.db.SetPasswordHash(hash)
-				// 仍是缺省口令（admin/admin 老库）：标记之，UI 会提示修改
-				if pwd == "admin" {
-					am.db.SetDefaultPasswordFlag(true)
+				am.mu.Lock()
+				if version != am.passwordVersion {
+					am.mu.Unlock()
+					return false
 				}
-				log.Printf("[auth] password hash migrated to bcrypt")
+				if err := am.db.SetPasswordHash(hash); err != nil {
+					log.Printf("[auth] bcrypt migration failed: %v", err)
+				} else {
+					// 仍是缺省口令（admin/admin 老库）：标记之，UI 会提示修改
+					if pwd == "admin" {
+						am.db.SetDefaultPasswordFlag(true)
+					}
+					log.Printf("[auth] password hash migrated to bcrypt")
+				}
+				am.mu.Unlock()
 			} else {
 				log.Printf("[auth] bcrypt migration skipped: %v", err)
 			}
@@ -174,10 +231,10 @@ func (am *AuthManager) verifyPassword(pwd string) bool {
 		return false
 	}
 	// 兜底：环境变量口令（常数时间比较，长度不等直接拒绝）
-	if am.fallbackPwd == "" || len(pwd) != len(am.fallbackPwd) {
+	if fallback == "" || len(pwd) != len(fallback) {
 		return false
 	}
-	return subtle.ConstantTimeCompare([]byte(pwd), []byte(am.fallbackPwd)) == 1
+	return subtle.ConstantTimeCompare([]byte(pwd), []byte(fallback)) == 1
 }
 
 // checkLoginRate 登录限速：锁定中返回剩余时长
@@ -211,6 +268,10 @@ func (am *AuthManager) recordLoginFail(key string) {
 	f := am.failures[key]
 	if f == nil {
 		f = &loginFail{}
+		if am.failures == nil {
+			// 裸 &AuthManager{db:...}（如 handleCreateKey 的步进验证）也要能用
+			am.failures = make(map[string]*loginFail)
+		}
 		am.failures[key] = f
 	}
 	f.count++
@@ -234,6 +295,25 @@ func (am *AuthManager) clearLoginFail(key string) {
 	am.failMu.Lock()
 	delete(am.failures, key)
 	am.failMu.Unlock()
+	am.bypassMu.Lock()
+	delete(am.lastBypassCheck, key)
+	am.bypassMu.Unlock()
+}
+
+// allowBypassCheck 锁定旁路的验证预算：距上次真实验证 < loginBypassCooldown
+// 时拒绝（不跑 bcrypt、不计失败——那是限速拒绝而非一次猜测），否则盖章放行
+func (am *AuthManager) allowBypassCheck(key string) bool {
+	am.bypassMu.Lock()
+	defer am.bypassMu.Unlock()
+	if am.lastBypassCheck == nil {
+		am.lastBypassCheck = make(map[string]time.Time)
+	}
+	now := time.Now()
+	if t, ok := am.lastBypassCheck[key]; ok && now.Sub(t) < loginBypassCooldown {
+		return false
+	}
+	am.lastBypassCheck[key] = now
+	return true
 }
 
 func (am *AuthManager) adminUser() string {
@@ -256,6 +336,8 @@ func (am *AuthManager) isDefaultPassword() bool {
 		}
 		return false
 	}
+	am.mu.RLock()
+	defer am.mu.RUnlock()
 	return am.fallbackPwd == "admin"
 }
 
@@ -278,28 +360,48 @@ func GenerateAPIKey() string {
 
 // Login 验证用户名密码，创建会话（带 IP+用户名 限速）
 func (am *AuthManager) Login(username, password, clientIP string) (string, bool, time.Duration) {
+	am.mu.RLock()
+	version := am.passwordVersion
+	am.mu.RUnlock()
 	// "login|" 命名空间隔离：username 全客户端可控，裸拼会与 step-up 端点的
 	// "IP|export"/"IP|password-change" 键碰撞——同出口 IP 的攻击者可用 5 次
 	// 假登录把管理员的导出/改密 step-up 锁死
 	rateKey := "login|" + clientIP + "|" + username
 	if wait := am.checkLoginRate(rateKey); wait > 0 {
-		return "", false, wait
-	}
-
-	// 口令验证（bcrypt 比较耗时数十至百毫秒）放在会话锁外，
-	// 避免登录风暴期间阻塞所有持读锁的 /api 请求
-	if username != am.adminUser() {
-		am.recordLoginFail(rateKey)
-		return "", false, 0
-	}
-	if !am.verifyPassword(password) {
-		am.recordLoginFail(rateKey)
-		return "", false, 0
+		// 治疗性旁路：锁定中仍允许真实口令登录（锁定器防的是噪音爆破，
+		// 不该变成同 IP 攻击者 5 次假登录就能对真实管理员无限续期的自我拒绝服务），
+		// 但猜测必须有界：每 loginBypassCooldown 只做一次真实验证（其余直接
+		// 按锁定等待拒绝，不烧 bcrypt），且被验证过的错误口令照常计入失败
+		// （续期锁定）——否则锁定窗口内可无限爆破，把锁定器变成摆设
+		if username != am.adminUser() {
+			return "", false, wait
+		}
+		if !am.allowBypassCheck(rateKey) {
+			return "", false, wait
+		}
+		if !am.verifyPassword(password) {
+			am.recordLoginFail(rateKey)
+			return "", false, wait
+		}
+		// 走到下方正常登录路径：clearLoginFail 会摘除失败状态
+	} else {
+		// 口令验证（bcrypt 比较耗时数十至百毫秒）放在会话锁外，
+		// 避免登录风暴期间阻塞所有持读锁的 /api 请求
+		if username != am.adminUser() {
+			am.recordLoginFail(rateKey)
+			return "", false, 0
+		}
+		if !am.verifyPassword(password) {
+			am.recordLoginFail(rateKey)
+			return "", false, 0
+		}
 	}
 
 	am.mu.Lock()
-	// 极小窗口：验证通过后、拿锁前口令被修改，会签出一个旧口令会话；
-	// 下次登录即失效，可接受
+	if version != am.passwordVersion {
+		am.mu.Unlock()
+		return "", false, 0
+	}
 	am.clearLoginFail(rateKey)
 
 	now := time.Now()
@@ -515,47 +617,124 @@ func (am *AuthManager) HandleChangePassword(w http.ResponseWriter, r *http.Reque
 			fmt.Sprintf("尝试过于频繁，请 %d 秒后再试", int(wait.Seconds())+1))
 		return
 	}
-	// 旧口令验证（bcrypt 耗时）放在会话锁外，与 Login 同一设计——
-	// 否则改密风暴会以 ~100ms/次的速度冻结整个 /api 面
+	// 旧口令验证与新口令哈希均放在会话锁外，写入前复核版本。
+	am.mu.RLock()
+	version := am.passwordVersion
+	am.mu.RUnlock()
 	if !am.verifyPassword(body.OldPassword) {
 		am.recordLoginFail(rateKey)
 		writeAPIError(w, http.StatusUnauthorized, "old password incorrect")
 		return
 	}
-	am.clearLoginFail(rateKey)
+	hash, err := hashPassword(body.NewPassword)
+	if err != nil {
+		writeAPIError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 
 	am.mu.Lock()
 	defer am.mu.Unlock()
+	if version != am.passwordVersion {
+		writeAPIError(w, http.StatusUnauthorized, "password changed; verify current password and retry")
+		return
+	}
 
 	if am.db != nil {
-		hash, err := hashPassword(body.NewPassword)
-		if err != nil {
-			writeAPIError(w, http.StatusBadRequest, err.Error())
-			return
-		}
 		if err := am.db.SetPasswordHash(hash); err != nil {
 			writeAPIError(w, http.StatusInternalServerError, "failed to save password")
 			return
 		}
 		am.db.SetDefaultPasswordFlag(false)
+		am.fallbackPwd = ""
+	} else {
+		am.fallbackPwd = body.NewPassword
 	}
+	am.passwordVersion++
+	am.clearLoginFail(rateKey)
 	am.sessions = make(map[string]*sessionEntry)
 	log.Printf("[auth] password changed, all sessions invalidated")
 	writeJSON(w, http.StatusOK, map[string]string{"message": "password changed, please re-login"})
 }
 
 // HandleGetAPIKey GET /api/settings/api-key
+// 只回存在性与脱敏形状，绝不回明文：GET 端点仅凭 session 即可访问，
+// 明文返回等于 stolen session（XSS/失窃 cookie）直接拿走根 Key。
+// 明文经 POST /api/settings/api-key/reveal 的口令步进重认证获取（对齐导出）。
 func (am *AuthManager) HandleGetAPIKey(w http.ResponseWriter, r *http.Request) {
 	key, err := am.db.GetAPIKey()
 	if err != nil {
 		writeAPIError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	resp := map[string]interface{}{"has_api_key": key != ""}
+	if key != "" {
+		masked := "****"
+		if len(key) > 12 {
+			masked = key[:8] + "…" + key[len(key)-4:]
+		}
+		resp["api_key_masked"] = masked
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// HandleRevealAPIKey POST /api/settings/api-key/reveal
+// 步进重认证展示根 Key 明文：需再次提供当前管理口令。独立限速键 ip|api-key-reveal
+// （与登录的 ip|user 分开计数），同样指数退避——stolen session 无法无节流爆破
+// 管理员口令。与导出（handleExportBundle）同一模式，无治疗性旁路：
+// 展示不是登录，锁死只影响这次主动操作。
+func (am *AuthManager) HandleRevealAPIKey(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		VerifyPassword string `json:"verify_password"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeAPIError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	rateKey := clientIP(r) + "|api-key-reveal"
+	if wait := am.checkLoginRate(rateKey); wait > 0 {
+		writeAPIError(w, http.StatusTooManyRequests,
+			fmt.Sprintf("尝试过于频繁，请 %d 秒后再试", int(wait.Seconds())+1))
+		return
+	}
+	if !am.verifyPassword(body.VerifyPassword) {
+		am.recordLoginFail(rateKey)
+		writeAPIError(w, http.StatusUnauthorized, "管理员密码验证失败，请输入当前管理员密码")
+		return
+	}
+	am.clearLoginFail(rateKey)
+	key, err := am.db.GetAPIKey()
+	if err != nil {
+		writeAPIError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	log.Printf("[auth] API key revealed after password step-up")
 	writeJSON(w, http.StatusOK, map[string]interface{}{"api_key": key, "has_api_key": key != ""})
 }
 
 // HandleGenerateAPIKey POST /api/settings/api-key/generate
+// 与 reveal 同规的口令步进：生成即轮换并回明文，纯 session 可调等于 stolen
+// session 直接铸新根 Key（还顺带作废所有 /v1 客户端的旧 Key）。独立限速键
+// ip|api-key-generate（与登录/reveal 分开计数）。
 func (am *AuthManager) HandleGenerateAPIKey(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		VerifyPassword string `json:"verify_password"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeAPIError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	rateKey := clientIP(r) + "|api-key-generate"
+	if wait := am.checkLoginRate(rateKey); wait > 0 {
+		writeAPIError(w, http.StatusTooManyRequests,
+			fmt.Sprintf("尝试过于频繁，请 %d 秒后再试", int(wait.Seconds())+1))
+		return
+	}
+	if !am.verifyPassword(body.VerifyPassword) {
+		am.recordLoginFail(rateKey)
+		writeAPIError(w, http.StatusUnauthorized, "管理员密码验证失败，请输入当前管理员密码")
+		return
+	}
+	am.clearLoginFail(rateKey)
 	newKey := GenerateAPIKey()
 	if err := am.db.SetAPIKey(newKey); err != nil {
 		writeAPIError(w, http.StatusInternalServerError, err.Error())

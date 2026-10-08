@@ -153,6 +153,10 @@ func ResolveVaultSeed(db *DB, dbPath string) {
 	}
 	keyFile := vaultKeyFile(dbPath)
 	legacy := legacyVaultSeed()
+	// keyFileInvalid：vault.key 存在但格式非法（截断/同步工具损坏）。降级消息
+	// 必须点名这个真实病因——报"修数据目录权限"会让操作员在错误方向上打转，
+	// 真正的解法是删除或替换该文件
+	keyFileInvalid := false
 
 	// 1. 已有 keyfile：先按其种子全量验证再采用
 	if keyFile != "" {
@@ -216,7 +220,8 @@ func ResolveVaultSeed(db *DB, dbPath string) {
 				return
 			}
 		} else if _, statErr := os.Stat(keyFile); statErr == nil {
-			log.Printf("[vault] WARNING: key file %s 存在但格式非法，忽略（如需重置请手动删除）", keyFile)
+			keyFileInvalid = true
+			log.Printf("[vault] WARNING: key file %s 存在但格式非法，忽略（如需重置请手动删除该文件）", keyFile)
 		}
 	}
 
@@ -239,6 +244,14 @@ func ResolveVaultSeed(db *DB, dbPath string) {
 				setVaultSeedOverride(seed)
 				return
 			}
+		}
+		if keyFileInvalid {
+			// 病因是残留的坏 keyfile（writeVaultKeyFile 拒绝覆盖既有文件），与权限无关：
+			// 指向唯一有效解法，否则操作员修完权限重启仍在降级态
+			log.Printf("[vault] WARNING: %s exists but is not a valid key file, so a fresh key cannot be written — "+
+				"entering degraded derived-key state where credential WRITES ARE REFUSED. "+
+				"Remediation: delete or replace %s and restart.", keyFile, keyFile)
+			return
 		}
 		// 生成/落盘失败：进入派生种子降级态——凭证加密写入将被拒绝，
 		// 恢复数据目录权限后重启即可重新生成
@@ -843,5 +856,34 @@ func (db *DB) MigrateVault() error {
 	return nil
 }
 
-// vaultSecretSettings 需要静态加密的设置键
-var vaultSecretSettings = []string{"api_key", "password_hash"}
+// vaultSecretSettings 需要静态加密的设置键。
+// upstream_proxy 形如 socks5://user:pass@host:port——内嵌的代理凭据与账号列
+// 同一威胁模型：stolen zcode.db 不得直接读出出口代理凭据。加入本表后
+// SetSetting/GetSetting 透明加解密，MigrateVault 启动时会把存量明文值
+// 一次性加密（encrypt-if-plaintext，幂等），盘点/轮换/合并范围自动覆盖。
+var vaultSecretSettings = []string{"api_key", "password_hash", "upstream_proxy"}
+
+// vaultDataDir 返回 DB 文件所在目录（= vault.key 同目录 = 数据目录）。
+// 调用方（NewAuthManager 的引导逻辑）只持有 *DB、拿不到 dbPath，
+// 从连接本身的 PRAGMA database_list 取主库文件路径；拿不到（内存库/未挂载）返回 ""。
+func vaultDataDir(db *DB) string {
+	if db == nil || db.conn == nil {
+		return ""
+	}
+	rows, err := db.conn.Query(`PRAGMA database_list`)
+	if err != nil {
+		return ""
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var seq int
+		var name, file string
+		if rows.Scan(&seq, &name, &file) != nil {
+			continue
+		}
+		if name == "main" && file != "" {
+			return filepath.Dir(file)
+		}
+	}
+	return ""
+}
