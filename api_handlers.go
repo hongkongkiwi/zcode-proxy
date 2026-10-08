@@ -580,15 +580,11 @@ func (s *APIServer) handleUpdateAccount(w http.ResponseWriter, r *http.Request) 
 		writeAPIError(w, http.StatusBadRequest, "priority 取值范围 1-9999")
 		return
 	}
-	if err := s.db.UpdateAccountFields(id, group, remark, enabled, paidFallback); err != nil {
+	// 单事务更新（字段+priority 原子落库）：两条独立 UPDATE 会在第二条失败时
+	// 留下"半保存"状态，面板以为全失败而前一半已生效
+	if err := s.db.UpdateAccountFieldsWithPriority(id, group, remark, enabled, paidFallback, body.Priority); err != nil {
 		writeAPIError(w, http.StatusInternalServerError, err.Error())
 		return
-	}
-	if body.Priority != nil {
-		if err := s.db.UpdateAccountPriority(id, *body.Priority); err != nil {
-			writeAPIError(w, http.StatusInternalServerError, err.Error())
-			return
-		}
 	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{"success": true})
 }
@@ -852,6 +848,8 @@ var settingsWhitelist = map[string]bool{
 	// 闲时免费通道（off-peak ticket queue）
 	"async_enabled": true, "async_poll_interval_ms": true,
 	"async_keepalive_ms": true, "async_max_retries": true, "async_max_wait_sec": true,
+	// 用量记录保留天数（0=永久；每 6h 清扫一次）
+	"usage_retention_days": true,
 }
 
 func (s *APIServer) handleGetSettings(w http.ResponseWriter, r *http.Request) {
@@ -897,6 +895,27 @@ func (s *APIServer) handlePutSettings(w http.ResponseWriter, r *http.Request) {
 		if k == "quota_refresh_interval" {
 			if n, err := strconv.Atoi(v); err != nil || n < 0 || n > 86400 {
 				writeAPIError(w, http.StatusBadRequest, "无效刷新间隔")
+				return
+			}
+		}
+		// 用量保留天数：0=永久，上限 10 年（防手滑多零把清理变摆设）
+		if k == "usage_retention_days" {
+			if n, err := strconv.Atoi(v); err != nil || n < 0 || n > 3650 {
+				writeAPIError(w, http.StatusBadRequest, "无效保留天数（0=永久，上限 3650）")
+				return
+			}
+		}
+		// auto-reset 数值项按 UI 界限校验：静默收下非法值会让 settingInt 回落
+		// 默认（保存≠生效），或把"临期窗口"撑到 10 天令每个槽位恒"临期"
+		if k == "auto_reset_min_wait_minutes" || k == "auto_reset_expiry_spend_minutes" {
+			if n, err := strconv.Atoi(v); err != nil || n < 0 || n > 1440 {
+				writeAPIError(w, http.StatusBadRequest, "无效阈值（0-1440 分钟）")
+				return
+			}
+		}
+		if k == "auto_reset_min_wait_week_hours" {
+			if n, err := strconv.Atoi(v); err != nil || n < 0 || n > 168 {
+				writeAPIError(w, http.StatusBadRequest, "无效阈值（0-168 小时）")
 				return
 			}
 		}
@@ -978,7 +997,8 @@ func (s *APIServer) handleListProxies(w http.ResponseWriter, r *http.Request) {
 		item := map[string]interface{}{
 			"id": n.ID, "name": n.Name, "type": n.Type, "host": n.Host, "port": n.Port,
 			"username": n.Username, "has_password": n.Password != "",
-			"is_default": n.IsDefault, "group_name": n.GroupName, "enabled": n.Enabled,
+			"password_broken": n.PasswordBroken,
+			"is_default":      n.IsDefault, "group_name": n.GroupName, "enabled": n.Enabled,
 			"check_status": n.CheckStatus, "check_latency": n.CheckLatency,
 			"check_ip": n.CheckIP, "check_msg": n.CheckMsg, "check_at": n.CheckAt,
 			"created_at": n.CreatedAt, "updated_at": n.UpdatedAt,
@@ -1142,7 +1162,7 @@ func (s *APIServer) handleCaptchaSolve(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	param, region, err := s.captcha.GetVerifyParam(a)
+	param, region, err := s.captcha.GetVerifyParamCtx(r.Context(), a)
 	if err != nil {
 		writeAPIError(w, http.StatusBadGateway, err.Error())
 		return

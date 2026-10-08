@@ -15,14 +15,18 @@ import (
 // 明确边界：只领活动，绝不触碰额度重置——reset 仅支持面板手动触发。
 
 const (
-	autoClaimDefaultIntervalMin = 30 // 每轮间隔（分钟）
-	autoClaimDefaultDelaySec    = 10 // 账号间防风控延迟（秒）
-	autoClaimMinIntervalMin     = 5  // 间隔下限：过于频繁的批量 detect/claim 是风控信号
+	autoClaimDefaultIntervalMin = 30   // 每轮间隔（分钟）
+	autoClaimDefaultDelaySec    = 10   // 账号间防风控延迟（秒）
+	autoClaimMinIntervalMin     = 5    // 间隔下限：过于频繁的批量 detect/claim 是风控信号
+	autoClaimMaxIntervalMin     = 1440 // 间隔上限：超大值经 time.Duration(mins)*time.Minute 溢出为负 → 热循环
 )
 
 type AutoClaimer struct {
 	db   *DB
 	zapi *ZCodeAPI
+
+	mu          sync.Mutex
+	clampLogged string // 已告警过的超限原始值（钳制告警去重，不刷屏）
 
 	stopCh   chan struct{}
 	stopOnce sync.Once
@@ -61,7 +65,15 @@ func (ac *AutoClaimer) Start() {
 			}
 			iv := ac.interval()
 			if iv > 0 && ac.enabled() {
-				ac.RunOnce("cron")
+				// 常驻循环：单轮 panic 不得带走整个 goroutine（net/http 管不到这里）
+				func() {
+					defer func() {
+						if r := recover(); r != nil {
+							log.Printf("[auto-claim] round panic: %v", r)
+						}
+					}()
+					ac.RunOnce("cron")
+				}()
 			}
 			if iv == 0 {
 				// 手动模式（间隔显式 0）：循环空转，每分钟复查设置是否改回
@@ -78,7 +90,7 @@ func (ac *AutoClaimer) enabled() bool {
 	return v != "0" && v != "false"
 }
 
-// interval 轮询间隔（分钟）：>0 且 <5 提升到下限；非法/负数回落默认 30；
+// interval 轮询间隔（分钟）：钳制 [5,1440]；非法/负数回落默认 30；
 // 显式 0 = 手动模式：循环不自动执行，RunOnce 留给手动触发
 func (ac *AutoClaimer) interval() time.Duration {
 	mins := autoClaimDefaultIntervalMin
@@ -86,6 +98,12 @@ func (ac *AutoClaimer) interval() time.Duration {
 		if n, err := strconv.Atoi(v); err == nil {
 			if n == 0 {
 				return 0
+			}
+			if n > autoClaimMaxIntervalMin {
+				// 超上限：钳住（超大分钟数溢出 Duration 为负，t.Reset(负值)
+				// 立即触发 → 循环空转热循环）
+				ac.noteIntervalClamp(v)
+				n = autoClaimMaxIntervalMin
 			}
 			mins = n
 		}
@@ -99,6 +117,17 @@ func (ac *AutoClaimer) interval() time.Duration {
 	// +0~40% 抖动（只延长不缩短，风控保守方向）：固定周期批量打 detect 接口本身就是可聚类特征
 	jitter := time.Duration(rand.Intn(int(float64(mins)*0.4))) * time.Minute
 	return time.Duration(mins)*time.Minute + jitter
+}
+
+// noteIntervalClamp 超限钳制告警：同一原始值只告警一次（循环每轮读一次设置）
+func (ac *AutoClaimer) noteIntervalClamp(v string) {
+	ac.mu.Lock()
+	first := ac.clampLogged != v
+	ac.clampLogged = v
+	ac.mu.Unlock()
+	if first {
+		log.Printf("[auto-claim] auto_claim_interval_minutes=%s 超过上限 %d 分钟，钳制为 %d", v, autoClaimMaxIntervalMin, autoClaimMaxIntervalMin)
+	}
 }
 
 func (ac *AutoClaimer) delaySeconds() int {

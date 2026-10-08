@@ -190,7 +190,9 @@ func TestStreamCompletionsChunks(t *testing.T) {
 		if err := json.Unmarshal([]byte(strings.TrimPrefix(ln, "data: ")), &ch); err != nil {
 			t.Fatalf("unmarshal chunk %q: %v", ln, err)
 		}
-		if ch["object"] != "text_completion.chunk" {
+		// OpenAI /v1/completions 流式 chunk 的 object 是 "text_completion"
+		//（.chunk 后缀只属于 chat.completion.chunk）
+		if ch["object"] != "text_completion" {
 			t.Fatalf("chunk object = %v", ch["object"])
 		}
 		chunks = append(chunks, ch)

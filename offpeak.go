@@ -220,13 +220,6 @@ func (t offPeakTickets) status(ctx context.Context, a *Account, ticketID string)
 	return nil, fmt.Errorf("查票响应不含该票")
 }
 
-// settle 关票；4xx 已按成功处理；失败仅记日志（关票是 best-effort）。
-// 用独立 context：断连后的补偿关票不能随请求取消。
-func (t offPeakTickets) settle(a *Account, ticketID string) {
-	jwt, apiKey, deviceMid := a.credentialSnapshot()
-	t.settleSnapshot(offPeakCreds{z: t.z, jwt: jwt, apiKey: apiKey, deviceMid: deviceMid}, ticketID)
-}
-
 // offPeakCreds 关票 goroutine 用的凭证快照（无锁读取，避免与 setCredentials 竞争）
 type offPeakCreds struct {
 	z         *ZCodeAPI
@@ -238,6 +231,12 @@ type offPeakCreds struct {
 
 // settleSnapshot 同 settle，但使用凭证快照（在 spawn 前取好）
 func (t offPeakTickets) settleSnapshot(cred offPeakCreds, ticketID string) {
+	// 独立 goroutine（net/http 只恢复 handler）：panic 不得带走整个进程
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("[async] settle goroutine panic: %v", r)
+		}
+	}()
 	id := NewClientIdentity(cred.z.appVersion, cred.deviceMid)
 	settleURL := offPeakControlBase + "/ticket/" + url.QueryEscape(ticketID) + "/settle"
 	// 关票是补偿性操作：5xx/网络抖动重试一次，避免仍有效的票占住账号免费取票
@@ -280,6 +279,10 @@ func (t offPeakTickets) settleSnapshot(cred offPeakCreds, ticketID string) {
 func offPeakStateReady(s string) bool    { return s == "ready" || s == "active" }
 func offPeakStateExpired(s string) bool  { return s == "expired" || s == "not_found" }
 func offPeakStateTerminal(s string) bool { return s == "settled" || offPeakStateExpired(s) }
+
+// offPeakStateKnown 上游已知的全部票状态。未知串（上游新增/改名状态）不得
+// 无限占坑轮询——async_max_wait_sec=0 时那是唯一的终止路径
+func offPeakStateKnown(s string) bool { return offPeakStateReady(s) || offPeakStateTerminal(s) }
 
 // ---- 网关入口 ----
 
@@ -505,7 +508,16 @@ func (z *ZCodeAPI) offPeakBridge(w http.ResponseWriter, r *http.Request, a *Acco
 			return
 		}
 		settled[ticketID] = true
-		go tickets.settleSnapshot(cred, ticketID)
+		// 关票凭证取"当下"快照：401 恢复路径的 setCredentials 会就地更新本
+		// 副本，桥起点快照的旧 JWT 若已被上游吊销，关票 401 会被 4xx 分支
+		// 吞成"服务端已清理"——票实际挂着占坑到 active_deadline，零日志。
+		// credentialSnapshot 锁保护，可安全跨 goroutine 调；proxyURL 维持取票同出口
+		jwt2, apiKey2, deviceMid2 := a.credentialSnapshot()
+		if jwt2 == "" {
+			jwt2 = jwt
+		}
+		go tickets.settleSnapshot(offPeakCreds{z: z, jwt: jwt2, apiKey: apiKey2,
+			deviceMid: deviceMid2, proxyURL: cred.proxyURL}, ticketID)
 	}
 	// settleCur 关闭"当前"票（闭包捕获变量，随 retake 更新）。
 	// 只在终态路径调用：失败 / 放弃 / 客户端断开 / 响应完成——绝不取票即关。
@@ -604,6 +616,7 @@ func (z *ZCodeAPI) offPeakBridge(w http.ResponseWriter, r *http.Request, a *Acco
 
 	pollFailures := 0
 	nextKeepalive := time.Time{} // 跨轮询迭代持有：保活到期不因每次调用重派而失效
+	unknownStates := 0           // 连续未知状态计数（≥2 视同 expired，防无限轮询）
 	for attempt := 0; ; attempt++ {
 		// WAIT：票未就绪时轮询 + 保活
 		for !offPeakStateReady(ticket.State) && !offPeakStateTerminal(ticket.State) {
@@ -645,9 +658,17 @@ func (z *ZCodeAPI) offPeakBridge(w http.ResponseWriter, r *http.Request, a *Acco
 			}
 			pollFailures = 0
 			ticket = st
+			// 未知状态连续两次即视同 expired（单次可能是瞬时怪响应，
+			// 不立即丢弃有效排队票；两次则几乎必然是上游状态机变更）
+			if offPeakStateKnown(ticket.State) {
+				unknownStates = 0
+			} else if unknownStates++; unknownStates >= 2 {
+				log.Printf("[async] ticket %s… unknown state %q twice, treating as expired", safePrefixLog(ticket.ID, 8), ticket.State)
+				break // 交由下方 expired 同路分支 retake
+			}
 		}
 
-		if offPeakStateExpired(ticket.State) || ticket.State == "settled" {
+		if offPeakStateExpired(ticket.State) || ticket.State == "settled" || !offPeakStateKnown(ticket.State) {
 			next, out := retake(attempt, fmt.Sprintf("闲时票被回收（%s）", ticket.State))
 			if next == nil {
 				return out
@@ -884,11 +905,15 @@ func (z *ZCodeAPI) offPeakForward(w http.ResponseWriter, r *http.Request, a *Acc
 		flushWriter(w)
 		buf := make([]byte, 32<<10)
 		truncated := false
+		ttft := 0 // 首字节（转发侧）：主路径有计，闲时路径此前恒 0 污染看板
 		for {
 			n, rerr := sniff.Read(buf)
 			if n > 0 {
+				if ttft == 0 {
+					ttft = int(time.Since(start).Milliseconds())
+				}
 				if _, werr := w.Write(buf[:n]); werr != nil {
-					z.recordUsage(a, r, opts.payload, resp.StatusCode, start, 0, sniff.usage(), opts.clientStream)
+					z.recordUsage(a, r, opts.payload, resp.StatusCode, start, ttft, sniff.usage(), opts.clientStream)
 					return outcomeWritten
 				}
 				flushWriter(w)
@@ -913,7 +938,7 @@ func (z *ZCodeAPI) offPeakForward(w http.ResponseWriter, r *http.Request, a *Acc
 			writeSSEErrorEvent(w, msg)
 			recStatus = http.StatusBadGateway
 		}
-		z.recordUsage(a, r, opts.payload, recStatus, start, 0, sniffed, opts.clientStream)
+		z.recordUsage(a, r, opts.payload, recStatus, start, ttft, sniffed, opts.clientStream)
 		return outcomeWritten
 	}
 	// 非流式客户端：上游强制流式返回，网关聚合成完整 Anthropic message
@@ -942,7 +967,9 @@ type anthropicAgg struct {
 	id, model                string
 	blocks                   []map[string]interface{}
 	stopReason               string
-	streamError              string // 上游内联错误帧（独立于 stop_reason，不被后续 delta 掩盖）
+	stopSequence             interface{} // message_delta.stop_sequence 回显（客户端需要知道哪条命中）
+	sawMessageDelta          bool        // message_delta 到达过（干净的完整流必有；缺失 = 中途截断）
+	streamError              string      // 上游内联错误帧（独立于 stop_reason，不被后续 delta 掩盖）
 	in, out                  int
 	cacheRead, cacheCreation int
 	toolJSON                 map[int]*strings.Builder
@@ -996,6 +1023,11 @@ func aggregateAnthropicStream(r io.Reader) ([]byte, *StreamUsage, error) {
 					nb["input"] = map[string]interface{}{}
 				}
 				agg.toolJSON[idx] = &strings.Builder{}
+			case "redacted_thinking":
+				// 透传 data：剥掉会产出缺字段的块，下一轮重放必被上游拒绝
+				if data, ok := blk["data"]; ok {
+					nb["data"] = data
+				}
 			}
 			for idx >= len(agg.blocks) {
 				agg.blocks = append(agg.blocks, nil)
@@ -1072,8 +1104,12 @@ func aggregateAnthropicStream(r io.Reader) ([]byte, *StreamUsage, error) {
 				}
 			}
 			if d, ok := ev.Data["delta"].(map[string]interface{}); ok {
+				agg.sawMessageDelta = true
 				if sr, ok := d["stop_reason"].(string); ok && sr != "" {
 					agg.stopReason = sr
+				}
+				if ss, has := d["stop_sequence"]; has {
+					agg.stopSequence = ss
 				}
 			}
 		case "error":
@@ -1144,6 +1180,12 @@ func aggregateAnthropicStream(r io.Reader) ([]byte, *StreamUsage, error) {
 	if agg.id == "" && len(agg.blocks) == 0 {
 		return nil, partialUsage(agg), fmt.Errorf("upstream stream ended without any events")
 	}
+	// 有内容但没等到 message_delta（干净截断）：合成 end_turn 会把半截回答
+	// 伪装成完整消息、把截断的 tool_use 变成空参执行——与透传路径的
+	// truncated 判定同规按失败处理
+	if !agg.sawMessageDelta && agg.stopReason == "" {
+		return nil, partialUsage(agg), fmt.Errorf("upstream stream truncated before message_delta")
+	}
 	sr := agg.stopReason
 	if sr == "" {
 		sr = "end_turn"
@@ -1152,7 +1194,7 @@ func aggregateAnthropicStream(r io.Reader) ([]byte, *StreamUsage, error) {
 		"id": agg.id, "type": "message", "role": "assistant", "model": agg.model,
 		"content":       content,
 		"stop_reason":   sr,
-		"stop_sequence": nil,
+		"stop_sequence": agg.stopSequence,
 		"usage": map[string]interface{}{
 			"input_tokens": agg.in, "output_tokens": agg.out,
 			"cache_read_input_tokens": agg.cacheRead, "cache_creation_input_tokens": agg.cacheCreation,

@@ -565,10 +565,14 @@ async function submitEditAccount(id) {
     if (!group) return;
   }
   try {
+    // 空字段回落默认 100；显式键入的非法值如实 400（静默改写成 100 会让
+    // 管理员以为 0 生效了）
+    const pv = parseInt(document.getElementById('editPriority').value, 10);
+    const priority = Number.isNaN(pv) ? 100 : pv;
     await api(`/api/accounts/${id}`, { method: 'PUT', body: {
       group, remark: document.getElementById('editRemark').value,
       enabled: document.getElementById('editEnabled').checked,
-      priority: parseInt(document.getElementById('editPriority').value, 10) || 100,
+      priority,
     }});
     closeModal(); toast(t('已保存')); loadGroups(); loadAccounts();
   } catch (e) { toast(e.message, 'error'); }
@@ -734,8 +738,11 @@ function pollOAuth() {
         el.textContent = t('正在兑换 token 并提取 API Key…');
       }
     } catch (e) {
-      // 流程过期/会话失效：终止轮询，否则弹窗叠在登录页上 1.5s 一次打 401
+      // 流程过期/会话失效：终止轮询，否则弹窗叠在登录页上 1.5s 一次打 401；
+      // 同时让死状态可见（授权可能在网关侧重已完成，轮询却静默死了）
       clearInterval(oauthPollTimer);
+      const sel = document.getElementById('oauthStatus');
+      if (sel) sel.textContent = tf('轮询已停止: %s（如已完成授权请刷新账号列表）', e.message);
     }
   }, 1500);
 }
@@ -1359,7 +1366,7 @@ function renderProxies() {
   el.innerHTML = `<div class="table-wrap"><table>
     <thead><tr><th>${t('名称')}</th><th>${t('类型')}</th><th>${t('地址')}</th><th>${t('绑定分组')}</th><th>${t('默认')}</th><th>${t('启用')}</th><th>${t('检测')}</th><th style="width:180px">${t('操作')}</th></tr></thead>
     <tbody>${proxiesCache.map(n => `<tr>
-      <td style="font-weight:700">${esc(n.name || '-')}</td>
+      <td style="font-weight:700">${esc(n.name || '-')}${n.password_broken ? ` <span class="badge badge-danger" title="${t('密码密文无法用当前钥匙解密，节点已被跳过')}">${t('密码损坏')}</span>` : ''}</td>
       <td>${esc(n.type)}</td>
       <td class="mono">${esc(n.host)}:${n.port}${n.username ? ' · ' + esc(n.username) : ''}</td>
       <td>${n.group_name ? n.group_name.split(',').map(g => `<span class="pill-group" style="margin:1px">${esc(g.trim())}</span>`).join('') : '-'}</td>
@@ -1608,11 +1615,13 @@ async function runLlmTest() {
   resultEl.innerHTML = `<div class="kv-item"><div class="k">${t('状态')}</div><div class="v">${t('运行中…')}</div></div>`;
   contentEl.textContent = '';
   const t0 = performance.now();
-  let ttft = 0, text = '', think = '', events = 0, usage = null, status = 0;
+  let ttft = 0, text = '', think = '', events = 0, usage = null, status = 0, streamError = '';
   try {
     const resp = await fetch(path, { method: 'POST', headers, body: JSON.stringify(body) });
     status = resp.status;
-    if (stream && resp.body) {
+    // 非 2xx 的 JSON 错误体（鉴权/RPM/配额拒绝）必须走容错解析分支：
+    // SSE 解析器消费纯 JSON 体只会得到零帧，把真实拒绝原因吞成"（空响应）"
+    if (stream && resp.ok && resp.body) {
       const reader = resp.body.getReader();
       const dec = new TextDecoder();
       let buf = '';
@@ -1631,7 +1640,17 @@ async function runLlmTest() {
           events++;
           text += llmDeltaText(proto, data);
           think += llmDeltaThink(proto, data);
-          try { const j = JSON.parse(data); const u = llmUsageFrom(j, proto); if (u && (u.in || u.out)) usage = u; } catch (e) { }
+          try {
+            const j = JSON.parse(data);
+            const u = llmUsageFrom(j, proto);
+            if (u && (u.in || u.out)) usage = u;
+            // 网关把流内错误以 SSE 帧透传（event:error / error 键）：
+            // 不识别会把失败流记成"测试完成"
+            if (j.type === 'error' || j.error) {
+              const em = (j.error && (j.error.message || j.error.type)) || 'stream error';
+              streamError = em;
+            }
+          } catch (e) { }
         }
       }
     } else {
@@ -1661,17 +1680,21 @@ async function runLlmTest() {
     }
   } catch (e) {
     // status 在 fetch 成功后已保有真实 HTTP 码；走到这里说明请求本身失败
+    // （流中途断连 reader.read() reject 也落这里）——必须进失败判定，
+    // 否则 200 起始的流挂掉会绿灯"测试完成"
     text = tf('请求失败: %s', e.message);
+    streamError = e.message;
   }
   const latency = Math.round(performance.now() - t0);
   btn.disabled = false;
-  const ok = status >= 200 && status < 300;
+  const ok = status >= 200 && status < 300 && !streamError;
   resultEl.innerHTML = `
     <div class="kv-item"><div class="k">${t('HTTP 状态')}</div><div class="v" style="color:${ok ? 'var(--c-success-dark)' : 'var(--c-danger)'}">${status || t('网络错误')}</div></div>
     <div class="kv-item"><div class="k">${t('总延迟')}</div><div class="v">${latency}ms</div></div>
     <div class="kv-item"><div class="k">${t('首字 TTFT')}</div><div class="v">${stream ? ttft + 'ms' : '-'}</div></div>
-    <div class="kv-item"><div class="k">Tokens in/out</div><div class="v">${usage ? usage.in + ' / ' + usage.out : '-'}</div></div>
+    <div class="kv-item"><div class="k">Tokens in/out</div><div class="v">${usage ? `${usage.in ?? '-'} / ${usage.out ?? '-'}` : '-'}</div></div>
     <div class="kv-item"><div class="k">${t('SSE 事件数')}</div><div class="v">${stream ? events : '-'}</div></div>
+    ${streamError ? `<div class="kv-item"><div class="k">${t('流内错误')}</div><div class="v" style="color:var(--c-danger)">${esc(streamError)}</div></div>` : ''}
     <div class="kv-item"><div class="k">${t('协议')}</div><div class="v">${proto}${stream ? ' (stream)' : ''}</div></div>`;
   contentEl.textContent = text
     ? text
@@ -1680,7 +1703,8 @@ async function runLlmTest() {
   llmHistory.unshift({ t: new Date().toLocaleTimeString(), proto, model, status, latency, ttft, ok });
   document.getElementById('llmHistory').innerHTML = llmHistory.slice(0, 10).map(h =>
     `<div>${esc(h.t)} · ${esc(h.proto)} · ${esc(h.model)} · <span style="color:${h.ok ? 'var(--c-success-dark)' : 'var(--c-danger)'}">${h.status}</span> · ${h.latency}ms${h.ttft ? ' / ttft ' + h.ttft + 'ms' : ''}</div>`).join('');
-  if (ok) toast(t('测试完成')); else toast(tf('测试返回 %s', status), 'error');
+  if (!ok) toast(streamError ? tf('流内错误: %s', streamError) : tf('测试返回 %s', status), 'error');
+  else toast(t('测试完成'));
 }
 
 function clearLlmHistory() {

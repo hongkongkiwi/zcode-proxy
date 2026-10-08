@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"path/filepath"
 	"testing"
 	"time"
@@ -51,10 +52,10 @@ func TestExhaustedFreeAccountStillPaidSelectable(t *testing.T) {
 	if !paidChannelAvailable(fresh, now) {
 		t.Fatal("paid fallback must still accept exhausted-free account")
 	}
-	if got := p.SelectChannel("zai", "", nil, ChannelFree); got != nil {
+	if got := p.SelectChannel("zai", "", nil, nil, ChannelFree); got != nil {
 		t.Fatalf("free phase selected exhausted account: %+v", got)
 	}
-	if got := p.SelectChannel("zai", "", nil, ChannelPaid); got == nil || got.UserID != "drained" {
+	if got := p.SelectChannel("zai", "", nil, nil, ChannelPaid); got == nil || got.UserID != "drained" {
 		t.Fatalf("paid phase should select exhausted-free account, got %+v", got)
 	}
 }
@@ -68,7 +69,7 @@ func TestPaidFallbackToggle(t *testing.T) {
 		t.Fatal(err)
 	}
 	// 关闭付费回退（group/remark/enabled 保持原值）
-	if err := db.UpdateAccountFields(id, a.AccountGroup, a.Remark, true, false); err != nil {
+	if err := db.UpdateAccountFieldsWithPriority(id, a.AccountGroup, a.Remark, true, false, nil); err != nil {
 		t.Fatal(err)
 	}
 	now := time.Now().Unix()
@@ -82,14 +83,14 @@ func TestPaidFallbackToggle(t *testing.T) {
 	if !selectableForFreePhase(fresh, now) {
 		t.Fatal("free channel must remain selectable after paid toggle-off")
 	}
-	if got := p.SelectChannel("zai", "", nil, ChannelPaid); got != nil {
+	if got := p.SelectChannel("zai", "", nil, nil, ChannelPaid); got != nil {
 		t.Fatalf("paid phase should skip toggled-off account, got %+v", got)
 	}
 	// 重新开启
-	if err := db.UpdateAccountFields(id, a.AccountGroup, a.Remark, true, true); err != nil {
+	if err := db.UpdateAccountFieldsWithPriority(id, a.AccountGroup, a.Remark, true, true, nil); err != nil {
 		t.Fatal(err)
 	}
-	if got := p.SelectChannel("zai", "", nil, ChannelPaid); got == nil {
+	if got := p.SelectChannel("zai", "", nil, nil, ChannelPaid); got == nil {
 		t.Fatal("paid phase should select after toggle-on")
 	}
 }
@@ -148,7 +149,7 @@ func TestFreeSideStateDoesNotBlockPaid(t *testing.T) {
 				t.Fatal(err)
 			}
 		}
-		if got := p.SelectChannel("zai", "", nil, ChannelPaid); got == nil || got.UserID != "free-"+status {
+		if got := p.SelectChannel("zai", "", nil, nil, ChannelPaid); got == nil || got.UserID != "free-"+status {
 			t.Fatalf("paid fallback should accept %s account, got %+v", status, got)
 		}
 		if err := db.DeleteAccount(id); err != nil {
@@ -189,14 +190,14 @@ func TestPerChannelSlotGates(t *testing.T) {
 	a.ID = id
 	db.SetSetting("max_concurrent_per_account", "1")
 
-	relFree, ok := p.AcquireAccountSlot(a, ChannelFree, 50*time.Millisecond)
+	relFree, ok := p.AcquireAccountSlot(context.Background(), a, ChannelFree, 50*time.Millisecond)
 	if !ok {
 		t.Fatal("free slot acquire should succeed")
 	}
-	if _, ok := p.AcquireAccountSlot(a, ChannelFree, 50*time.Millisecond); ok {
+	if _, ok := p.AcquireAccountSlot(context.Background(), a, ChannelFree, 50*time.Millisecond); ok {
 		t.Fatal("free slot over cap should time out")
 	}
-	relPaid, ok := p.AcquireAccountSlot(a, ChannelPaid, 50*time.Millisecond)
+	relPaid, ok := p.AcquireAccountSlot(context.Background(), a, ChannelPaid, 50*time.Millisecond)
 	if !ok {
 		t.Fatal("paid slot must be independent of full free slot")
 	}
@@ -282,13 +283,13 @@ func TestAPIKeyOnlyAccountSelection(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if got := p.SelectChannel("zai", "", nil, ChannelPaidOnly); got == nil || got.UserID != "keyonly" {
+	if got := p.SelectChannel("zai", "", nil, nil, ChannelPaidOnly); got == nil || got.UserID != "keyonly" {
 		t.Fatalf("paid_only should select apikey-only account, got %+v", got)
 	}
-	if got := p.SelectChannel("zai", "", nil, ChannelFree); got != nil {
+	if got := p.SelectChannel("zai", "", nil, nil, ChannelFree); got != nil {
 		t.Fatalf("free phase must skip apikey-only account, got %+v", got)
 	}
-	if got := p.SelectChannel("zai", "", nil, ChannelPaid); got == nil || got.UserID != "keyonly" {
+	if got := p.SelectChannel("zai", "", nil, nil, ChannelPaid); got == nil || got.UserID != "keyonly" {
 		t.Fatalf("paid phase should select apikey-only account, got %+v", got)
 	}
 
@@ -297,7 +298,7 @@ func TestAPIKeyOnlyAccountSelection(t *testing.T) {
 		t.Fatal(err)
 	}
 	// 双通道账号不匹配 paid_only（它们在 never 策略下只用免费通道）
-	if got := p.SelectChannel("zai", "", nil, ChannelPaidOnly); got == nil || got.UserID != "keyonly" {
+	if got := p.SelectChannel("zai", "", nil, nil, ChannelPaidOnly); got == nil || got.UserID != "keyonly" {
 		t.Fatalf("paid_only must not match dual-channel account, got %+v", got)
 	}
 	// 唯一通道耗尽：keyonly 不再被选（status 描述的就是付费通道本身）；
@@ -305,10 +306,10 @@ func TestAPIKeyOnlyAccountSelection(t *testing.T) {
 	if err := db.SetAccountStatus(id, StatusExhausted, "monitor 额度用完", 0); err != nil {
 		t.Fatal(err)
 	}
-	if got := p.SelectChannel("zai", "", nil, ChannelPaid); got != nil && got.UserID == "keyonly" {
+	if got := p.SelectChannel("zai", "", nil, nil, ChannelPaid); got != nil && got.UserID == "keyonly" {
 		t.Fatalf("exhausted apikey-only account must be skipped, got %+v", got)
 	}
-	if got := p.SelectChannel("zai", "", nil, ChannelPaidOnly); got != nil {
+	if got := p.SelectChannel("zai", "", nil, nil, ChannelPaidOnly); got != nil {
 		t.Fatalf("exhausted apikey-only account must be skipped (paid_only), got %+v", got)
 	}
 }

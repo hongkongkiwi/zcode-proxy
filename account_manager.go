@@ -261,6 +261,11 @@ func (m *AccountManager) importLocalClient(f localClientFiles, group, remark str
 	// 异步刷新额度：在库内新副本上刷新——本副本随即被 handler 无锁序列化
 	// （accountPublicView），共享实例就地写会撕裂字符串字段（-race/segfault 面）
 	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("[import] quota refresh panic: %v", r)
+			}
+		}()
 		time.Sleep(500 * time.Millisecond)
 		fresh, err := m.db.GetAccount(id)
 		if err != nil {
@@ -311,6 +316,11 @@ func (m *AccountManager) ImportPasted(provider, name, secret, group string) (*Ac
 	if isJWT {
 		if claims, err := DecodeJWTPayload(secret); err == nil {
 			userID = firstNonEmpty(jsonStr(claims, "user_id"), jsonStr(claims, "sub"))
+			// 过期 JWT 照常导入（管理员可能手上有刷新材料），但导入时如实告警
+			if exp, ok := claims["exp"].(float64); ok && exp > 0 && time.Now().Unix() >= int64(exp) {
+				log.Printf("[import] WARNING: pasted JWT already expired at %s — first relay request will 401 until refreshed",
+					time.Unix(int64(exp), 0).Format("2006-01-02 15:04"))
+			}
 		}
 	}
 	if userID == "" {
@@ -345,6 +355,11 @@ func (m *AccountManager) ImportPasted(provider, name, secret, group string) (*Ac
 	// 异步刷新额度：与本地导入同纪律——在库内新副本上刷新，本副本随即被
 	// handler 无锁序列化（accountPublicView），共享实例并发写会撕裂字符串字段
 	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("[import] paste quota refresh panic: %v", r)
+			}
+		}()
 		time.Sleep(500 * time.Millisecond)
 		fresh, err := m.db.GetAccount(id)
 		if err != nil {

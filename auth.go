@@ -81,7 +81,11 @@ func NewAuthManager(db *DB, password string) *AuthManager {
 	if fallbackPwd == "" && db != nil {
 		hashPresent, perr := db.HasSetting("password_hash")
 		stored, _ := db.GetPasswordHash()
-		if perr == nil && hashPresent && stored == "" {
+		if perr != nil {
+			// 存在性检查自身出错：按"哈希可能存在"处理——此时引导覆盖会
+			// 不可逆地销毁原口令哈希，不确定时必须走保守分支
+			log.Printf("[auth] WARNING: password hash existence check failed (%v); bootstrap skipped", perr)
+		} else if hashPresent && stored == "" {
 			// 哈希行存在但当前钥匙解不开（错误 env / 换钥匙后启动）：
 			// 覆盖会把原口令哈希永久销毁——跳过引导，保持 env 兜底并告警
 			log.Printf("[auth] WARNING: password hash exists but cannot be decrypted with the active vault key; " +
@@ -274,7 +278,10 @@ func GenerateAPIKey() string {
 
 // Login 验证用户名密码，创建会话（带 IP+用户名 限速）
 func (am *AuthManager) Login(username, password, clientIP string) (string, bool, time.Duration) {
-	rateKey := clientIP + "|" + username
+	// "login|" 命名空间隔离：username 全客户端可控，裸拼会与 step-up 端点的
+	// "IP|export"/"IP|password-change" 键碰撞——同出口 IP 的攻击者可用 5 次
+	// 假登录把管理员的导出/改密 step-up 锁死
+	rateKey := "login|" + clientIP + "|" + username
 	if wait := am.checkLoginRate(rateKey); wait > 0 {
 		return "", false, wait
 	}
@@ -363,9 +370,10 @@ func (am *AuthManager) Middleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		path := r.URL.Path
 
-		// 免认证路径：登录接口、健康检查、Web 页面、OAuth 环回回调
+		// 免认证路径：登录接口、健康检查、Web 页面、OAuth 环回回调。
+		// /web 必须整段匹配：裸前缀会把未来的 /webhooks 之类静默变成免认证路由
 		if path == "/api/login" || path == "/health" ||
-			strings.HasPrefix(path, "/web") || strings.HasPrefix(path, "/oauth/") {
+			path == "/web" || strings.HasPrefix(path, "/web/") || strings.HasPrefix(path, "/oauth/") {
 			next.ServeHTTP(w, r)
 			return
 		}

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"path/filepath"
 	"testing"
 	"time"
@@ -79,7 +80,7 @@ func TestStickySessions(t *testing.T) {
 		}
 	}
 	// 粘滞账号停用 → 自动让位（且新粘滞落到另一账号）
-	if err := db.UpdateAccountFields(first.ID, "", "", false, false); err != nil {
+	if err := db.UpdateAccountFieldsWithPriority(first.ID, "", "", false, false, nil); err != nil {
 		t.Fatal(err)
 	}
 	other := p.SelectSticky("zai", "", "sess-x", nil)
@@ -87,7 +88,7 @@ func TestStickySessions(t *testing.T) {
 		t.Fatalf("expected fallback after disable, got %+v", other)
 	}
 	// skip 中的账号不参与粘滞：重新启用 s1，跳过 s2 → 应选中 s1
-	if err := db.UpdateAccountFields(first.ID, "", "", true, false); err != nil {
+	if err := db.UpdateAccountFieldsWithPriority(first.ID, "", "", true, false, nil); err != nil {
 		t.Fatal(err)
 	}
 	third := p.SelectSticky("zai", "", "sess-y", map[int64]bool{other.ID: true})
@@ -137,26 +138,26 @@ func TestAccountSlotGate(t *testing.T) {
 	a.ID = id
 	db.SetSetting("max_concurrent_per_account", "2")
 
-	rel1, ok := p.AcquireAccountSlot(a, "free", 50*time.Millisecond)
+	rel1, ok := p.AcquireAccountSlot(context.Background(), a, "free", 50*time.Millisecond)
 	if !ok {
 		t.Fatal("first acquire should succeed")
 	}
-	rel2, ok := p.AcquireAccountSlot(a, "free", 50*time.Millisecond)
+	rel2, ok := p.AcquireAccountSlot(context.Background(), a, "free", 50*time.Millisecond)
 	if !ok {
 		t.Fatal("second acquire should succeed")
 	}
-	if _, ok := p.AcquireAccountSlot(a, "free", 50*time.Millisecond); ok {
+	if _, ok := p.AcquireAccountSlot(context.Background(), a, "free", 50*time.Millisecond); ok {
 		t.Fatal("third acquire over cap should time out")
 	}
 	rel1()
-	rel3, ok := p.AcquireAccountSlot(a, "free", 50*time.Millisecond)
+	rel3, ok := p.AcquireAccountSlot(context.Background(), a, "free", 50*time.Millisecond)
 	if !ok {
 		t.Fatal("acquire after release should succeed")
 	}
 	rel3()
 	rel3() // 幂等：多余释放不 panic 不负计数
 	rel2() // 旧持有者的释放同样幂等（绑定获取时的同一把闸门）
-	rel4, ok := p.AcquireAccountSlot(a, "free", 50*time.Millisecond)
+	rel4, ok := p.AcquireAccountSlot(context.Background(), a, "free", 50*time.Millisecond)
 	if !ok {
 		t.Fatal("idempotent double-release should not corrupt the gate")
 	}
@@ -174,31 +175,31 @@ func TestAccountSlotGateRebuildReleaseBinding(t *testing.T) {
 	a.ID = id
 	db.SetSetting("max_concurrent_per_account", "2")
 
-	rel1, ok := p.AcquireAccountSlot(a, "free", 50*time.Millisecond)
+	rel1, ok := p.AcquireAccountSlot(context.Background(), a, "free", 50*time.Millisecond)
 	if !ok {
 		t.Fatal("first acquire should succeed")
 	}
-	rel2, ok := p.AcquireAccountSlot(a, "free", 50*time.Millisecond)
+	rel2, ok := p.AcquireAccountSlot(context.Background(), a, "free", 50*time.Millisecond)
 	if !ok {
 		t.Fatal("second acquire should succeed")
 	}
 	// 上限变更：下一次 acquire 重建闸门对象
 	db.SetSetting("max_concurrent_per_account", "3")
-	if _, ok := p.AcquireAccountSlot(a, "free", 50*time.Millisecond); !ok {
+	if _, ok := p.AcquireAccountSlot(context.Background(), a, "free", 50*time.Millisecond); !ok {
 		t.Fatal("acquire after cap change should succeed")
 	}
 	// 旧持有者释放：不得放掉新闸门的 token（修复前会错放，新闸门被放空）
 	rel1()
 	rel2()
-	a1, ok := p.AcquireAccountSlot(a, "free", 50*time.Millisecond)
+	a1, ok := p.AcquireAccountSlot(context.Background(), a, "free", 50*time.Millisecond)
 	if !ok {
 		t.Fatal("new gate acquire 1 should succeed after stale releases")
 	}
-	a2, ok := p.AcquireAccountSlot(a, "free", 50*time.Millisecond)
+	a2, ok := p.AcquireAccountSlot(context.Background(), a, "free", 50*time.Millisecond)
 	if !ok {
 		t.Fatal("new gate acquire 2 should succeed after stale releases")
 	}
-	if _, ok := p.AcquireAccountSlot(a, "free", 50*time.Millisecond); ok {
+	if _, ok := p.AcquireAccountSlot(context.Background(), a, "free", 50*time.Millisecond); ok {
 		t.Fatal("new gate should enforce its own cap after stale releases")
 	}
 	a1()

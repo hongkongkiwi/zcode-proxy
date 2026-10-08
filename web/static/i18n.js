@@ -19,14 +19,6 @@ function detectSystemLang() {
   return 'en';
 }
 
-function resolveLang() {
-  try {
-    const c = localStorage.getItem(LANG_STORAGE_KEY);
-    if (c === 'zh' || c === 'en') return c;
-  } catch (e) { /* 隐私模式等场景下 localStorage 不可用 */ }
-  return detectSystemLang();
-}
-
 function currentLocale() {
   return CURRENT_LANG === 'zh' ? 'zh-CN' : 'en-US';
 }

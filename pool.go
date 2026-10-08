@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"log"
 	"math/rand"
@@ -82,6 +83,8 @@ type AccountPool struct {
 	paidRateLast    map[int64]int         // 付费通道限流冷却升级记忆（mu 保护：30→120→300s）
 	paidRiskStrikes map[int64][]time.Time // 付费通道风控 24h 窗口计次（mu 保护，复用 riskLadder）
 
+	intervalClampLogged string // 已告警过的 quota_refresh_interval 原始值（mu 保护：钳制告警去重，不刷屏）
+
 	refreshFn func(a *Account) error // 由 ZCodeAPI 注入的额度刷新函数
 	stopCh    chan struct{}
 	stopOnce  sync.Once
@@ -108,6 +111,13 @@ const (
 
 	slotDefaultCap = 3
 	slotMaxCap     = 32
+
+	// quota_refresh_interval 读取侧钳制边界（0=关闭除外）：
+	// 上限防 time.Duration(n)*time.Second 溢出为负 → time.After(负值) 立即
+	// 触发 → 刷新热循环；下限挡亚分钟轮询（高频刷新由成功请求后的
+	// RefreshAccountQuotaThrottled 即时刷新覆盖）
+	refreshIntervalMinSec = 30
+	refreshIntervalMaxSec = 86400
 )
 
 // NewAccountPool 创建账号池
@@ -189,7 +199,28 @@ func (p *AccountPool) refreshInterval() int {
 	if n < 0 {
 		return 60
 	}
-	return n // 显式 0 = 关闭后台刷新
+	if n == 0 {
+		return 0 // 显式 0 = 关闭后台刷新
+	}
+	// 钳制 [30, 86400]（与 accountSlotCap 同式；API 写入侧已限 0-86400，
+	// 这里兜住直写库/旧版本落库的越界值）：超大 n 经 time.Duration 溢出为负
+	clamped := n
+	if clamped < refreshIntervalMinSec {
+		clamped = refreshIntervalMinSec
+	} else if clamped > refreshIntervalMaxSec {
+		clamped = refreshIntervalMaxSec
+	}
+	if clamped != n {
+		// 被钳制：同一原始值只告警一次（refreshLoop/invalidBackoff 每轮都会读）
+		p.mu.Lock()
+		first := p.intervalClampLogged != v
+		p.intervalClampLogged = v
+		p.mu.Unlock()
+		if first {
+			log.Printf("[pool] quota_refresh_interval=%s 超出 [%d,%d]s，钳制为 %ds", v, refreshIntervalMinSec, refreshIntervalMaxSec, clamped)
+		}
+	}
+	return clamped
 }
 
 // invalidBackoff invalid 账号重试退避间隔：max(refreshInterval*10, 5 分钟)
@@ -351,9 +382,21 @@ func matchAccountGroup(a *Account, group string) bool {
 
 // ---- 账号选择 ----
 
+// SnapshotAccounts 供转发热路径一次取全量账号快照：一次请求内最多会做
+// 十余次选择/提示扫描，各自 ListAccounts（逐行 6 列 vault 解密）是最坏情形
+// 下的主要 CPU 开销。快照在本请求内复用，跨请求不受影响（每请求重取）。
+func (p *AccountPool) SnapshotAccounts() []*Account {
+	accounts, err := p.db.ListAccounts("")
+	if err != nil {
+		log.Printf("[pool] snapshot list: %v", err)
+		return nil
+	}
+	return accounts
+}
+
 // Select 按策略选择账号（不限通道）。group 为空 = 不限组；skip 为已尝试过的账号 ID。
 func (p *AccountPool) Select(provider, group string, skip map[int64]bool) *Account {
-	return p.SelectChannel(provider, group, skip, "")
+	return p.SelectChannel(provider, group, nil, skip, "")
 }
 
 // channelHasCreds 通道凭证要求：候选账号必须持有该通道的凭证
@@ -367,12 +410,18 @@ func channelHasCreds(a *Account, channel string) bool {
 	return a.ZCodeJWT != "" || a.APIKey != ""
 }
 
-// SelectChannel 按策略在指定通道的候选里选账号；channel 为空 = 不限通道
-func (p *AccountPool) SelectChannel(provider, group string, skip map[int64]bool, channel string) *Account {
-	accounts, err := p.db.ListAccounts("")
-	if err != nil {
-		log.Printf("[pool] select list: %v", err)
-		return nil
+// SelectChannel 按策略在指定通道的候选里选账号；channel 为空 = 不限通道。
+// accounts 为调用方预取的快照（热路径传 SnapshotAccounts() 的结果，一次请求
+// 全程复用）；传 nil 则内部自取（非热路径/测试用）。
+// 快照取舍：本请求内其他请求/管理员/刷新循环对账号的标记不可见（skip 只挡
+// 本请求已试过的），最坏是多烧几次上游往返或 503 提示略欠准——下次请求即自愈；
+// 换来热路径上一次 ListAccounts 替代十余次。
+func (p *AccountPool) SelectChannel(provider, group string, accounts []*Account, skip map[int64]bool, channel string) *Account {
+	if accounts == nil {
+		accounts = p.SnapshotAccounts()
+		if accounts == nil {
+			return nil
+		}
 	}
 	now := time.Now().Unix()
 	var pool []*Account
@@ -453,13 +502,14 @@ func (p *AccountPool) stickyEnabled() bool {
 // SelectSticky 粘滞优先选择（不限通道）：sessionKey 命中且账号仍可选 → 复用；
 // 否则按策略选择并记录。skip（已尝试失败）的账号不粘滞。
 func (p *AccountPool) SelectSticky(provider, group, sessionKey string, skip map[int64]bool) *Account {
-	return p.SelectStickyChannel(provider, group, sessionKey, skip, "")
+	return p.SelectStickyChannel(provider, group, sessionKey, nil, skip, "")
 }
 
 // SelectStickyChannel 粘滞优先选择（通道感知）：粘滞命中时按通道可选性复验，
 // 免费侧受限的粘滞账号在付费阶段仍可粘滞复用（prompt 缓存跨通道失效，
-// 但账号一致性对排查与配额归因仍有价值）。
-func (p *AccountPool) SelectStickyChannel(provider, group, sessionKey string, skip map[int64]bool, channel string) *Account {
+// 但账号一致性对排查与配额归因仍有价值）。accounts 快照语义同 SelectChannel；
+// 粘滞命中始终走 selectableByIDChannel 的单账号实时读取（复验要新鲜状态）。
+func (p *AccountPool) SelectStickyChannel(provider, group, sessionKey string, accounts []*Account, skip map[int64]bool, channel string) *Account {
 	if sessionKey != "" && p.stickyEnabled() {
 		now := time.Now().Unix()
 		p.mu.Lock()
@@ -472,7 +522,7 @@ func (p *AccountPool) SelectStickyChannel(provider, group, sessionKey string, sk
 			}
 		}
 	}
-	a := p.SelectChannel(provider, group, skip, channel)
+	a := p.SelectChannel(provider, group, accounts, skip, channel)
 	if a != nil && sessionKey != "" && p.stickyEnabled() {
 		p.rememberSticky(sessionKey, a.ID)
 	}
@@ -553,12 +603,13 @@ func (p *AccountPool) accountSlotCap() int {
 	return n
 }
 
-// AcquireAccountSlot 占用一个在途名额（阻塞至 timeout）；false = 排队超时。
+// AcquireAccountSlot 占用一个在途名额（阻塞至 timeout）；false = 排队超时或客户端已断开。
 // 闸门按（账号×通道）隔离：免费与付费是两条上游链路，免费侧打满不得堵死付费回退。
+// ctx 取消（客户端断开）与超时同路返回——断开的请求不得继续占用队列坑位。
 // 返回绑定式 release：名额始终归还给"获取时"的那把闸门。上限设置变更会重建
 // 闸门对象——若按"当前对象"释放，旧持有者会错放新闸门的 token，在途计数被
 // 放空后并发上限失守（恰是本闸门要防的 1302 条件）。
-func (p *AccountPool) AcquireAccountSlot(a *Account, channel string, timeout time.Duration) (func(), bool) {
+func (p *AccountPool) AcquireAccountSlot(ctx context.Context, a *Account, channel string, timeout time.Duration) (func(), bool) {
 	capNow := p.accountSlotCap()
 	key := slotKey{id: a.ID, channel: channel}
 	p.mu.Lock()
@@ -585,6 +636,8 @@ func (p *AccountPool) AcquireAccountSlot(a *Account, channel string, timeout tim
 		select {
 		case ch <- struct{}{}:
 			return release, true
+		case <-ctx.Done():
+			return func() {}, false
 		default:
 			return func() {}, false
 		}
@@ -594,6 +647,8 @@ func (p *AccountPool) AcquireAccountSlot(a *Account, channel string, timeout tim
 	select {
 	case ch <- struct{}{}:
 		return release, true
+	case <-ctx.Done():
+		return func() {}, false
 	case <-timer.C:
 		return func() {}, false
 	}
@@ -631,10 +686,13 @@ func isRateLimitBody(status int, text string) bool {
 
 // ExhaustedResetInfo 返回 provider/group 下耗尽账号的最早重置时间（unix 秒）
 // 与账号名；读各自 quota_json 的 next_reset 字段（monitor 通道提供）。
-func (p *AccountPool) ExhaustedResetInfo(provider, group string) (int64, string) {
-	accounts, err := p.db.ListAccounts("")
-	if err != nil {
-		return 0, ""
+// accounts 快照语义同 SelectChannel（nil = 内部自取）。
+func (p *AccountPool) ExhaustedResetInfo(provider, group string, accounts []*Account) (int64, string) {
+	if accounts == nil {
+		accounts = p.SnapshotAccounts()
+		if accounts == nil {
+			return 0, ""
+		}
 	}
 	var until int64
 	email := ""
@@ -798,7 +856,14 @@ func (p *AccountPool) MarkPaidCooling(a *Account, reason string, seconds int) {
 	a.setPaidRuntime(reason, until)
 	p.db.SetAccountPaidStatus(a.ID, reason, until)
 	p.mu.Lock()
-	p.paidRateLast[a.ID] = seconds
+	// 升级记忆只认真实阶梯档 {30,120,300}：slot 满（10s）、鉴权失败（3600s）、
+	// 连接失败（60s）等外来冷却若原样入库，nextPaidCooldown 的 default 分支会把
+	// 下一次真实 429 直接顶到 300s——阶梯被无关失败污染（成功清零见 MarkPaidUsed）
+	if seconds == 30 || seconds == 120 || seconds == 300 {
+		p.paidRateLast[a.ID] = seconds
+	} else {
+		p.paidRateLast[a.ID] = 0
+	}
 	p.mu.Unlock()
 	log.Printf("[pool] account %s paid-channel cooling %ds: %s", a.Email, seconds, reason)
 }
@@ -860,11 +925,14 @@ func (p *AccountPool) MarkFailed(a *Account, reason string) {
 	p.db.BumpAccountFail(a.ID, reason)
 }
 
-// CoolingInfo 返回该 provider/group 下最近一个冷却中账号的恢复时间与原因（用于 503 提示）
-func (p *AccountPool) CoolingInfo(provider, group string) (int64, string) {
-	accounts, err := p.db.ListAccounts("")
-	if err != nil {
-		return 0, ""
+// CoolingInfo 返回该 provider/group 下最近一个冷却中账号的恢复时间与原因（用于 503 提示）。
+// accounts 快照语义同 SelectChannel（nil = 内部自取）。
+func (p *AccountPool) CoolingInfo(provider, group string, accounts []*Account) (int64, string) {
+	if accounts == nil {
+		accounts = p.SnapshotAccounts()
+		if accounts == nil {
+			return 0, ""
+		}
 	}
 	now := time.Now().Unix()
 	var until int64

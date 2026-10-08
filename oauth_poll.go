@@ -151,7 +151,16 @@ func (m *OAuthManager) pollLoop(flow *OAuthFlow, pollToken, flowID string, expir
 			m.finishFlow(flow, "", "授权超时，请重新发起登录")
 			return
 		}
-		ready, data, fatal := m.pollOnce(client, pollToken, flowID)
+		// 轮询循环 panic 隔离：单轮失败降级为流超时，进程与流程标记不得丢
+		ready, data, fatal := func() (ready bool, data map[string]interface{}, fatal error) {
+			defer func() {
+				if r := recover(); r != nil {
+					log.Printf("[oauth] poll %s… panic: %v", safePrefixLog(flowID, 8), r)
+					fatal = fmt.Errorf("internal error")
+				}
+			}()
+			return m.pollOnce(client, pollToken, flowID)
+		}()
 		if fatal != nil {
 			m.finishFlow(flow, "", "授权失败: "+fatal.Error())
 			log.Printf("[oauth] poll %s… fatal: %v", safePrefixLog(flowID, 8), fatal)

@@ -14,7 +14,9 @@ package main
 
 import (
 	"crypto/rand"
+	"database/sql"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -319,11 +321,16 @@ func (db *DB) scanVaultCiphertext(seed string) (total, broken int, err error) {
 		}
 		rows.Close()
 	}
-	// 设置表机密项同样纳入盘点（轮换/合并决策必须看到全部密文）
+	// 设置表机密项同样纳入盘点（轮换/合并决策必须看到全部密文）。
+	// 仅 ErrNoRows 视为未设置；其余读错误必须上抛——"扫不到"当"没有"
+	// 会基于错误前提换钥匙，把密文永久留在旧钥匙下
 	for _, key := range vaultSecretSettings {
 		var val string
 		if err := db.conn.QueryRow(`SELECT value FROM settings WHERE key = ?`, key).Scan(&val); err != nil {
-			continue // 键未设置
+			if errors.Is(err, sql.ErrNoRows) {
+				continue // 键未设置
+			}
+			return total, broken, fmt.Errorf("scan setting %s: %w", key, err)
 		}
 		if !strings.HasPrefix(val, vaultPrefix) {
 			continue
@@ -423,11 +430,14 @@ func (db *DB) consolidateMixedVaultRows(keySeed, legacySeed string) (int, int, e
 		}
 		moved += len(updates)
 	}
-	// 设置表机密项并入 keySeed（与盘点/轮换范围一致）
+	// 设置表机密项并入 keySeed（与盘点/轮换范围一致；读错误上抛，理由同盘点）
 	for _, key := range vaultSecretSettings {
 		var val string
 		if err := tx.QueryRow(`SELECT value FROM settings WHERE key = ?`, key).Scan(&val); err != nil {
-			continue // 键未设置
+			if errors.Is(err, sql.ErrNoRows) {
+				continue // 键未设置
+			}
+			return moved, stuck, fmt.Errorf("consolidate read setting %s: %w", key, err)
 		}
 		if !strings.HasPrefix(val, vaultPrefix) {
 			continue
@@ -551,11 +561,15 @@ func (db *DB) reencryptVaultColumns(oldSeed, newSeed string) (int, error) {
 		}
 		moved += len(updates)
 	}
-	// 设置表机密项一并轮换（与 scanVaultCiphertext 的盘点范围保持一致）
+	// 设置表机密项一并轮换（与 scanVaultCiphertext 的盘点范围保持一致；
+	// 读错误上抛——轮换中途漏读同样留下混钥匙状态）
 	for _, key := range vaultSecretSettings {
 		var val string
 		if err := tx.QueryRow(`SELECT value FROM settings WHERE key = ?`, key).Scan(&val); err != nil {
-			continue // 键未设置
+			if errors.Is(err, sql.ErrNoRows) {
+				continue // 键未设置
+			}
+			return 0, fmt.Errorf("reencrypt read setting %s: %w", key, err)
 		}
 		if !strings.HasPrefix(val, vaultPrefix) {
 			continue
@@ -681,16 +695,23 @@ func vaultEncrypt(plain string) (string, error) {
 }
 
 func vaultDecrypt(value string) string {
+	out, _ := vaultDecryptOK(value)
+	return out
+}
+
+// vaultDecryptOK 解密单值并区分"明文/为空"（ok=true）与"密文解不开"
+// （ok=false，值返回 ""）——调用方据此把节点标记为凭证损坏而不是密码为空
+func vaultDecryptOK(value string) (string, bool) {
 	if value == "" || !strings.HasPrefix(value, vaultPrefix) {
-		return value
+		return value, true
 	}
 	// vault1: 与 enc:v1 信封布局一致，仅前缀与密钥不同
 	out, err := DecryptCredential(encPrefix+strings.TrimPrefix(value, vaultPrefix), VaultSecret())
 	if err != nil {
 		log.Printf("[vault] decrypt failed: %v", err)
-		return ""
+		return "", false
 	}
-	return out
+	return out, true
 }
 
 // MigrateVault 把存量明文凭证列加密（幂等：已加密值跳过）。启动时调用一次。
@@ -743,11 +764,19 @@ func (db *DB) MigrateVault() error {
 			hadUpdates = true
 		}
 	}
-	// 设置表机密项（网关 sk- 密钥、bcrypt 口令哈希）一并入库加密
+	// 设置表机密项（网关 sk- 密钥、bcrypt 口令哈希）一并入库加密。
+	// 读错误上抛（迁移幂等，下轮重启重试）：静默跳过会让明文连同
+	// WAL 残留一直躺在库里，且没有任何告警
 	for _, key := range vaultSecretSettings {
 		var val string
 		err := db.conn.QueryRow(`SELECT value FROM settings WHERE key = ?`, key).Scan(&val)
-		if err != nil || val == "" || strings.HasPrefix(val, vaultPrefix) {
+		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				continue
+			}
+			return fmt.Errorf("vault migrate read setting %s: %w", key, err)
+		}
+		if val == "" || strings.HasPrefix(val, vaultPrefix) {
 			continue
 		}
 		enc, err := EncryptCredential(val, secret)
@@ -801,9 +830,14 @@ func (db *DB) MigrateVault() error {
 		hadUpdates = true
 	}
 	if hadUpdates {
-		// 迁移前的明文会残留在 WAL 与空闲页：checkpoint 截断 WAL，VACUUM 重写并清空 freelist
-		db.conn.Exec(`PRAGMA wal_checkpoint(TRUNCATE)`)
-		db.conn.Exec(`VACUUM`)
+		// 迁移前的明文会残留在 WAL 与空闲页：checkpoint 截断 WAL，VACUUM 重写并清空 freelist。
+		// 任一步失败（外部读者占锁等）必须如实告警——明文残留仍在，不能谎报已清
+		if _, err := db.conn.Exec(`PRAGMA wal_checkpoint(TRUNCATE)`); err != nil {
+			log.Printf("[vault] WARNING: wal_checkpoint failed: %v — plaintext residue remains in WAL", err)
+		}
+		if _, err := db.conn.Exec(`VACUUM`); err != nil {
+			log.Printf("[vault] WARNING: VACUUM failed: %v — plaintext residue remains in freelist pages", err)
+		}
 		log.Printf("[vault] post-migration WAL checkpoint + VACUUM done (plaintext residue scrubbed)")
 	}
 	return nil

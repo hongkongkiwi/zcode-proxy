@@ -130,8 +130,15 @@ window.initAliyunCaptcha({
 </script></body></html>`
 }
 
-// GetVerifyParam 获取有效验证参数（缓存 → 宽限期旧值 → 重新求解）
+// GetVerifyParam 获取有效验证参数（缓存 → 宽限期旧值 → 重新求解）。
+// 后台路径用（无客户端可断）；前台请用 GetVerifyParamCtx
 func (s *CaptchaService) GetVerifyParam(a *Account) (param, region string, err error) {
+	return s.GetVerifyParamCtx(context.Background(), a)
+}
+
+// GetVerifyParamCtx 同上，前台路径用：ctx 取消（客户端断开/请求超时）即刻
+// 放弃等待——在跑的尝试不中断，转入后台继续并把结果写入缓存（不白烧）
+func (s *CaptchaService) GetVerifyParamCtx(ctx context.Context, a *Account) (param, region string, err error) {
 	mode := s.getSetting("captcha_mode")
 	if mode == "off" {
 		return "", "", nil // 关闭验证码：直连（上游可能已放宽）
@@ -159,7 +166,7 @@ func (s *CaptchaService) GetVerifyParam(a *Account) (param, region string, err e
 	}
 	s.mu.Unlock()
 
-	return s.solveOnce(a)
+	return s.solveOnce(ctx, a)
 }
 
 func (s *CaptchaService) getSetting(key string) string {
@@ -196,13 +203,16 @@ func (s *CaptchaService) tryAcquireSolve(sem chan struct{}) bool {
 	}
 }
 
-// acquireSolve 有界等待获取求解权：最长等 captchaAcquireTimeout，超时返回 false（前台同步路径用）
-func (s *CaptchaService) acquireSolve(sem chan struct{}) bool {
+// acquireSolve 有界等待获取求解权：最长等 captchaAcquireTimeout 或 ctx 取消，
+// 返回 false（前台同步路径用）
+func (s *CaptchaService) acquireSolve(ctx context.Context, sem chan struct{}) bool {
 	timer := time.NewTimer(captchaAcquireTimeout)
 	defer timer.Stop()
 	select {
 	case sem <- struct{}{}:
 		return true
+	case <-ctx.Done():
+		return false
 	case <-timer.C:
 		return false
 	}
@@ -215,37 +225,58 @@ func (s *CaptchaService) refreshInBackground(a *Account) {
 	if !s.tryAcquireSolve(sem) {
 		return
 	}
-	defer s.releaseSolve(sem)
-	s.doSolve(a, captchaSolveBudgetBack)
+	// 后台续跑无客户端可断：Background 语义，预算内自行结束并释放
+	s.doSolve(context.Background(), a, captchaSolveBudgetBack, func() { s.releaseSolve(sem) })
 }
 
-func (s *CaptchaService) solveOnce(a *Account) (string, string, error) {
+func (s *CaptchaService) solveOnce(ctx context.Context, a *Account) (string, string, error) {
 	sem := s.groupSem(a)
-	if !s.acquireSolve(sem) {
+	if !s.acquireSolve(ctx, sem) {
+		if ctx.Err() != nil {
+			return "", "", fmt.Errorf("请求已取消")
+		}
 		return "", "", fmt.Errorf("验证码求解繁忙（等待 %v 超时），请稍后重试", captchaAcquireTimeout)
 	}
-	defer s.releaseSolve(sem)
-
 	key := s.cacheKey(a)
 	// 双检：等信号量期间可能已被其他请求求解成功
 	s.mu.Lock()
 	if e, ok := s.cache[key]; ok && time.Since(e.at) < captchaCacheTTL {
 		p, r := e.param, e.region
 		s.mu.Unlock()
+		s.releaseSolve(sem)
 		return p, r, nil
 	}
 	s.mu.Unlock()
-	return s.doSolve(a, captchaSolveBudgetFront)
+	// sem 所有权移交 doSolve：由它在真正结束时释放（含 detach 转后台的场景）
+	return s.doSolve(ctx, a, captchaSolveBudgetFront, func() { s.releaseSolve(sem) })
 }
 
-func (s *CaptchaService) doSolve(a *Account, budget time.Duration) (string, string, error) {
+// recordSolveSuccess 成功入缓存（前台/后台续跑共用同一条写入路径）
+func (s *CaptchaService) recordSolveSuccess(key, param, region string) {
+	s.mu.Lock()
+	s.cache[key] = &captchaCacheEntry{param: param, region: region, at: time.Now()}
+	delete(s.failAt, key)
+	s.manual = false // 成功后回到无头模式
+	s.mu.Unlock()
+}
+
+// doSolve 求解重试循环。release（组信号量释放权）由本函数在真正结束时调用
+// 恰好一次：正常结束原地释放；ctx 取消时剩余尝试移交后台续跑方释放——
+// 调用方立即拿到超时错误，不持有也不释放信号量
+func (s *CaptchaService) doSolve(ctx context.Context, a *Account, budget time.Duration, release func()) (string, string, error) {
 	key := s.cacheKey(a)
-	cc, err := s.fetchConfig(a)
+	cc, err := s.fetchConfig(ctx, a)
 	if err != nil {
-		s.markFail(key)
+		// ctx 取消（客户端断开/前台预算到点）不是求解失败：不进 60s 风控冷却，
+		// 否则一次取消会让该出口组所有请求 60 秒内跳过求解降级直连
+		if ctx.Err() == nil {
+			s.markFail(key)
+		}
+		release()
 		return "", "", err
 	}
 	if !cc.Enabled {
+		release()
 		return "", "", nil // 上游未开启验证码
 	}
 
@@ -272,18 +303,44 @@ func (s *CaptchaService) doSolve(a *Account, budget time.Duration) (string, stri
 			break
 		}
 		attempts = attempt
-		param, err := s.solveWithBrowser(cc, headless, a)
-		if err == nil && param != "" {
-			s.mu.Lock()
-			s.cache[key] = &captchaCacheEntry{param: param, region: cc.Region, at: time.Now()}
-			delete(s.failAt, key)
-			s.manual = false // 成功后回到无头模式
-			s.mu.Unlock()
-			log.Printf("[captcha] solved (headless=%v, attempt=%d, len=%d)", headless, attempt, len(param))
-			return param, cc.Region, nil
+		// 尝试在独立 goroutine 跑（内部有 30s 启动 + 40s 求解上界，必然自终）：
+		// ctx 取消时前台即刻放弃，在跑尝试由后台接管等完并续跑剩余预算
+		type attemptRes struct {
+			param string
+			err   error
 		}
-		lastErr = err
-		log.Printf("[captcha] solve attempt %d failed (headless=%v): %v", attempt, headless, err)
+		resCh := make(chan attemptRes, 1)
+		go func() {
+			p, err := s.solveWithBrowser(cc, headless, a)
+			resCh <- attemptRes{p, err}
+		}()
+		var res attemptRes
+		select {
+		case res = <-resCh:
+		case <-ctx.Done():
+			abandon := budget - time.Since(start)
+			if abandon < 30*time.Second {
+				abandon = 30 * time.Second
+			}
+			go func() {
+				res := <-resCh // 串行等在跑尝试结束（防同组并发求解）
+				if res.param != "" {
+					s.recordSolveSuccess(key, res.param, cc.Region)
+					release()
+					return
+				}
+				s.doSolve(context.Background(), a, abandon, release)
+			}()
+			return "", "", fmt.Errorf("验证码求解等待超时（已转后台，成功后将写入缓存）")
+		}
+		if res.err == nil && res.param != "" {
+			s.recordSolveSuccess(key, res.param, cc.Region)
+			log.Printf("[captcha] solved (headless=%v, attempt=%d, len=%d)", headless, attempt, len(res.param))
+			release()
+			return res.param, cc.Region, nil
+		}
+		lastErr = res.err
+		log.Printf("[captcha] solve attempt %d failed (headless=%v): %v", attempt, headless, res.err)
 		// 无头连续失败 2 次后升级有头手动模式
 		if headless && attempt >= 2 {
 			headless = false
@@ -294,6 +351,7 @@ func (s *CaptchaService) doSolve(a *Account, budget time.Duration) (string, stri
 			log.Printf("[captcha] switching to headed manual mode")
 		}
 	}
+	release()
 	s.markFail(key)
 	if lastErr == nil {
 		lastErr = fmt.Errorf("求解器未返回参数") // 理论不可达：成功路径已提前 return
@@ -335,7 +393,15 @@ func (s *CaptchaService) StartPrewarm(stopCh <-chan struct{}) {
 				return
 			case <-t.C:
 			}
-			s.prewarmOnce()
+			// 常驻循环：单轮 panic 不得带走保温（验证码缓存从此不再刷新）
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						log.Printf("[captcha] prewarm round panic: %v", r)
+					}
+				}()
+				s.prewarmOnce()
+			}()
 			t.Reset(prewarmTick)
 		}
 	}()
@@ -431,7 +497,7 @@ func (s *CaptchaService) Status() map[string]interface{} {
 }
 
 // fetchConfig 获取并缓存验证码配置
-func (s *CaptchaService) fetchConfig(a *Account) (*CaptchaConfig, error) {
+func (s *CaptchaService) fetchConfig(ctx context.Context, a *Account) (*CaptchaConfig, error) {
 	s.mu.Lock()
 	if s.config != nil && time.Since(s.configAt) < captchaConfigTTL {
 		c := s.config
@@ -444,7 +510,10 @@ func (s *CaptchaService) fetchConfig(a *Account) (*CaptchaConfig, error) {
 	// 配置接口无需认证，但必须走全局出口代理（与上游其余调用同一网络路径），
 	// 否则配置直连失败会让所有求解在起点就报废
 	client := ClientForURL(captchaGlobalProxyHook(), urlStr, 20*time.Second)
-	req, _ := http.NewRequest("GET", urlStr, nil)
+	req, err := http.NewRequestWithContext(ctx, "GET", urlStr, nil)
+	if err != nil {
+		return nil, fmt.Errorf("验证码配置请求构造失败: %w", err)
+	}
 	id := NewClientIdentity(s.appVersion, "")
 	for k, v := range ZaiClientHeaders(id) {
 		req.Header.Set(k, v)

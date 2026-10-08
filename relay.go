@@ -129,6 +129,11 @@ func (z *ZCodeAPI) relay(w http.ResponseWriter, r *http.Request, rc *relayCtx) {
 	start := time.Now()
 	sessionKey := rc.sessionKey()
 	policy := z.pool.PaidFallbackPolicy()
+	// 本请求的全量账号快照：一次取用，选择/503 提示全程复用（热路径上
+	// 逐次 ListAccounts 的逐行 vault 解密是最坏情形的主要 CPU 开销）。
+	// 取舍：本请求内其他请求对账号的标记不可见（skip 只挡本请求已试过的），
+	// 最坏多烧几次受限账号的往返，下次请求自愈；后台任务一律用库内新副本
+	accounts := z.pool.SnapshotAccounts()
 
 	// 阶段一：免费通道。balanced 策略下免费侧"软受限"（风控拦截/验证码拒绝）
 	// 立刻同账号试付费通道；硬失败（耗尽/限流/凭证失效）与 free_first 一致交给阶段二
@@ -138,7 +143,7 @@ func (z *ZCodeAPI) relay(w http.ResponseWriter, r *http.Request, rc *relayCtx) {
 	}
 	tried := map[int64]bool{}
 	for attempt := 0; attempt < maxAccountAttempts; attempt++ {
-		a := z.pool.SelectStickyChannel(rc.provider, rc.group, sessionKey, tried, ChannelFree)
+		a := z.pool.SelectStickyChannel(rc.provider, rc.group, sessionKey, accounts, tried, ChannelFree)
 		if a == nil {
 			break
 		}
@@ -167,7 +172,7 @@ func (z *ZCodeAPI) relay(w http.ResponseWriter, r *http.Request, rc *relayCtx) {
 	// never 策略不进付费阶段，但纯 API Key 账号（无 JWT，付费是唯一通道）仍须可服务
 	if policy == PaidModeNever && paidCapReason == "" {
 		for attempt := 0; attempt < maxAccountAttempts; attempt++ {
-			a := z.pool.SelectStickyChannel(rc.provider, rc.group, sessionKey, tried, ChannelPaidOnly)
+			a := z.pool.SelectStickyChannel(rc.provider, rc.group, sessionKey, accounts, tried, ChannelPaidOnly)
 			if a == nil {
 				break
 			}
@@ -198,7 +203,7 @@ func (z *ZCodeAPI) relay(w http.ResponseWriter, r *http.Request, rc *relayCtx) {
 			}
 		}
 		for attempt := 0; attempt < maxAccountAttempts; attempt++ {
-			a := z.pool.SelectStickyChannel(rc.provider, rc.group, sessionKey, triedPaid, ChannelPaid)
+			a := z.pool.SelectStickyChannel(rc.provider, rc.group, sessionKey, accounts, triedPaid, ChannelPaid)
 			if a == nil {
 				break
 			}
@@ -225,7 +230,7 @@ func (z *ZCodeAPI) relay(w http.ResponseWriter, r *http.Request, rc *relayCtx) {
 		msg += "；" + paidSkipReason
 	}
 	// 若因冷却导致无可用账号，给出预计恢复时间
-	if until, reason := z.pool.CoolingInfo(rc.provider, rc.group); until > 0 {
+	if until, reason := z.pool.CoolingInfo(rc.provider, rc.group, accounts); until > 0 {
 		secs := until - time.Now().Unix()
 		if secs < 0 {
 			secs = 0
@@ -234,7 +239,7 @@ func (z *ZCodeAPI) relay(w http.ResponseWriter, r *http.Request, rc *relayCtx) {
 	}
 	// F3：耗尽账号的上游重置时间已知时如实告知（monitor 通道 nextResetTime）。
 	// 不带账号邮箱/展示名：503 体面向命名 Key 持有方（可能发给第三方）
-	if until, _ := z.pool.ExhaustedResetInfo(rc.provider, rc.group); until > 0 {
+	if until, _ := z.pool.ExhaustedResetInfo(rc.provider, rc.group, accounts); until > 0 {
 		mins := (until - time.Now().Unix()) / 60
 		if mins < 0 {
 			mins = 0
@@ -310,9 +315,12 @@ func (z *ZCodeAPI) tryAccount(w http.ResponseWriter, r *http.Request, a *Account
 
 	needsCaptcha := rc.provider == "zai" && a.AuthType == "jwt" && a.ZCodeJWT != ""
 
-	// 路径 1：JWT + 阿里云无痕验证码（含失效重解重试）；无可用验证参数时跳过（与路径 2 直连等价）
+	// 路径 1：JWT + 阿里云无痕验证码（含失效重解重试）；无可用验证参数时跳过（与路径 2 直连等价）。
+	// 求解等待上限 45s（文档承诺值）：ctx 超时即放弃，在跑尝试转后台入缓存
 	if needsCaptcha {
-		verifyParam, region, err := z.captcha.GetVerifyParam(a)
+		captchaCtx, captchaCancel := context.WithTimeout(r.Context(), captchaSolveBudgetFront)
+		verifyParam, region, err := z.captcha.GetVerifyParamCtx(captchaCtx, a)
+		captchaCancel()
 		if err != nil {
 			note("人机校验求解失败: " + truncate(err.Error(), 180))
 		} else if verifyParam != "" {
@@ -422,10 +430,16 @@ func (z *ZCodeAPI) forwardOnce(w http.ResponseWriter, r *http.Request, a *Accoun
 	rc *relayCtx, start time.Time, pathLabel, channel string) relayOutcome {
 
 	// 每（账号×通道）并发闸门：排队而非打满并发（上游 1302 并发超限的根治手段）。
-	// 排队 45s 仍无名额 → 让位下一候选（10s 短冷却，很快回来）。
+	// 排队 45s 仍无名额或客户端已断开 → 让位下一候选（10s 短冷却，很快回来）。
 	// release 绑定获取时的闸门对象：设置变更重建闸门后旧持有者不会错放新闸门
-	release, ok := z.pool.AcquireAccountSlot(a, channel, 45*time.Second)
+	release, ok := z.pool.AcquireAccountSlot(r.Context(), a, channel, 45*time.Second)
 	if !ok {
+		// 客户端已断开（ctx 取消/超时）：与下方 client.Do 的取消处理同规——
+		// 不动账号状态直接终止。否则一次断连会给排队中的健康账号泼一轮假
+		// “并发已满”10s 冷却（逐个污染候选账号，最多 ~10 个/断连）
+		if r.Context().Err() != nil {
+			return outcomeUpstreamError
+		}
 		if channel == ChannelPaid {
 			z.pool.MarkPaidCooling(a, "付费通道并发已满（在途请求达到上限），短暂冷却", 10)
 		} else {
@@ -485,18 +499,37 @@ func (z *ZCodeAPI) forwardOnce(w http.ResponseWriter, r *http.Request, a *Accoun
 				return outcomeNextAccount
 			}
 
+			// 无 CF 指纹但返回 HTML：阿里云 WAF（上游跑在阿里云，拦截页不带 CF
+			// 指纹）、其他防护或中间代理错误页。API 端点正常只回 JSON，4xx/5xx
+			// + HTML 与凭证无关，与上方 CF 分支同待遇：只冷通道，绝不判死账号，
+			// 也不当验证码被拒
+			if strings.Contains(resp.Header.Get("Content-Type"), "text/html") {
+				z.markChannelFailure(a, channel, fmt.Sprintf("上游返回 HTML 拦截/错误页 HTTP %d", resp.StatusCode), 300)
+				return outcomeNextAccount
+			}
+
 			// 验证码被拒：失效缓存 → 重解 → 带新参数重试本路径
 			if isCaptchaError(text) && (resp.StatusCode == 400 || resp.StatusCode == 401 || resp.StatusCode == 403) {
 				if verifyParam != "" && attempt+1 < retries {
 					z.captcha.InvalidateFor(a)
 					log.Printf("[relay] account %s captcha rejected, re-solving", a.Email)
-					newParam, newRegion, err := z.captcha.GetVerifyParam(a)
+					captchaCtx, captchaCancel := context.WithTimeout(r.Context(), captchaSolveBudgetFront)
+					newParam, newRegion, err := z.captcha.GetVerifyParamCtx(captchaCtx, a)
+					captchaCancel()
 					if err == nil && newParam != "" {
 						verifyParam, region = newParam, newRegion
 						continue
 					}
 				}
 				return outcomeCaptchaRejected
+			}
+
+			// 风控拦截（3012）先于凭证分支判类：上游曾以 401/403 壳携带 3012 体，
+			// 落进凭证分支会烧一次 90s 刷新退避再把临时风控标记的账号标成
+			// invalid（需人工干预）；短冷却后真死的凭证会再次失败，无害
+			if isRiskBlocked(text) {
+				log.Printf("[relay] account %s risk-blocked on %s path", a.DisplayNameOrEmail(), pathLabel)
+				return outcomeRiskBlocked
 			}
 
 			switch {
@@ -546,11 +579,6 @@ func (z *ZCodeAPI) forwardOnce(w http.ResponseWriter, r *http.Request, a *Accoun
 					z.pool.MarkCooling(a, fmt.Sprintf("%s，冷却 %ds", reason, cool), cool)
 				}
 				return outcomeNextAccount
-			case isRiskBlocked(text):
-				// 3012 unusual activity：风控拦截。不立即冷却，先试本模式内其余路径
-				//（api.z.ai 是独立服务，通常不受免费侧风控影响）
-				log.Printf("[relay] account %s risk-blocked on %s path", a.DisplayNameOrEmail(), pathLabel)
-				return outcomeRiskBlocked
 			case isExhaustedError(resp.StatusCode, text):
 				if channel == ChannelPaid {
 					// 付费通道余额/额度不足：长冷却留充值自愈窗口，免费侧不受牵连
@@ -558,10 +586,25 @@ func (z *ZCodeAPI) forwardOnce(w http.ResponseWriter, r *http.Request, a *Accoun
 					return outcomeNextAccount
 				}
 				z.pool.MarkExhausted(a, "额度已用完")
+				// 后台任务在库内新副本上跑：relay 的账号快照被本请求的 503 提示
+				// 扫描无锁读取，共享实例就地写（setQuota/setRuntime）会与之竞态。
 				// 走节流+单飞版本：并发请求同时撞上同一耗尽账号时只拉一次 billing
-				z.goBackground("quota-refresh", func() { z.RefreshAccountQuotaThrottled(a) })
+				exhaustedID := a.ID
+				z.goBackground("quota-refresh", func() {
+					fresh, err := z.db.GetAccount(exhaustedID)
+					if err != nil {
+						return
+					}
+					z.RefreshAccountQuotaThrottled(fresh)
+				})
 				// 自动重置策略（默认关闭）：耗尽且自然窗口等待超阈值时才消耗重置
-				z.goBackground("auto-reset", func() { z.MaybeAutoReset(a, "relay") })
+				z.goBackground("auto-reset", func() {
+					fresh, err := z.db.GetAccount(exhaustedID)
+					if err != nil {
+						return
+					}
+					z.MaybeAutoReset(fresh, "relay")
+				})
 				return outcomeNextAccount
 			}
 
@@ -581,7 +624,15 @@ func (z *ZCodeAPI) forwardOnce(w http.ResponseWriter, r *http.Request, a *Accoun
 		} else {
 			z.pool.MarkUsed(a)
 		}
-		z.goBackground("relay-success-quota", func() { z.RefreshAccountQuotaThrottled(a) })
+		// 同耗尽路径：后台刷新用库内新副本，不在 relay 快照实例上就地写
+		successID := a.ID
+		z.goBackground("relay-success-quota", func() {
+			fresh, err := z.db.GetAccount(successID)
+			if err != nil {
+				return
+			}
+			z.RefreshAccountQuotaThrottled(fresh)
+		})
 		log.Printf("[relay] account %s success via %s [%s] (HTTP %d)", a.DisplayNameOrEmail(), pathLabel, channel, resp.StatusCode)
 
 		contentType := resp.Header.Get("Content-Type")
@@ -598,12 +649,23 @@ func (z *ZCodeAPI) forwardOnce(w http.ResponseWriter, r *http.Request, a *Accoun
 		if !isStream {
 			body, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<20))
 			resp.Body.Close()
+			// 撞到 64MB 上限（LimitReader EOF 与真实 EOF 无法区分）按失败处理：
+			// 静默截断会把截在半截的 input_json_delta 洗成"成功的空参 tool_use"
+			if len(body) == 64<<20 {
+				z.pool.MarkFailed(a, "上游响应超过 64MB 上限")
+				z.recordUsage(a, r, payload, http.StatusBadGateway, start, 0, nil, rc.clientStream)
+				writeAPIError(w, http.StatusBadGateway, "upstream response exceeds the 64MB limit")
+				return outcomeUpstreamError
+			}
 			// 2xx + JSON 但不是 message（上游内联错误信封，SSE 路径已证实存在）：
 			// 不得洗成"成功空响应"，按上游错误处理
 			if isErrorEnvelope(body) {
 				z.pool.MarkFailed(a, "上游 2xx 内联错误信封")
 				z.recordUsage(a, r, payload, http.StatusBadGateway, start, 0, nil, rc.clientStream)
 				writeUpstreamErrorForProto(w, resp, string(body), rc.proto)
+				// 终态失败解绑粘滞（与下方 4xx/5xx 分支同规）：MarkFailed 不改
+				// 可选状态，粘滞命中会把会话域钉死在持续吐错误信封的账号上
+				z.pool.ForgetSticky(rc.sessionKey())
 				return outcomeUpstreamError
 			}
 			usage := parseAnthropicUsageJSON(body)
@@ -653,8 +715,8 @@ func isErrorEnvelope(body []byte) bool {
 		if json.Unmarshal(v.Code, &n) != nil {
 			return true // 非数值 code（字符串形态）按错误信封处理
 		}
-		if n != 0 {
-			return true
+		if n != 0 && n != 200 {
+			return true // code 200 是成功封套（与 zcode_api 的解析同规），不算错误
 		}
 	}
 	return false
@@ -997,8 +1059,8 @@ func validateMessagesBody(body map[string]interface{}) error {
 	}
 	// tool_use/tool_result 配对预检：孤儿 tool_result 上游必 400，且会把
 	// 健康账号计一次 MarkFailed——本地拒绝并给出准确原因
-	declaredToolUses := map[string]bool{}
-	for _, m := range msgs {
+	declaredToolUses := map[string]int{} // id → 首次出现的 message 下标
+	for i, m := range msgs {
 		mm, _ := m.(map[string]interface{})
 		if mm == nil {
 			continue
@@ -1017,7 +1079,29 @@ func validateMessagesBody(body map[string]interface{}) error {
 				}
 				if t, _ := bm["type"].(string); t == "tool_use" {
 					if id, _ := bm["id"].(string); id != "" {
-						declaredToolUses[id] = true
+						if _, seen := declaredToolUses[id]; !seen {
+							declaredToolUses[id] = i
+						}
+					}
+				}
+			}
+		}
+	}
+	referencedToolUses := map[string]bool{}
+	for _, m := range msgs {
+		mm, _ := m.(map[string]interface{})
+		if mm == nil {
+			continue
+		}
+		if blocks := asIfaceSlice(mm["content"]); blocks != nil {
+			for _, b := range blocks {
+				bm, ok := b.(map[string]interface{})
+				if !ok {
+					continue
+				}
+				if t, _ := bm["type"].(string); t == "tool_result" {
+					if id, _ := bm["tool_use_id"].(string); id != "" {
+						referencedToolUses[id] = true
 					}
 				}
 			}
@@ -1076,8 +1160,8 @@ func validateMessagesBody(body map[string]interface{}) error {
 				case "tool_use":
 					if id, _ := bm["id"].(string); id == "" {
 						return fmt.Errorf("messages[%d].content[%d]: tool_use block must have an id", i, j)
-					} else {
-						declaredToolUses[id] = true
+					} else if _, seen := declaredToolUses[id]; !seen {
+						declaredToolUses[id] = i
 					}
 					if name, _ := bm["name"].(string); name == "" {
 						return fmt.Errorf("messages[%d].content[%d]: tool_use block must have a name", i, j)
@@ -1087,20 +1171,33 @@ func validateMessagesBody(body map[string]interface{}) error {
 					if tid == "" {
 						return fmt.Errorf("messages[%d].content[%d]: tool_result block must have a tool_use_id", i, j)
 					}
-					if !declaredToolUses[tid] {
+					if _, ok := declaredToolUses[tid]; !ok {
 						return fmt.Errorf("messages[%d].content[%d]: tool_result references unknown tool_use_id %q (dropped assistant turn?)", i, j, tid)
 					}
 				case "image":
-					if src, ok := bm["source"].(map[string]interface{}); ok {
-						if st, _ := src["type"].(string); st != "url" {
-							if data, _ := src["data"].(string); data == "" {
-								return fmt.Errorf("messages[%d].content[%d]: image block must contain base64 data (url sources are not accepted by the upstream)", i, j)
-							}
-						}
+					// 上游只接受 base64 source：url 形态与缺失/null/非对象 source
+					// 一律本地拒绝（此前 url 形态放行 → 上游 400，健康账号白计一次
+					// MarkFailed）。与 handlers_openai.go 的 image_url fail-closed 同规
+					src, _ := bm["source"].(map[string]interface{})
+					st, _ := src["type"].(string)
+					data, _ := src["data"].(string)
+					if st == "url" || src == nil || data == "" {
+						return fmt.Errorf("messages[%d].content[%d]: image block must contain base64 data (url sources are not accepted by the upstream)", i, j)
 					}
 				}
 			}
 		}
+	}
+	// 反向配对：tool_use 无任何 tool_result 引用 → 上游 400 + 账号计失败。
+	// 末条 assistant 消息例外（prefill 到工具调用的合法形状，模型从这里继续）
+	for id, msgIdx := range declaredToolUses {
+		if referencedToolUses[id] {
+			continue
+		}
+		if msgIdx == len(msgs)-1 {
+			continue
+		}
+		return fmt.Errorf("messages[%d].content contains tool_use %q with no matching tool_result (dropped tool turn?)", msgIdx, id)
 	}
 	if mt, ok := body["max_tokens"]; ok {
 		switch v := mt.(type) {

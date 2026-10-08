@@ -3,6 +3,8 @@ package main
 import (
 	"database/sql"
 	"fmt"
+	"math/rand/v2"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -87,11 +89,18 @@ func (db *DB) UpdateClaimPlanRunAt(id int64, status, msg, runAt string) error {
 
 // ---- 活动领取记录 ----
 
-// HasResetRecordNear 是否已存在该账号 ±15 分钟内、同一重置类型（kind）的成功记录
+// HasResetRecordNear 是否已存在该账号邻近时间内、同一重置类型（kind）的成功记录
 // （用于上游 used_at 去重：官方客户端等外部执行的重置不必重复入库。
 // 必须按 kind 区分：five_hour 与 week 背靠背消耗时互不构成重复）
-// 注意：created_at 存的是 localtime 墙钟字符串，strftime('%s') 会按 UTC 解析，
-// 需减去本地时区偏移才是真实 epoch。
+// 窗口分三档：
+//   - used_at 精确相等：同为上游时钟的同步行；
+//   - used_at ±900s 邻近：本地执行行的 used_at 是本地时钟、同步行是上游时钟，
+//     两级延迟下秒级相等是赌博；
+//   - used_at=0（遗留行）走 created_at 墙钟回退 ±5400s：created_at 是
+//     localtime 墙钟串，strftime('%s') 按 UTC 解析，查询端只有"今天"的 UTC
+//     偏移可还原 epoch；跨越夏令时边界的行偏移差最大 3600s，±900s 会漏配——
+//     漏配 = 对同一窗口重复消耗重置，比误配（多跳过一次重复写入）危险得多。
+//     HK 生产无 DST 不受影响，此窗仅覆盖跨时区/历史数据。
 func (db *DB) HasResetRecordNear(accountID int64, usedAtSec int64, kind string) (bool, error) {
 	_, offset := time.Now().Zone()
 	var n int
@@ -99,8 +108,10 @@ func (db *DB) HasResetRecordNear(accountID int64, usedAtSec int64, kind string) 
 		`SELECT COUNT(1) FROM claim_records
 		 WHERE account_id=? AND task_type='reset' AND success=1
 		   AND plan_name LIKE ?
-		   AND (used_at = ? OR (used_at = 0 AND ABS(strftime('%s',created_at)-?-?)<900))`,
-		accountID, "%("+kind+")%", usedAtSec, offset, usedAtSec).Scan(&n)
+		   AND (used_at = ?
+		        OR (used_at > 0 AND ABS(used_at - ?) < 900)
+		        OR (used_at = 0 AND ABS(strftime('%s',created_at)-?-?)<5400))`,
+		accountID, "%("+kind+")%", usedAtSec, usedAtSec, offset, usedAtSec).Scan(&n)
 	return n > 0, err
 }
 
@@ -227,8 +238,8 @@ func (db *DB) UsageStats(days int) (map[string]interface{}, error) {
 		out["success_rate"] = 0.0
 		out["cache_hit_rate"] = 0.0
 	}
-	// TTFT 分位（非零样本，内存计算；7d 个人量级足够）
-	if ttfts, err := db.ttftSamples(since, 20000); err == nil && len(ttfts) > 0 {
+	// TTFT 分位（非零样本；水库采样封顶 10 万条，任意窗口大小下均无偏）
+	if ttfts, err := db.ttftSamples(since, 100000); err == nil && len(ttfts) > 0 {
 		out["p50_ttft_ms"] = percentile(ttfts, 0.5)
 		out["p95_ttft_ms"] = percentile(ttfts, 0.95)
 	}
@@ -322,23 +333,42 @@ func (db *DB) UsageStats(days int) (map[string]interface{}, error) {
 	return out, nil
 }
 
-// ttftSamples 窗口内非零 TTFT 样本（升序返回，供分位计算）
+// ttftSamples 窗口内非零 TTFT 样本（升序返回，供分位计算）。
+// 不用 SQL ORDER BY ttft_ms LIMIT cap：那取的是"最快尾部的 cap 条"，
+// 窗口样本数一旦超过 cap，p50/p95 会整体向快端静默漂移。改为全量流式
+// 扫描 + 水库采样（Algorithm R）封顶 cap 条：对任意窗口大小均无偏，
+// 内存有界（cap=100000 约 0.8MB）。
 func (db *DB) ttftSamples(since string, cap int) ([]int, error) {
+	if cap <= 0 {
+		return nil, nil
+	}
 	rows, err := db.conn.Query(`
 		SELECT ttft_ms FROM usage_records
-		WHERE created_at >= ? AND ttft_ms > 0 ORDER BY ttft_ms LIMIT ?`, since, cap)
+		WHERE created_at >= ? AND ttft_ms > 0`, since)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	var out []int
+	sample := make([]int, 0, cap)
+	seen := 0
 	for rows.Next() {
 		var v int
-		if rows.Scan(&v) == nil {
-			out = append(out, v)
+		if err := rows.Scan(&v); err != nil {
+			continue
 		}
+		if len(sample) < cap {
+			sample = append(sample, v)
+		} else if j := rand.IntN(seen + 1); j < cap {
+			// 第 seen+1 条样本以 cap/(seen+1) 概率换掉已采样的随机槽位
+			sample[j] = v
+		}
+		seen++
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	sort.Ints(sample)
+	return sample, nil
 }
 
 // percentile 有序样本的最近秩分位
@@ -371,8 +401,9 @@ func (db *DB) ListProxyNodes() ([]*ProxyNode, error) {
 			return nil, err
 		}
 		// 密码静态加密读回明文（vault1: 前缀才解；历史明文行原样透传，
-		// 下次保存时加密迁移）
-		n.Password = vaultDecrypt(n.Password)
+		// 下次保存时加密迁移）。解不开标记 PasswordBroken——静默变空串
+		// 会让带用户名的节点用空密码拨号、整组账号连环冷却
+		n.Password, n.PasswordBroken = vaultDecryptOK(n.Password)
 		n.IsDefault = isDef == 1
 		n.Enabled = enabled == 1
 		out = append(out, &n)
@@ -451,14 +482,19 @@ func (db *DB) UpdateProxyNodeCheck(id int64, status string, latency int, ip, msg
 
 // ProxyNodeForGroup 查找组绑定的启用代理节点；组无绑定则回退默认节点。
 // group_name 支持逗号分隔多组。
+// 密码密文解不开（PasswordBroken）的节点跳过：带用户名却用空密码拨号必被
+// 代理拒绝，整组账号会连环冷却——跳过让组回退默认节点/直连，面板可见告警。
 func (db *DB) ProxyNodeForGroup(group string) (*ProxyNode, error) {
 	nodes, err := db.ListProxyNodes()
 	if err != nil {
 		return nil, err
 	}
+	unusable := func(n *ProxyNode) bool {
+		return !n.Enabled || (n.PasswordBroken && n.Username != "")
+	}
 	if group != "" {
 		for _, n := range nodes {
-			if !n.Enabled {
+			if unusable(n) {
 				continue
 			}
 			for _, g := range strings.Split(n.GroupName, ",") {
@@ -469,11 +505,55 @@ func (db *DB) ProxyNodeForGroup(group string) (*ProxyNode, error) {
 		}
 	}
 	for _, n := range nodes {
-		if n.Enabled && n.IsDefault {
+		if n.Enabled && n.IsDefault && !unusable(n) {
 			return n, nil
 		}
 	}
 	return nil, nil
+}
+
+// ---- 记录保留（防无界增长：stats 聚合随表龄线性变慢）----
+
+// PruneRecords 删除时间戳（usage_records/claim_records 按 created_at，
+// plan_run_records 按 run_at）早于 days 天的记录行，返回三表删除总数。
+// claim_records（自动领取每账号每轮一行）与 plan_run_records（分钟级计划
+// 一天 1440 行）与 usage_records 同样无界增长，共用同一个保留旋钮。
+// days <= 0 = 永久保留（不执行）
+func (db *DB) PruneRecords(days int) (int64, error) {
+	if days <= 0 {
+		return 0, nil
+	}
+	cutoff := time.Now().AddDate(0, 0, -days).Format("2006-01-02 15:04:05")
+	var total int64
+	for _, stmt := range []string{
+		`DELETE FROM usage_records WHERE created_at < ?`,
+		`DELETE FROM claim_records WHERE created_at < ?`,
+		`DELETE FROM plan_run_records WHERE run_at < ?`,
+	} {
+		res, err := db.conn.Exec(stmt, cutoff)
+		if err != nil {
+			return total, err
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return total, err
+		}
+		total += n
+	}
+	return total, nil
+}
+
+// UsageRetentionDays 记录保留天数（覆盖 usage_records / claim_records /
+// plan_run_records 三表）：未配置 = 90；显式 0 = 永久保留
+func (db *DB) UsageRetentionDays() int {
+	v, _ := db.GetSetting("usage_retention_days")
+	if v == "" {
+		return 90
+	}
+	if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+		return n
+	}
+	return 90
 }
 
 // ---- 计划运行记录 ----

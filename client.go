@@ -43,8 +43,10 @@ var (
 	cachedOSVer    string
 	cachedOSCat    string
 
-	// 上游 HTTP 客户端缓存（连接池复用）
-	clientCache sync.Map
+	// 上游 transport 缓存（连接池复用）：按 (代理, 类型, 指纹) 共享连接池。
+	// http.Client 按需廉价构造（Timeout 是 client 级属性），不复用 transport
+	// 的话 8 种超时值会把同一主机的连接池撕成 8 份，保活连接形同虚设
+	transportCache sync.Map
 )
 
 // ClientPlatform 返回 "win32-x64" 形式的平台标识
@@ -315,21 +317,34 @@ func ProxyURLForNode(n *ProxyNode) string {
 
 // NewUpstreamHTTPClient 标准库 TLS 客户端（含 HTTP/2），用于 api.z.ai / open.bigmodel.cn
 // 等非 ESA WAF 保护的端点（实测 api.z.ai 协商 h2）。
-func NewUpstreamHTTPClient(proxyURL string, timeout time.Duration) *http.Client {
-	transport := &http.Transport{
-		// 拨号/响应头都有界：流式客户端 Timeout=0 时没有它们，黑洞路由
-		// 会占住账号并发闸门直到下游断开（SSE 只受 time-to-first-header 约束，不受影响）
-		DialContext:           (&net.Dialer{Timeout: 30 * time.Second}).DialContext,
-		ResponseHeaderTimeout: 60 * time.Second,
-		TLSClientConfig:       &tls.Config{MinVersion: tls.VersionTLS12},
-		ForceAttemptHTTP2:     true,
-		MaxIdleConns:          32,
-		MaxIdleConnsPerHost:   16, // Go 默认 2：并发下多余连接被关闭，每请求重握手直拉高 TTFB
-		IdleConnTimeout:       90 * time.Second,
+// cachedTransport 取共享 transport（不存在则构建并缓存）。同一 (代理, 类型, 指纹)
+// 的所有 client 共用连接池；指纹/代理设置变更由 CloseIdleClients 整体失效
+func cachedTransport(key string, build func() *http.Transport) *http.Transport {
+	if v, ok := transportCache.Load(key); ok {
+		return v.(*http.Transport)
 	}
-	applyProxy(transport, proxyURL)
+	actual, _ := transportCache.LoadOrStore(key, build())
+	return actual.(*http.Transport)
+}
+
+func NewUpstreamHTTPClient(proxyURL string, timeout time.Duration) *http.Client {
+	t := cachedTransport("std|"+proxyURL, func() *http.Transport {
+		transport := &http.Transport{
+			// 拨号/响应头都有界：流式客户端 Timeout=0 时没有它们，黑洞路由
+			// 会占住账号并发闸门直到下游断开（SSE 只受 time-to-first-header 约束，不受影响）
+			DialContext:           (&net.Dialer{Timeout: 30 * time.Second}).DialContext,
+			ResponseHeaderTimeout: 60 * time.Second,
+			TLSClientConfig:       &tls.Config{MinVersion: tls.VersionTLS12},
+			ForceAttemptHTTP2:     true,
+			MaxIdleConns:          32,
+			MaxIdleConnsPerHost:   16, // Go 默认 2：并发下多余连接被关闭，每请求重握手直拉高 TTFB
+			IdleConnTimeout:       90 * time.Second,
+		}
+		applyProxy(transport, proxyURL)
+		return transport
+	})
 	return &http.Client{
-		Transport: transport,
+		Transport: t,
 		Timeout:   timeout,
 		// 不跟随重定向：WAF 挑战/登录页 302 交由 relay 显式分类
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
@@ -342,33 +357,33 @@ func NewUpstreamHTTPClient(proxyURL string, timeout time.Duration) *http.Client 
 // ESA WAF 保护端点：模拟浏览器 ClientHello，且 WAF 不支持 h2 ALPN。
 func NewFingerprintHTTPClient(proxyURL string, timeout time.Duration) *http.Client {
 	fp := fingerprintHook()
-	dialer := &net.Dialer{Timeout: 30 * time.Second}
-
-	dialTLS := func(ctx context.Context, network, addr string) (net.Conn, error) {
-		host := addr
-		if h, _, err := net.SplitHostPort(addr); err == nil {
-			host = h
+	t := cachedTransport("fp|"+fp.Mode+"|"+fp.JA3+"|"+proxyURL, func() *http.Transport {
+		dialer := &net.Dialer{Timeout: 30 * time.Second}
+		dialTLS := func(ctx context.Context, network, addr string) (net.Conn, error) {
+			host := addr
+			if h, _, err := net.SplitHostPort(addr); err == nil {
+				host = h
+			}
+			raw, err := dialRaw(ctx, dialer, proxyURL, network, addr)
+			if err != nil {
+				return nil, err
+			}
+			return utlsHandshake(ctx, raw, host, fp)
 		}
-		raw, err := dialRaw(ctx, dialer, proxyURL, network, addr)
-		if err != nil {
-			return nil, err
+		return &http.Transport{
+			DialContext:    dialer.DialContext,
+			DialTLSContext: dialTLS,
+			// 黑洞路由（代理/TCP 通了但对端永不回包）在 Timeout=0 的流式请求上
+			// 只受此约束——缺失时一次挂起就占死账号并发闸门直到下游断开
+			ResponseHeaderTimeout: 60 * time.Second,
+			TLSNextProto:          map[string]func(string, *tls.Conn) http.RoundTripper{}, // 禁 h2
+			MaxIdleConns:          32,
+			MaxIdleConnsPerHost:   16, // utls 握手成本高，保活连接直接决定 TTFB 稳定性
+			IdleConnTimeout:       90 * time.Second,
 		}
-		return utlsHandshake(ctx, raw, host, fp)
-	}
-
-	transport := &http.Transport{
-		DialContext:    dialer.DialContext,
-		DialTLSContext: dialTLS,
-		// 黑洞路由（代理/TCP 通了但对端永不回包）在 Timeout=0 的流式请求上
-		// 只受此约束——缺失时一次挂起就占死账号并发闸门直到下游断开
-		ResponseHeaderTimeout: 60 * time.Second,
-		TLSNextProto:          map[string]func(string, *tls.Conn) http.RoundTripper{}, // 禁 h2
-		MaxIdleConns:          32,
-		MaxIdleConnsPerHost:   16, // utls 握手成本高，保活连接直接决定 TTFB 稳定性
-		IdleConnTimeout:       90 * time.Second,
-	}
+	})
 	return &http.Client{
-		Transport: transport,
+		Transport: t,
 		Timeout:   timeout,
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
 			return http.ErrUseLastResponse
@@ -377,30 +392,20 @@ func NewFingerprintHTTPClient(proxyURL string, timeout time.Duration) *http.Clie
 }
 
 // ClientForURL 按主机选择客户端：zcode.z.ai（ESA WAF）→ utls 指纹；其余 → 标准库 h2。
-// 客户端按 (代理, 指纹模式, JA3, 超时) 缓存复用连接池；设置变更时 CloseIdleClients() 失效。
+// transport 按 (代理, 类型, 指纹) 共享连接池；client（含 Timeout）按需构造。
+// 指纹/代理设置变更时 CloseIdleClients() 整体失效。
 func ClientForURL(proxyURL, urlStr string, timeout time.Duration) *http.Client {
-	fp := fingerprintHook()
-	isZcode := strings.Contains(urlStr, "zcode.z.ai")
-	// 缓存键必须含主机类型：zcode.z.ai 用指纹+h1，api.z.ai 用标准库+h2（ALPN 仅 h2），不可互复用
-	key := fmt.Sprintf("%s|%s|%s|%s|%v", proxyURL, fp.Mode, fp.JA3, timeout, isZcode)
-	if v, ok := clientCache.Load(key); ok {
-		return v.(*http.Client)
+	if strings.Contains(urlStr, "zcode.z.ai") {
+		return NewFingerprintHTTPClient(proxyURL, timeout)
 	}
-	var c *http.Client
-	if isZcode {
-		c = NewFingerprintHTTPClient(proxyURL, timeout)
-	} else {
-		c = NewUpstreamHTTPClient(proxyURL, timeout)
-	}
-	actual, _ := clientCache.LoadOrStore(key, c)
-	return actual.(*http.Client)
+	return NewUpstreamHTTPClient(proxyURL, timeout)
 }
 
-// CloseIdleClients 关闭并清空缓存的全部上游客户端（指纹/代理设置变更后调用）
+// CloseIdleClients 关闭并清空缓存的全部上游 transport（指纹/代理设置变更后调用）
 func CloseIdleClients() {
-	clientCache.Range(func(k, v interface{}) bool {
-		v.(*http.Client).CloseIdleConnections()
-		clientCache.Delete(k)
+	transportCache.Range(func(k, v interface{}) bool {
+		v.(*http.Transport).CloseIdleConnections()
+		transportCache.Delete(k)
 		return true
 	})
 }

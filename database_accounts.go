@@ -325,16 +325,35 @@ func (db *DB) DeleteAccount(id int64) error {
 	return err
 }
 
-// UpdateAccountFields 更新账号可变字段（UI 编辑：备注/分组/启用/付费回退开关）
-func (db *DB) UpdateAccountFields(id int64, group, remark string, enabled, paidFallback bool) error {
-	_, err := db.conn.Exec(`
+// UpdateAccountFieldsWithPriority 单事务更新账号可变字段 + priority：
+// 两条独立 UPDATE 会在第二条失败（瞬时 I/O 错误）时留下"半保存"状态——
+// handler 返回 500 但前一半已落库，重试行为不可预期
+func (db *DB) UpdateAccountFieldsWithPriority(id int64, group, remark string, enabled, paidFallback bool, priority *int64) error {
+	tx, err := db.conn.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(`
 		UPDATE accounts SET account_group = ?, remark = ?, enabled = ?, paid_fallback = ?,
 		status = CASE WHEN ? = 0 AND status != 'disabled' THEN 'disabled'
 		             WHEN ? = 1 AND status = 'disabled' THEN 'active'
 		             ELSE status END,
 		updated_at = datetime('now','localtime') WHERE id = ?`,
-		group, remark, boolInt(enabled), boolInt(paidFallback), boolInt(enabled), boolInt(enabled), id)
-	return err
+		group, remark, boolInt(enabled), boolInt(paidFallback), boolInt(enabled), boolInt(enabled), id); err != nil {
+		return err
+	}
+	if priority != nil {
+		p := *priority
+		if p <= 0 {
+			p = DefaultPriority
+		}
+		if _, err := tx.Exec(`UPDATE accounts SET priority = ?,
+			updated_at = datetime('now','localtime') WHERE id = ?`, p, id); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 // SetAccountPaidStatus 写付费通道冷却（含余额不足长冷却）；不触碰免费侧状态列

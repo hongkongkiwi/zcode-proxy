@@ -339,9 +339,15 @@ func (z *ZCodeAPI) SyncResetHistoryFromUpstream(a *Account) (int, error) {
 	}
 
 	// 与 UseReset 本地落记录互斥（同一把账号级锁）：关闭"上游已接受重置、
-	// 本地尚未落记录"亚秒窗口内同步读到新 used_at 造成重复入库的竞态
+	// 本地尚未落记录"亚秒窗口内同步读到新 used_at 造成重复入库的竞态。
+	// 非阻塞 TryLock：本函数跑在池子的 4-worker 额度刷新信号量上，而同一把锁
+	// 会被整段领取流程持有（含验证码求解，可达数十秒）——阻塞等锁会把刷新
+	// worker 全部停摆、拖死 60s 刷新轮。同步按账号节流，本轮跳过下轮再来
 	mu := z.claimLockFor(a.ID)
-	mu.Lock()
+	if !mu.TryLock() {
+		log.Printf("[reset] account %s claim lock busy, skipping reset-history sync this round", a.Email)
+		return 0, nil
+	}
 	defer mu.Unlock()
 
 	inserted := 0
