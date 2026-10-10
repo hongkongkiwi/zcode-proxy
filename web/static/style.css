@@ -68,6 +68,11 @@ body{font-family:'Inter',-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Hel
 .nav-more-menu .menu-divider{height:1px;background:var(--c-border);margin:4px 0}
 .status-chip{display:inline-flex;align-items:center;gap:6px;font-size:12px;color:var(--c-success-dark);background:#ecfdf5;border:1px solid #a7f3d0;padding:5px 12px;border-radius:20px;font-weight:600}
 .status-chip .dot{width:7px;height:7px;border-radius:50%;background:var(--c-success);box-shadow:0 0 0 3px rgba(16,185,129,.18);animation:pulse 2s infinite}
+.status-chip.paused{color:var(--c-danger-dark);background:#fef2f2;border-color:#fecaca}
+.status-chip.paused .dot{background:var(--c-danger);animation:none;box-shadow:0 0 0 3px rgba(239,68,68,.15)}
+.btn-paused{color:#fff !important;background:var(--c-danger) !important;border-color:var(--c-danger) !important}
+.btn-paused:hover{background:var(--c-danger-dark) !important}
+.chart-title{font-weight:700;font-size:13px;margin-bottom:8px}
 @keyframes pulse{0%,100%{box-shadow:0 0 0 3px rgba(16,185,129,.18)}50%{box-shadow:0 0 0 6px rgba(16,185,129,.06)}}
 .top-user .user-avatar{width:30px;height:30px;border-radius:50%;background:linear-gradient(135deg,#6366f1,#a855f7);color:#fff;display:flex;align-items:center;justify-content:center;font-size:12.5px;font-weight:700;flex-shrink:0}
 .top-user-name{font-size:13px;font-weight:600;color:var(--c-text);max-width:120px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}

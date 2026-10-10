@@ -250,7 +250,46 @@ async function loadDashboard() {
       <div style="display:flex;gap:8px;flex-wrap:wrap">
         ${Object.entries(gc).map(([k, v]) => `<span class="pill-group">${esc(k)} · ${v}</span>`).join('')}
       </div>`;
+
+    applyGatewayPausedUI(!!d.gateway_paused);
   } catch (e) { reportLoadError(e); }
+}
+
+// ---- 网关全局暂停（panic stop） ----
+
+// applyGatewayPausedUI 顶栏状态徽章 + 暂停按钮联动。data-i18n 同步改写：
+// 语言切换时 applyI18n 以属性值为 key 重刷文本
+function applyGatewayPausedUI(paused) {
+  const chip = document.getElementById('gwStatusChip');
+  const txt = chip ? chip.querySelector('.status-txt') : null;
+  const btn = document.getElementById('btnPauseGateway');
+  if (chip) {
+    chip.classList.toggle('paused', paused);
+    if (txt) {
+      txt.setAttribute('data-i18n', paused ? '已暂停' : '运行中');
+      txt.textContent = t(paused ? '已暂停' : '运行中');
+    }
+  }
+  if (btn) {
+    btn.setAttribute('data-i18n', paused ? '恢复网关' : '暂停网关');
+    btn.textContent = t(paused ? '恢复网关' : '暂停网关');
+    btn.classList.toggle('btn-paused', paused);
+  }
+}
+
+async function toggleGatewayPause() {
+  const btn = document.getElementById('btnPauseGateway');
+  const pausedNow = !!(btn && btn.classList.contains('btn-paused'));
+  const next = !pausedNow;
+  const msg = next
+    ? t('确认暂停网关？暂停后所有转发请求将被拒绝（账号与后台任务不受影响）。')
+    : t('确认恢复网关转发？');
+  if (!confirm(msg)) return;
+  try {
+    await api('/api/settings', { method: 'PUT', body: { gateway_paused: next ? '1' : '0' } });
+    applyGatewayPausedUI(next);
+    toast(next ? t('网关已暂停') : t('网关已恢复'));
+  } catch (e) { toast(e.message, 'error'); }
 }
 
 // ---- 分组 ----
@@ -775,6 +814,17 @@ function keyQuotaCell(k) {
     <span class="quota-num">${fmtNum(k.quota_used)} / ${fmtNum(k.quota_total)}</span></div>`;
 }
 
+// keyWindowsCell 滚动窗口限额列：三段紧凑展示，全 0 显示"不限"
+function keyWindowsCell(k) {
+  const parts = [];
+  if (k.rate_5h) parts.push('5h ' + fmtNum(k.rate_5h));
+  if (k.rate_1d) parts.push('24h ' + fmtNum(k.rate_1d));
+  if (k.rate_7d) parts.push('7d ' + fmtNum(k.rate_7d));
+  return parts.length
+    ? `<span class="mono" style="font-size:12px">${parts.join(' · ')}</span>`
+    : `<span style="color:var(--c-text-lighter)">${t('不限')}</span>`;
+}
+
 function renderKeys() {
   const el = document.getElementById('keysTable');
   if (!el) return;
@@ -783,13 +833,14 @@ function renderKeys() {
     return;
   }
   el.innerHTML = `<div class="table-wrap"><table>
-    <thead><tr><th>${t('名称')}</th><th>${t('Key 前缀')}</th><th>${t('状态')}</th><th>RPM</th><th>${t('配额')}</th><th>${t('模型')}</th><th>${t('最近使用')}</th><th style="width:190px">${t('操作')}</th></tr></thead>
+    <thead><tr><th>${t('名称')}</th><th>${t('Key 前缀')}</th><th>${t('状态')}</th><th>RPM</th><th>${t('窗口限额')}</th><th>${t('配额')}</th><th>${t('模型')}</th><th>${t('最近使用')}</th><th style="width:190px">${t('操作')}</th></tr></thead>
     <tbody>${keysCache.map(k => `
       <tr>
         <td style="font-weight:700">${esc(k.name)}</td>
         <td class="mono">${esc(k.key_prefix || '-')}</td>
         <td>${k.enabled ? `<span class="badge badge-success">${t('启用')}</span>` : `<span class="badge badge-secondary">${t('停用')}</span>`}</td>
         <td>${k.rpm_limit ? k.rpm_limit : `<span style="color:var(--c-text-lighter)">${t('不限')}</span>`}</td>
+        <td style="min-width:130px">${keyWindowsCell(k)}</td>
         <td style="min-width:150px">${keyQuotaCell(k)}</td>
         <td style="max-width:160px" title="${esc(k.models || '')}">${k.models ? `<span class="mono">${esc(k.models)}</span>` : `<span style="color:var(--c-text-lighter)">${t('全部')}</span>`}</td>
         <td style="font-size:12px">${fmtAgo(k.last_used_at)}</td>
@@ -809,6 +860,12 @@ function showKeyModal(id) {
       <div class="form-group"><label>${t('RPM 限制（0=不限）')}</label><input type="number" id="keyRpm" class="form-input" min="0" max="100000" value="${k.rpm_limit ?? ''}" placeholder="${t('0=不限')}"></div>
       <div class="form-group"><label>${t('总配额（tokens，0=不限）')}</label><input type="number" id="keyQuota" class="form-input" min="0" value="${k.quota_total ?? ''}" placeholder="${t('0=不限')}"></div>
     </div>
+    <div class="form-group"><label>${t('滚动窗口请求数限额（0=不限，按小时分桶近似）')}</label></div>
+    <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px">
+      <div class="form-group"><label>5h</label><input type="number" id="keyRate5h" class="form-input" min="0" value="${k.rate_5h ?? ''}" placeholder="${t('0=不限')}"></div>
+      <div class="form-group"><label>24h</label><input type="number" id="keyRate1d" class="form-input" min="0" value="${k.rate_1d ?? ''}" placeholder="${t('0=不限')}"></div>
+      <div class="form-group"><label>7d</label><input type="number" id="keyRate7d" class="form-input" min="0" value="${k.rate_7d ?? ''}" placeholder="${t('0=不限')}"></div>
+    </div>
     <div class="form-group"><label>${t('模型白名单（逗号分隔，留空=全部）')}</label><input type="text" id="keyModels" class="form-input mono" value="${esc(k.models || '')}" placeholder="${t('glm-5.3,glm-5.2 留空=全部')}"></div>
     ${id ? '' : `<div class="form-group"><label>${t('管理员密码（创建需口令验证）')}</label><input type="password" id="keyVerifyPwd" class="form-input" autocomplete="off"></div>`}
     <div class="actions"><button class="btn btn-secondary" onclick="closeModal()">${t('取消')}</button>
@@ -822,6 +879,9 @@ async function saveKey(id) {
     name,
     rpm_limit: Number(document.getElementById('keyRpm').value || 0),
     quota_total: Number(document.getElementById('keyQuota').value || 0),
+    rate_5h: Number(document.getElementById('keyRate5h').value || 0),
+    rate_1d: Number(document.getElementById('keyRate1d').value || 0),
+    rate_7d: Number(document.getElementById('keyRate7d').value || 0),
     models: document.getElementById('keyModels').value.trim(),
   };
   if (!id) {
@@ -1067,14 +1127,68 @@ async function loadPlanRuns() {
 // ---- 使用记录 ----
 
 // dailySparkline 按天请求数的纯字符串 SVG 折线（无依赖；不足两个点不画）
-function dailySparkline(daily) {
-  const vals = (daily || []).map(d => Number(d.requests || 0));
-  if (vals.length < 2) return '';
+function sparklineSVG(vals) {
+  if (!vals || vals.length < 2) return '';
   const max = Math.max(...vals, 1);
   const W = 560, H = 40;
   const step = W / (vals.length - 1);
   const pts = vals.map((v, i) => (i * step).toFixed(1) + ',' + (H - 4 - v / max * (H - 8)).toFixed(1)).join(' ');
   return `<svg width="${W}" height="${H}" viewBox="0 0 ${W} ${H}" style="max-width:100%;display:block"><defs><linearGradient id="sparkGrad" x1="0" y1="0" x2="1" y2="0"><stop stop-color="#6366f1"/><stop offset="1" stop-color="#ec4899"/></linearGradient></defs><polyline points="${pts}" fill="none" stroke="url(#sparkGrad)" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/></svg>`;
+}
+
+function dailySparkline(daily) {
+  return sparklineSVG((daily || []).map(d => Number(d.requests || 0)));
+}
+
+// renderHeatmap GitHub 风格 365 天活动热力图：7 行（星期）× ~53 列（周），
+// 颜色按当日请求数四分位。days 只含有数据的日期
+function renderHeatmap(days) {
+  const byDay = {};
+  let max = 0;
+  (days || []).forEach(d => { byDay[d.day] = d; if (d.requests > max) max = d.requests; });
+  if (!max) return '';
+  const end = new Date(); end.setHours(0, 0, 0, 0);
+  const start = new Date(end); start.setDate(start.getDate() - 364);
+  start.setDate(start.getDate() - start.getDay()); // 对齐到周日，列=周
+  const fmt = x => x.getFullYear() + '-' + String(x.getMonth() + 1).padStart(2, '0') + '-' + String(x.getDate()).padStart(2, '0');
+  const cells = [];
+  for (const d = new Date(start); d <= end; d.setDate(d.getDate() + 1)) {
+    const key = fmt(d);
+    const c = byDay[key];
+    cells.push({ key, requests: c ? c.requests : 0, tokens: c ? c.tokens : 0 });
+  }
+  const weeks = [];
+  cells.forEach((c, i) => {
+    const w = Math.floor(i / 7);
+    if (!weeks[w]) weeks[w] = [null, null, null, null, null, null, null];
+    weeks[w][i % 7] = c;
+  });
+  const level = r => r <= 0 ? 0 : r < max * 0.25 ? 1 : r < max * 0.5 ? 2 : r < max * 0.75 ? 3 : 4;
+  const colors = ['#ebedf0', '#9be9a8', '#40c463', '#30a14e', '#216e39'];
+  const size = 11, gap = 3, pad = 16;
+  const W = pad + weeks.length * (size + gap) + 4, H = pad + 7 * (size + gap) + 4;
+  let rects = '';
+  weeks.forEach((week, w) => week.forEach((c, dow) => {
+    if (!c) return;
+    const lv = level(c.requests);
+    rects += `<rect x="${pad + w * (size + gap)}" y="${pad + dow * (size + gap)}" width="${size}" height="${size}" rx="2.5" fill="${colors[lv]}"><title>${c.key}: ${fmtNum(c.requests)} ${t('次请求')} · ${fmtNum(c.tokens)} tokens</title></rect>`;
+  }));
+  // 月份标签：每列首格的月份变化处标注
+  let labels = '';
+  let lastMonth = -1;
+  weeks.forEach((week, w) => {
+    const first = week.find(Boolean);
+    if (!first) return;
+    const m = Number(first.key.slice(5, 7));
+    if (m !== lastMonth) {
+      lastMonth = m;
+      labels += `<text x="${pad + w * (size + gap)}" y="11" font-size="9" fill="var(--c-text-lighter)">${m}</text>`;
+    }
+  });
+  return `<svg width="${W}" height="${H}" viewBox="0 0 ${W} ${H}" style="max-width:100%;display:block">${labels}${rects}</svg>
+    <div style="display:flex;align-items:center;gap:4px;font-size:11px;color:var(--c-text-lighter);margin-top:4px">${t('少')}
+    ${colors.map(c => `<span style="display:inline-block;width:10px;height:10px;border-radius:2px;background:${c}"></span>`).join('')}
+    ${t('多')} · ${t('365 天活动')}</div>`;
 }
 
 async function loadUsageStats() {
@@ -1102,16 +1216,37 @@ async function loadUsageStats() {
     const daily = u.daily || [];
     const dayEl = document.getElementById('dailyStats');
     if (!dayEl) return;
-    if (!daily.length) { dayEl.innerHTML = `<div class="empty"><p>${t('暂无数据')}</p></div>`; return; }
-    dayEl.innerHTML = `<div style="margin-bottom:10px">${dailySparkline(daily)}</div>
-      <div class="table-wrap"><table>
-      <thead><tr><th>${t('日期')}</th><th>${t('请求数')}</th><th>Tokens</th><th>${t('缓存命中')}</th></tr></thead>
-      <tbody>${daily.map(d => `<tr>
-        <td style="font-size:12px">${esc(d.day)}</td>
-        <td>${fmtNum(d.requests)}</td>
-        <td>${fmtNum(d.tokens)}</td>
-        <td>${d.cache_read_tokens ? fmtNum(d.cache_read_tokens) : '-'}</td>
-      </tr>`).join('')}</tbody></table></div>`;
+    if (!daily.length) { dayEl.innerHTML = `<div class="empty"><p>${t('暂无数据')}</p></div>`; }
+    else {
+      dayEl.innerHTML = `<div style="margin-bottom:10px">${dailySparkline(daily)}</div>
+        <div class="table-wrap"><table>
+        <thead><tr><th>${t('日期')}</th><th>${t('请求数')}</th><th>Tokens</th><th>${t('缓存命中')}</th></tr></thead>
+        <tbody>${daily.map(d => `<tr>
+          <td style="font-size:12px">${esc(d.day)}</td>
+          <td>${fmtNum(d.requests)}</td>
+          <td>${fmtNum(d.tokens)}</td>
+          <td>${d.cache_read_tokens ? fmtNum(d.cache_read_tokens) : '-'}</td>
+        </tr>`).join('')}</tbody></table></div>`;
+    }
+
+    // 24h 小时趋势（/api/stats 附带，失败时 heatmap_error 如实提示）
+    const hourEl = document.getElementById('hourlyStats');
+    const heatEl = document.getElementById('heatmapStats');
+    if (u.heatmap_error) {
+      if (hourEl) hourEl.innerHTML = `<div class="warn-box">${tf('趋势/热力图加载失败：%s', esc(u.heatmap_error))}</div>`;
+      if (heatEl) heatEl.innerHTML = '';
+    } else {
+      const hourly = u.hourly_24 || [];
+      if (hourEl) {
+        hourEl.innerHTML = hourly.length
+          ? `<div class="chart-title">${t('24 小时趋势')}</div>${sparklineSVG(hourly.map(h => Number(h.requests || 0)))}
+             <div class="hint" style="margin-top:2px">${t('小时')} · ${t('请求数')}（${esc((hourly[0] || {}).hour || '')} → ${esc((hourly[hourly.length - 1] || {}).hour || '')}）</div>`
+          : '';
+      }
+      if (heatEl) {
+        heatEl.innerHTML = renderHeatmap(u.daily_365 || []);
+      }
+    }
   } catch (e) { reportLoadError(e); }
 }
 

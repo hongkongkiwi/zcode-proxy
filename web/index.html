@@ -68,7 +68,8 @@
 </div>
 </nav>
 <div class="top-user">
-<span class="status-chip"><span class="dot"></span><span class="status-txt" data-i18n="运行中">运行中</span></span>
+<span class="status-chip" id="gwStatusChip"><span class="dot"></span><span class="status-txt" data-i18n="运行中">运行中</span></span>
+<button class="btn-logout-top" id="btnPauseGateway" onclick="toggleGatewayPause()" data-i18n="暂停网关">暂停网关</button>
 <select class="lang-select" onchange="setLangChoice(this.value)" title="Language / 语言">
 <option value="auto" data-i18n="跟随系统">跟随系统</option>
 <option value="zh">简体中文</option>
@@ -170,6 +171,8 @@
 <div class="card-header"><h2 data-i18n="按网关 Key 与按天统计（7 日）">按网关 Key 与按天统计（7 日）</h2><button class="btn btn-sm btn-secondary" onclick="loadUsageStats()" data-i18n="刷新">刷新</button></div>
 <div style="padding:20px" id="byKeyStats"><div class="empty"><p data-i18n="加载中…">加载中…</p></div></div>
 <div style="padding:0 20px 20px" id="dailyStats"></div>
+<div style="padding:0 20px 20px" id="hourlyStats"></div>
+<div style="padding:0 20px 20px" id="heatmapStats"></div>
 </div>
 </div>
 

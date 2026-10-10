@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -52,7 +53,8 @@ type AuthManager struct {
 	bypassMu        sync.Mutex
 	lastBypassCheck map[string]time.Time
 
-	gwRPM gwRPMTracker // 命名网关 Key 的 RPM 滑动窗口（R1）
+	gwRPM     gwRPMTracker    // 命名网关 Key 的 RPM 滑动窗口（R1）
+	gwWindows gwWindowTracker // 命名网关 Key 的滚动窗口请求限额（5h/1d/7d）
 }
 
 // loginBypassCooldown 锁定中两次真实口令验证之间的最小间隔（打包级变量便于
@@ -508,7 +510,11 @@ func (am *AuthManager) Middleware(next http.Handler) http.Handler {
 			gk, errResp := am.resolveGatewayKey(apiKey)
 			if errResp != nil {
 				if errResp.status == http.StatusTooManyRequests {
-					w.Header().Set("Retry-After", "10")
+					retryAfter := 10
+					if errResp.retryAfterSeconds > 0 {
+						retryAfter = errResp.retryAfterSeconds
+					}
+					w.Header().Set("Retry-After", strconv.Itoa(retryAfter))
 				}
 				writeJSON(w, errResp.status, map[string]interface{}{
 					"type":  "error",

@@ -160,6 +160,7 @@ func (s *APIServer) handleDashboard(w http.ResponseWriter, r *http.Request) {
 		"usage_7d":           stats,
 		"app_version":        s.zapi.appVersion,
 		"captcha":            s.captcha.Status(),
+		"gateway_paused":     s.zapi.gatewayPaused(),
 	})
 }
 
@@ -858,6 +859,14 @@ func (s *APIServer) handleStats(w http.ResponseWriter, r *http.Request) {
 	if paid, err := s.db.PaidTokensToday(); err == nil {
 		stats["paid_tokens_today"] = paid
 	}
+	// 长窗口聚合（活动热力图 365d + 24h 小时趋势）：失败如实透传，不洗成空数据
+	if hm, err := s.db.UsageHeatmap(); err == nil {
+		for k, v := range hm {
+			stats[k] = v
+		}
+	} else {
+		stats["heatmap_error"] = err.Error()
+	}
 	writeJSON(w, http.StatusOK, stats)
 }
 
@@ -881,6 +890,8 @@ var settingsWhitelist = map[string]bool{
 	"async_keepalive_ms": true, "async_max_retries": true, "async_max_wait_sec": true,
 	// 用量记录保留天数（0=永久；每 6h 清扫一次）
 	"usage_retention_days": true,
+	// 网关全局暂停（panic stop）：1 = 数据面拒绝所有转发请求
+	"gateway_paused": true,
 }
 
 func (s *APIServer) handleGetSettings(w http.ResponseWriter, r *http.Request) {
@@ -959,6 +970,13 @@ func (s *APIServer) handlePutSettings(w http.ResponseWriter, r *http.Request) {
 		if k == "usage_retention_days" {
 			if n, err := strconv.Atoi(v); err != nil || n < 0 || n > 3650 {
 				writeAPIError(w, http.StatusBadRequest, "无效保留天数（0=永久，上限 3650）")
+				return
+			}
+		}
+		// 网关暂停开关：布尔键只收 0/1
+		if k == "gateway_paused" {
+			if v != "0" && v != "1" {
+				writeAPIError(w, http.StatusBadRequest, "无效暂停开关值（0=恢复，1=暂停）")
 				return
 			}
 		}

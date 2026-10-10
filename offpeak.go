@@ -298,6 +298,12 @@ func (z *ZCodeAPI) HandleAsyncMessages(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, http.StatusServiceUnavailable, "async (off-peak) channel is disabled; enable async_enabled in settings")
 		return
 	}
+	// 全局暂停闸（panic stop）：闲时通道与常规通道同受暂停开关约束
+	if z.gatewayPaused() {
+		log.Printf("[relay] async request rejected: gateway is paused (panic stop)")
+		writeAPIError(w, http.StatusServiceUnavailable, "网关已全局暂停（panic stop），请在管理面板恢复")
+		return
+	}
 	body, errResp := readJSONBody(r)
 	if errResp != nil {
 		errResp.Write(w)

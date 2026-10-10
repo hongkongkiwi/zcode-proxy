@@ -644,6 +644,25 @@ const I18N_EN = {
   '付费回退已开启': 'Paid fallback enabled',
   '付费回退已关闭': 'Paid fallback disabled',
   '操作失败: %s': 'Operation failed: %s',
+  // 网关全局暂停（panic stop）
+  '暂停网关': 'Pause gateway',
+  '恢复网关': 'Resume gateway',
+  '已暂停': 'Paused',
+  '确认暂停网关？暂停后所有转发请求将被拒绝（账号与后台任务不受影响）。': 'Pause the gateway? All relay requests will be rejected while paused (accounts and background tasks are unaffected).',
+  '确认恢复网关转发？': 'Resume gateway relaying?',
+  '网关已暂停': 'Gateway paused',
+  '网关已恢复': 'Gateway resumed',
+  // 网关 Key 滚动窗口限额
+  '窗口限额': 'Window limits',
+  '滚动窗口请求数限额（0=不限，按小时分桶近似）': 'Rolling-window request limits (0 = unlimited, hourly-bucket approximation)',
+  // 用量图表
+  '24 小时趋势': '24-hour trend',
+  '小时': 'Hour',
+  '次请求': 'requests',
+  '少': 'Less',
+  '多': 'More',
+  '365 天活动': '365-day activity',
+  '趋势/热力图加载失败：%s': 'Failed to load trends/heatmap: %s',
 };
 
 // ---- 启动：解析语言并应用到静态 DOM（脚本位于 body 末尾，DOM 已就绪） ----

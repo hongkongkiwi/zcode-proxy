@@ -19,6 +19,9 @@ type GatewayKey struct {
 	KeyPrefix  string `json:"key_prefix"` // 展示用前缀，如 sk-ab12…
 	Enabled    bool   `json:"enabled"`
 	RPMLimit   int    `json:"rpm_limit"`    // 每分钟请求数上限，0 = 不限
+	Rate5h     int    `json:"rate_5h"`      // 滚动 5 小时窗口请求数上限，0 = 不限
+	Rate1d     int    `json:"rate_1d"`      // 滚动 24 小时窗口请求数上限，0 = 不限
+	Rate7d     int    `json:"rate_7d"`      // 滚动 7 天窗口请求数上限，0 = 不限
 	QuotaTotal int64  `json:"quota_total"`  // 总 token 配额（prompt+completion），0 = 不限
 	QuotaUsed  int64  `json:"quota_used"`   // 已用 token（usage 落库时累加）
 	Models     string `json:"models"`       // 逗号分隔白名单（小写），空 = 不限
@@ -30,12 +33,14 @@ type GatewayKey struct {
 }
 
 const gatewayKeyCols = `id, name, key_hash, key_prefix, enabled, rpm_limit,
+	rate_5h, rate_1d, rate_7d,
 	quota_total, quota_used, models, last_used_at, created_at, updated_at`
 
 func scanGatewayKey(row interface{ Scan(...interface{}) error }) (*GatewayKey, error) {
 	var k GatewayKey
 	var enabled int
 	if err := row.Scan(&k.ID, &k.Name, &k.KeyHash, &k.KeyPrefix, &enabled, &k.RPMLimit,
+		&k.Rate5h, &k.Rate1d, &k.Rate7d,
 		&k.QuotaTotal, &k.QuotaUsed, &k.Models, &k.LastUsedAt, &k.CreatedAt, &k.UpdatedAt); err != nil {
 		return nil, err
 	}
@@ -47,10 +52,10 @@ func scanGatewayKey(row interface{ Scan(...interface{}) error }) (*GatewayKey, e
 func (db *DB) CreateGatewayKey(k *GatewayKey) (int64, error) {
 	res, err := db.conn.Exec(`
 		INSERT INTO gateway_keys (name, key_hash, key_prefix, enabled, rpm_limit,
-			quota_total, quota_used, models)
-		VALUES (?,?,?,?,?,?,0,?)`,
+			rate_5h, rate_1d, rate_7d, quota_total, quota_used, models)
+		VALUES (?,?,?,?,?,?,?,?,?,0,?)`,
 		k.Name, k.KeyHash, k.KeyPrefix, boolInt(k.Enabled), k.RPMLimit,
-		k.QuotaTotal, normalizeModelWhitelist(k.Models))
+		k.Rate5h, k.Rate1d, k.Rate7d, k.QuotaTotal, normalizeModelWhitelist(k.Models))
 	if err != nil {
 		return 0, err
 	}
@@ -95,11 +100,12 @@ func (db *DB) GetGatewayKey(id int64) (*GatewayKey, error) {
 }
 
 // UpdateGatewayKeyFields 编辑可变字段；models 归一化为小写白名单
-func (db *DB) UpdateGatewayKeyFields(id int64, name string, enabled bool, rpmLimit int, quotaTotal int64, models string) error {
+func (db *DB) UpdateGatewayKeyFields(id int64, name string, enabled bool, rpmLimit int, rate5h, rate1d, rate7d int, quotaTotal int64, models string) error {
 	_, err := db.conn.Exec(`
-		UPDATE gateway_keys SET name=?, enabled=?, rpm_limit=?, quota_total=?, models=?,
-		updated_at=datetime('now','localtime') WHERE id=?`,
-		name, boolInt(enabled), rpmLimit, quotaTotal, normalizeModelWhitelist(models), id)
+		UPDATE gateway_keys SET name=?, enabled=?, rpm_limit=?, rate_5h=?, rate_1d=?, rate_7d=?,
+		quota_total=?, models=?, updated_at=datetime('now','localtime') WHERE id=?`,
+		name, boolInt(enabled), rpmLimit, rate5h, rate1d, rate7d,
+		quotaTotal, normalizeModelWhitelist(models), id)
 	return err
 }
 

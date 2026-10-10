@@ -375,6 +375,77 @@ func (db *DB) UsageStats(days int) (map[string]interface{}, error) {
 	return out, nil
 }
 
+// dayCell / hourCell 热力图聚合行（包级类型，测试断言用）
+type dayCell struct {
+	Day      string `json:"day"`
+	Requests int    `json:"requests"`
+	Tokens   int64  `json:"tokens"`
+}
+
+type hourCell struct {
+	Hour      string `json:"hour"`
+	Requests  int    `json:"requests"`
+	Tokens    int64  `json:"tokens"`
+	CacheRead int64  `json:"cache_read_tokens"`
+}
+
+// UsageHeatmap 长窗口聚合（活动热力图 + 24h 小时趋势）：365 天按天 + 最近
+// 24 小时按小时。与 UsageStats 分离——热力图窗口固定 365 天，不该被
+// /api/stats?days 的窗口参数拖累；两段都是 created_at 索引上的范围聚合
+func (db *DB) UsageHeatmap() (map[string]interface{}, error) {
+	out := map[string]interface{}{}
+	since365 := time.Now().AddDate(0, 0, -365).Format("2006-01-02 15:04:05")
+	days := []dayCell{}
+	rows, err := db.conn.Query(`
+		SELECT date(created_at), COUNT(*), COALESCE(SUM(total_tokens),0)
+		FROM usage_records WHERE created_at >= ?
+		GROUP BY date(created_at) ORDER BY date(created_at)`, since365)
+	if err != nil {
+		return nil, fmt.Errorf("heatmap daily: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var c dayCell
+		var n int
+		if err := rows.Scan(&c.Day, &n, &c.Tokens); err != nil {
+			return nil, err
+		}
+		c.Requests = n
+		days = append(days, c)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	out["daily_365"] = days
+
+	// 24h 小时趋势：created_at 是本地时区 'YYYY-MM-DD HH:MM:SS' 文本，
+	// substr 前 13 位即小时桶（面板 x 轴直接展示）
+	since24 := time.Now().Add(-24 * time.Hour).Format("2006-01-02 15:04:05")
+	hours := []hourCell{}
+	rows2, err := db.conn.Query(`
+		SELECT substr(created_at,1,13), COUNT(*), COALESCE(SUM(total_tokens),0), COALESCE(SUM(cache_read_tokens),0)
+		FROM usage_records WHERE created_at >= ?
+		GROUP BY substr(created_at,1,13) ORDER BY substr(created_at,1,13)`, since24)
+	if err != nil {
+		return nil, fmt.Errorf("heatmap hourly: %w", err)
+	}
+	defer rows2.Close()
+	for rows2.Next() {
+		var c hourCell
+		var n int
+		if err := rows2.Scan(&c.Hour, &n, &c.Tokens, &c.CacheRead); err != nil {
+			return nil, err
+		}
+		c.Requests = n
+		hours = append(hours, c)
+	}
+	if err := rows2.Err(); err != nil {
+		return nil, err
+	}
+	out["hourly_24"] = hours
+	return out, nil
+}
+
 // ttftSamples 窗口内非零 TTFT 样本（升序返回，供分位计算）。
 // 不用 SQL ORDER BY ttft_ms LIMIT cap：那取的是"最快尾部的 cap 条"，
 // 窗口样本数一旦超过 cap，p50/p95 会整体向快端静默漂移。改为全量流式

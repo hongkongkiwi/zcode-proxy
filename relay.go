@@ -148,11 +148,25 @@ func (z *ZCodeAPI) HandleMessages(w http.ResponseWriter, r *http.Request) {
 	z.relay(w, r, rc)
 }
 
+// gatewayPaused 网关全局暂停（panic stop）：设置键 gateway_paused=1 时数据面
+// 拒绝所有转发请求。只停数据面——自动领取/配额刷新等后台增益任务照常运行。
+// 读失败按未暂停处理：开关是运维手段，存储抖动不应把网关整体打瘫
+func (z *ZCodeAPI) gatewayPaused() bool {
+	v, err := z.db.GetSetting("gateway_paused")
+	return err == nil && v == "1"
+}
+
 // relay 选账号并按降级链转发。
 // 通道模型（free_first 默认策略）：免费通道（JWT 套餐额度）先用；免费侧受限
 // （并发满/限流/额度耗尽/风控）后无缝落到付费通道（api.z.ai API Key，按量计费）。
 // 并发闸门按通道隔离，因此部分会话走免费、部分走付费可同时成立。
 func (z *ZCodeAPI) relay(w http.ResponseWriter, r *http.Request, rc *relayCtx) {
+	// 全局暂停闸（panic stop）：优先于一切账号选择/网关 Key 限额
+	if z.gatewayPaused() {
+		log.Printf("[relay] request rejected: gateway is paused (panic stop)")
+		writeAPIError(w, http.StatusServiceUnavailable, "网关已全局暂停（panic stop），请在管理面板恢复")
+		return
+	}
 	// 命名网关 Key（R1）：模型白名单 / token 配额在进入账号池前拦截
 	if gk := gatewayKeyFromCtx(r.Context()); gk != nil {
 		if errResp := checkGatewayKeyRequest(gk, relayModelName(rc)); errResp != nil {
@@ -311,7 +325,7 @@ func writeAllAccountsUnavailable(w http.ResponseWriter, rc *relayCtx, msg string
 }
 
 // canonicalModelName 白名单校验用的规范模型名：去 provider 前缀 + 小写
-//（与 gateway_keys 白名单同规范）
+// （与 gateway_keys 白名单同规范）
 func canonicalModelName(bodyModel string) string {
 	if i := strings.Index(bodyModel, "/"); i >= 0 {
 		bodyModel = bodyModel[i+1:]
@@ -584,9 +598,9 @@ func (z *ZCodeAPI) forwardOnce(w http.ResponseWriter, r *http.Request, a *Accoun
 			if r.Context().Err() != nil || errors.Is(err, context.Canceled) {
 				return outcomeUpstreamError
 			}
-		// 完整错误（含出口代理地址）只进服务端日志；客户端可见明细经
-		// connFailReason 脱敏——失败原因会拼进 503/529 body 发给命名 Key 持有方
-		log.Printf("[relay] account %s connect failed via %s: %v", a.DisplayNameOrEmail(), redactProxyURL(proxyURL), err)
+			// 完整错误（含出口代理地址）只进服务端日志；客户端可见明细经
+			// connFailReason 脱敏——失败原因会拼进 503/529 body 发给命名 Key 持有方
+			log.Printf("[relay] account %s connect failed via %s: %v", a.DisplayNameOrEmail(), redactProxyURL(proxyURL), err)
 			z.markChannelFailure(rc, a, channel, connFailReason(proxyURL, err), 60)
 			return outcomeNextAccount
 		}
@@ -1129,6 +1143,9 @@ func readJSONBody(r *http.Request) (map[string]interface{}, *errorResponse) {
 type errorResponse struct {
 	status int
 	msg    string
+	// retryAfterSeconds > 0 时（网关 Key 滚动窗口限流），429 响应以此回写
+	// Retry-After；0 = 调用方用固定 10s 兜底
+	retryAfterSeconds int
 }
 
 func (e *errorResponse) Write(w http.ResponseWriter) {
@@ -1465,30 +1482,30 @@ func validateMessagesBody(ctx context.Context, body map[string]interface{}) erro
 					st, _ := src["type"].(string)
 					data, _ := src["data"].(string)
 					if st == "url" {
-					u, _ := src["url"].(string)
-					// 额度按出现处计（去重只省网络抓取——红队 F4：同一 URL
-					// 重复 N 次不得绕过上限在 marshal 时放大数 GB）
-					if inline.count >= maxInlineImagesPerRequest {
-						return fmt.Errorf("messages[%d].content[%d]: too many url images in one request (limit %d)", i, j, maxInlineImagesPerRequest)
-					}
-					inl, cached := inline.cache[u]
-					if !cached {
-						var ferr error
-						if inl, ferr = fetchImageAsBase64(ctx, u); ferr != nil {
-							return fmt.Errorf("messages[%d].content[%d]: image url fetch failed: %v", i, j, ferr)
+						u, _ := src["url"].(string)
+						// 额度按出现处计（去重只省网络抓取——红队 F4：同一 URL
+						// 重复 N 次不得绕过上限在 marshal 时放大数 GB）
+						if inline.count >= maxInlineImagesPerRequest {
+							return fmt.Errorf("messages[%d].content[%d]: too many url images in one request (limit %d)", i, j, maxInlineImagesPerRequest)
 						}
+						inl, cached := inline.cache[u]
+						if !cached {
+							var ferr error
+							if inl, ferr = fetchImageAsBase64(ctx, u); ferr != nil {
+								return fmt.Errorf("messages[%d].content[%d]: image url fetch failed: %v", i, j, ferr)
+							}
+						}
+						inline.count++
+						inline.bytes += len(inl.data)
+						if inline.bytes > maxInlineBase64BytesPerRequest {
+							return fmt.Errorf("messages[%d].content[%d]: inlined image payload exceeds %dMB per request", i, j, maxInlineBase64BytesPerRequest>>20)
+						}
+						if !cached {
+							inline.cache[u] = inl
+						}
+						bm["source"] = map[string]interface{}{"type": "base64", "media_type": inl.mediaType, "data": inl.data}
+						continue
 					}
-					inline.count++
-					inline.bytes += len(inl.data)
-					if inline.bytes > maxInlineBase64BytesPerRequest {
-						return fmt.Errorf("messages[%d].content[%d]: inlined image payload exceeds %dMB per request", i, j, maxInlineBase64BytesPerRequest>>20)
-					}
-					if !cached {
-						inline.cache[u] = inl
-					}
-					bm["source"] = map[string]interface{}{"type": "base64", "media_type": inl.mediaType, "data": inl.data}
-					continue
-				}
 					if src == nil || data == "" {
 						return fmt.Errorf("messages[%d].content[%d]: image block must contain base64 data (url sources are not accepted by the upstream)", i, j)
 					}

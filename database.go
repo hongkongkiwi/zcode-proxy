@@ -262,6 +262,17 @@ func NewDBWithOptions(dbPath string, migrate bool) (*DB, error) {
 			return nil, err
 		}
 	}
+	// gateway_keys 增量迁移：滚动窗口请求限额（5h/1d/7d，0=不限）
+	for _, col := range []string{
+		`ALTER TABLE gateway_keys ADD COLUMN rate_5h INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE gateway_keys ADD COLUMN rate_1d INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE gateway_keys ADD COLUMN rate_7d INTEGER NOT NULL DEFAULT 0`,
+	} {
+		if err := db.addColumnMigrate(col); err != nil {
+			conn.Close()
+			return nil, err
+		}
+	}
 	// 存量明文凭证列静态加密迁移（幂等；失败不阻断启动，下轮再试）
 	if err := db.MigrateVault(); err != nil {
 		log.Printf("[vault] migrate: %v", err)
@@ -472,6 +483,9 @@ func (db *DB) initSchema() error {
 		quota_total INTEGER DEFAULT 0,
 		quota_used  INTEGER DEFAULT 0,
 		models      TEXT DEFAULT '',
+		rate_5h     INTEGER DEFAULT 0,
+		rate_1d     INTEGER DEFAULT 0,
+		rate_7d     INTEGER DEFAULT 0,
 		last_used_at INTEGER DEFAULT 0,
 		created_at  TEXT DEFAULT (datetime('now','localtime')),
 		updated_at  TEXT DEFAULT (datetime('now','localtime'))

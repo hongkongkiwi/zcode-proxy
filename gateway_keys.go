@@ -74,6 +74,19 @@ func (am *AuthManager) resolveGatewayKey(key string) (*GatewayKey, *errorRespons
 		return nil, &errorResponse{status: http.StatusTooManyRequests,
 			msg: "gateway key rate limited (" + strconv.Itoa(k.RPMLimit) + " rpm): " + k.Name}
 	}
+	// 滚动窗口限额（5h/1d/7d）：与 RPM 同闸口（认证时点计数），跨窗口一次
+	// 命中只记一笔；首个触限窗口决定 429 文案与 Retry-After（小时边界粒度）
+	if k.Rate5h > 0 || k.Rate1d > 0 || k.Rate7d > 0 {
+		if rej := am.gwWindows.admit(k.ID, []gwWindowSpec{
+			{hours: 5, limit: k.Rate5h, label: "5h"},
+			{hours: 24, limit: k.Rate1d, label: "24h"},
+			{hours: gwWindowRingHours, limit: k.Rate7d, label: "7d"},
+		}); rej != nil {
+			return nil, &errorResponse{status: http.StatusTooManyRequests,
+				msg:               "gateway key rate limited (" + rej.window + " rolling window): " + k.Name,
+				retryAfterSeconds: int(rej.retryAfter.Seconds()) + 1}
+		}
+	}
 	return k, nil
 }
 
@@ -139,4 +152,141 @@ func (t *gwRPMTracker) allow(id int64, limit int) bool {
 	}
 	t.hits[id] = append(live, now)
 	return true
+}
+
+// ---- 滚动窗口限额（5h/1d/7d）----
+// 按"自然小时"分桶近似滑动窗口：每把 Key 一个 168 桶环形计数器（桶 0 = 当前
+// 自然小时，含未满部分），窗口命中数 = 最近 N 个桶之和。请求时间戳存满 7 天
+// 在长窗口下不可行（RPM 的逐条 []time.Time 到 7d 量级是内存泄漏形状），分桶
+// 把每 Key 状态压到常量 1.3KB。粒度取舍：窗口起点对齐小时边界——命中在桶内
+// 的位置被抹平，实际放行只会比严格滑动窗口更早（最多提前约 1 小时），绝不会
+// 更严；对"别把共享 Key 的 5h 套餐窗口烧穿"的用途足够（面板同文案披露）。
+// 进程内状态，重启清零（与 RPM 同口径，不持久化）。
+
+const gwWindowRingHours = 168 // 7 天
+
+// gwWindowSpec 单个窗口：hours 桶之和对比 limit（0 = 该窗口不限）
+type gwWindowSpec struct {
+	hours int
+	limit int
+	label string
+}
+
+type gwWindowRejection struct {
+	window     string
+	retryAfter time.Duration
+}
+
+// gwWindowTracker 命名 Key 的滚动窗口计数器（与转发无关的独立锁）。
+// 锁内操作 gwHourRing；Key 集合以 DB 行为界（管理员手工创建），删除时由
+// forget 显式清理，admit 内另有陈旧环兜底
+type gwWindowTracker struct {
+	mu   sync.Mutex
+	keys map[int64]*gwHourRing
+}
+
+// forget 删除 Key 时同步清窗口状态：create→use→delete 循环不在内存里累积
+// 陈旧环（每环 1.3KB，泄漏是慢性的但方向明确不对）
+func (t *gwWindowTracker) forget(id int64) {
+	t.mu.Lock()
+	delete(t.keys, id)
+	t.mu.Unlock()
+}
+
+// gwHourRing 小时桶环形：counts[i] = anchor 往前第 i 个自然小时的命中数。
+// 所有方法要求调用方持有 tracker 锁。
+type gwHourRing struct {
+	anchor int64 // counts[0] 对应的自然小时（unix 秒 / 3600）
+	counts [gwWindowRingHours]int64
+}
+
+// advance 把环形推进到 nowHour；时钟回拨按重置处理（宁可多放不可卡死）
+func (r *gwHourRing) advance(nowHour int64) {
+	if r.anchor == nowHour {
+		return
+	}
+	if r.anchor == 0 || nowHour < r.anchor || nowHour-r.anchor >= gwWindowRingHours {
+		r.anchor = nowHour
+		r.counts = [gwWindowRingHours]int64{}
+		return
+	}
+	d := int(nowHour - r.anchor)
+	// 右移 d 桶：counts[d:] = counts[:168-d]，老桶自然移出窗口尾（copy 即 memmove）
+	copy(r.counts[d:], r.counts[:])
+	for i := 0; i < d; i++ {
+		r.counts[i] = 0
+	}
+	r.anchor = nowHour
+}
+
+func (r *gwHourRing) sum(hours int) int64 {
+	var s int64
+	for i := 0; i < hours && i < gwWindowRingHours; i++ {
+		s += r.counts[i]
+	}
+	return s
+}
+
+// unlockAfter 估算触限窗口的最早解除时点。触限后 admit 不再记录命中（窗口
+// 冻结），把窗口内最老侧逐桶移出，求最小 k 使剩余计数 < limit——推进 k 个
+// 整点后（anchor+k）第 k 批最老桶恰好滑出，即解除边界。误差方向：若管理员
+// 中途上调限额，实际恢复早于估算（保守可接受）；环内其他窗口有余量时新请求
+// 会放行并记录，也会让实际恢复晚于估算（报短不报长——此后请求仍被拒，客户
+// 端按 429 重退避）。下限 1s 防止边界抖动报 0
+func (r *gwHourRing) unlockAfter(hours, limit int, nowHour int64, now time.Time) time.Duration {
+	total := r.sum(hours)
+	removed := int64(0)
+	k := 1
+	for ; k <= hours; k++ {
+		if idx := hours - k; idx >= 0 && idx < gwWindowRingHours {
+			removed += r.counts[idx]
+		}
+		if total-removed < int64(limit) {
+			break
+		}
+	}
+	if k > hours {
+		k = hours
+	}
+	d := time.Unix((nowHour+int64(k))*3600, 0).Sub(now)
+	if d < time.Second {
+		d = time.Second
+	}
+	return d
+}
+
+// admit 依次检查各窗口；全部放行时记录一次命中并返回 nil，否则返回首个触限
+// 窗口（不记录命中——被拒请求不计入窗口）。计数在认证时点发生：后续请求校验
+// 失败（400 等）不退还，与 RPM 同口径——只数"校验成功"会让畸形请求洪泛免费
+// 消耗上游算力
+func (t *gwWindowTracker) admit(id int64, specs []gwWindowSpec) *gwWindowRejection {
+	now := time.Now()
+	nowHour := now.Unix() / 3600
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.keys == nil {
+		t.keys = map[int64]*gwHourRing{}
+	}
+	// 陈旧环兜底（forget 漏网/直接改库删 Key 的场景）：anchor 落后整环时长的
+	// 环不可能再有窗口内命中，下次该 Key 回来时 advance 也会整环重置
+	if len(t.keys) >= 4096 {
+		for kid, kr := range t.keys {
+			if nowHour-kr.anchor >= gwWindowRingHours {
+				delete(t.keys, kid)
+			}
+		}
+	}
+	r := t.keys[id]
+	if r == nil {
+		r = &gwHourRing{}
+		t.keys[id] = r
+	}
+	r.advance(nowHour)
+	for _, sp := range specs {
+		if sp.limit > 0 && r.sum(sp.hours) >= int64(sp.limit) {
+			return &gwWindowRejection{window: sp.label, retryAfter: r.unlockAfter(sp.hours, sp.limit, nowHour, now)}
+		}
+	}
+	r.counts[0]++
+	return nil
 }

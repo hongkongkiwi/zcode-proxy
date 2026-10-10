@@ -28,6 +28,9 @@ func (s *APIServer) handleCreateKey(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		Name           string `json:"name"`
 		RPMLimit       int    `json:"rpm_limit"`
+		Rate5h         int    `json:"rate_5h"`
+		Rate1d         int    `json:"rate_1d"`
+		Rate7d         int    `json:"rate_7d"`
 		QuotaTotal     int64  `json:"quota_total"`
 		Models         string `json:"models"`
 		Enabled        *bool  `json:"enabled"`
@@ -75,6 +78,12 @@ func (s *APIServer) handleCreateKey(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, http.StatusBadRequest, "rpm_limit 取值范围 0-100000（0=不限）")
 		return
 	}
+	for field, v := range map[string]int{"rate_5h": body.Rate5h, "rate_1d": body.Rate1d, "rate_7d": body.Rate7d} {
+		if v < 0 || v > 10000000 {
+			writeAPIError(w, http.StatusBadRequest, field+" 取值范围 0-10000000（0=不限）")
+			return
+		}
+	}
 	if body.QuotaTotal < 0 {
 		writeAPIError(w, http.StatusBadRequest, "quota_total 不能为负")
 		return
@@ -90,6 +99,9 @@ func (s *APIServer) handleCreateKey(w http.ResponseWriter, r *http.Request) {
 		KeyPrefix:  plain[:10] + "…",
 		Enabled:    enabled,
 		RPMLimit:   body.RPMLimit,
+		Rate5h:     body.Rate5h,
+		Rate1d:     body.Rate1d,
+		Rate7d:     body.Rate7d,
 		QuotaTotal: body.QuotaTotal,
 		Models:     normalizeModelWhitelist(body.Models),
 		Key:        plain,
@@ -126,6 +138,9 @@ func (s *APIServer) handleUpdateKey(w http.ResponseWriter, r *http.Request) {
 		Name       *string `json:"name"`
 		Enabled    *bool   `json:"enabled"`
 		RPMLimit   *int    `json:"rpm_limit"`
+		Rate5h     *int    `json:"rate_5h"`
+		Rate1d     *int    `json:"rate_1d"`
+		Rate7d     *int    `json:"rate_7d"`
 		QuotaTotal *int64  `json:"quota_total"`
 		Models     *string `json:"models"`
 	}
@@ -162,6 +177,25 @@ func (s *APIServer) handleUpdateKey(w http.ResponseWriter, r *http.Request) {
 		}
 		rpm = *body.RPMLimit
 	}
+	rate5h, rate1d, rate7d := existing.Rate5h, existing.Rate1d, existing.Rate7d
+	for field, v := range map[string]*int{"rate_5h": body.Rate5h, "rate_1d": body.Rate1d, "rate_7d": body.Rate7d} {
+		if v == nil {
+			continue
+		}
+		if *v < 0 || *v > 10000000 {
+			writeAPIError(w, http.StatusBadRequest, field+" 取值范围 0-10000000（0=不限）")
+			return
+		}
+	}
+	if body.Rate5h != nil {
+		rate5h = *body.Rate5h
+	}
+	if body.Rate1d != nil {
+		rate1d = *body.Rate1d
+	}
+	if body.Rate7d != nil {
+		rate7d = *body.Rate7d
+	}
 	quota := existing.QuotaTotal
 	if body.QuotaTotal != nil {
 		if *body.QuotaTotal < 0 {
@@ -174,7 +208,7 @@ func (s *APIServer) handleUpdateKey(w http.ResponseWriter, r *http.Request) {
 	if body.Models != nil {
 		models = *body.Models
 	}
-	if err := s.db.UpdateGatewayKeyFields(id, name, enabled, rpm, quota, models); err != nil {
+	if err := s.db.UpdateGatewayKeyFields(id, name, enabled, rpm, rate5h, rate1d, rate7d, quota, models); err != nil {
 		writeAPIError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -201,6 +235,11 @@ func (s *APIServer) handleDeleteKey(w http.ResponseWriter, r *http.Request) {
 	if err := s.db.DeleteGatewayKey(id); err != nil {
 		writeAPIError(w, http.StatusInternalServerError, err.Error())
 		return
+	}
+	// 窗口计数环与 Key 生命周期同步：不清理的话 create→use→delete 循环
+	// 在进程内慢性累积陈旧环
+	if s.auth != nil {
+		s.auth.gwWindows.forget(id)
 	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{"success": true})
 }
