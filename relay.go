@@ -31,19 +31,34 @@ const (
 )
 
 // modelNameMap 上游模型名大小写敏感，客户端小写别名 → 官方名
+// （全表对齐 zai-org/ZCode official-glm-selection 迁移 SQL 的官方大小写）
 var modelNameMap = map[string]string{
 	"glm-5.3":       "GLM-5.3",
 	"glm-5.3-flash": "GLM-5.3-Flash",
+	"glm-5v-turbo":  "GLM-5V-Turbo",
 	"glm-5.2":       "GLM-5.2",
+	"glm-5.1":       "GLM-5.1",
+	"glm-5":         "GLM-5",
 	"glm-5-turbo":   "GLM-5-Turbo",
 	"glm-turbo":     "GLM-5-Turbo",
-	"glm-5.1":       "GLM-5.1",
 	"glm-4.7":       "GLM-4.7",
 	"glm-4.6":       "GLM-4.6",
 	"glm-4.5":       "GLM-4.5",
 	"glm-4.5-air":   "GLM-4.5-Air",
 	"glm-4.5v":      "GLM-4.5V",
 	"glm-4.5-flash": "GLM-4.5-Flash",
+	// 客户端历史选型迁移表中的旧代模型（大小写归一用，上游不返回则照常报错）
+	"glm-5.1-highspeed":        "GLM-5.1-Highspeed",
+	"glm-4.7-flash":            "GLM-4.7-Flash",
+	"glm-4.7-flashx":           "GLM-4.7-FlashX",
+	"glm-4.6v":                 "GLM-4.6V",
+	"glm-4.6v-flash":           "GLM-4.6V-Flash",
+	"glm-4.6v-flashx":          "GLM-4.6V-FlashX",
+	"glm-4.1v-thinking-flash":  "GLM-4.1V-Thinking-Flash",
+	"glm-4.1v-thinking-flashx": "GLM-4.1V-Thinking-FlashX",
+	"glm-4-flash-250414":       "GLM-4-Flash-250414",
+	"glm-4-flashx-250414":      "GLM-4-FlashX-250414",
+	"glm-4v-flash":             "GLM-4V-Flash",
 }
 
 // relayOutcome 单次转发结果
@@ -976,6 +991,10 @@ func (z *ZCodeAPI) buildUpstreamRequest(a *Account, verifyParam, region string, 
 		"accept-language": true, "cache-control": true, "anthropic-beta": true,
 		"anthropic-dangerous-direct-browser-access": true, "traceparent": true,
 		"tracestate": true, "x-client-request-id": true,
+		// 3.15.1 闲时 PAT 鉴权与高速卡通道身份头（客户端可能随模型请求携带）
+		"x-coding-plan-api-key": true,
+		"x-highspeed-card-id":   true, "x-bigmodel-authorization": true,
+		"bigmodel-target-type": true, "bigmodel-organization": true, "bigmodel-project": true,
 	}
 	for k, vals := range r.Header {
 		lk := strings.ToLower(k)

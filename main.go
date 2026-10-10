@@ -377,6 +377,9 @@ func (wt *writeTracker) Flush() {
 // 的请求被改写为 {ZCODE_BASE_URL}/api/v1/ultra[|-zai]/anthropic/v1/messages。
 // 3.14.4 起改写目标由服务端 agent/configs 路由表下发（客户端不再内联字面量），
 // 故用子树模式覆盖查询串/尾斜杠/count_tokens 等变体，而非仅精确路径。
+// /api/v1/highspeed/... 是 3.15.1 起新增的高速卡通道改写形状（zcode-builtin.json
+// 高速卡 provider baseUrl = {origin}/api/v1/highspeed/anthropic），同样子树别名到
+// HandleMessages；高速卡专属 header（x-highspeed-card-id 等）由 relay 白名单透传。
 // 别名到 HandleMessages：认证走同一 API Key 中间件（auth.go 对 /api/v1/ultra
 // 前缀同样拦截），上游凭证由账号池注入，客户端自带计划凭证仅作本地认证。
 func registerModelRoutes(mux *http.ServeMux, zapi *ZCodeAPI) {
@@ -391,4 +394,5 @@ func registerModelRoutes(mux *http.ServeMux, zapi *ZCodeAPI) {
 	mux.HandleFunc("/async/v1/messages", zapi.HandleAsyncMessages)
 	mux.HandleFunc("/api/v1/ultra/", zapi.HandleMessages)
 	mux.HandleFunc("/api/v1/ultra-zai/", zapi.HandleMessages)
+	mux.HandleFunc("/api/v1/highspeed/", zapi.HandleMessages)
 }
