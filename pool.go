@@ -693,8 +693,7 @@ func isRateLimitBody(status int, text string) bool {
 	if status == 429 {
 		return true
 	}
-	if strings.Contains(text, `"code":1302`) || strings.Contains(text, `"code": 1302`) ||
-		strings.Contains(text, `"code":1303`) || strings.Contains(text, `"code": 1303`) {
+	if hasBizCode(text, "1302") || hasBizCode(text, "1303") {
 		return true
 	}
 	low := strings.ToLower(text)

@@ -670,6 +670,8 @@ func TestGatewayAliasRouting(t *testing.T) {
 	for _, path := range []string{
 		"/api/v1/ultra/anthropic/v1/messages",
 		"/api/v1/ultra-zai/anthropic/v1/messages",
+		"/api/v1/highspeed/anthropic/v1/messages",
+		"/api/v1/zcode-plan/anthropic/v1/messages",
 	} {
 		t.Run(path, func(t *testing.T) {
 			// 无凭证：必须 401（别名路径不得成为未认证模型端点）
@@ -1054,7 +1056,10 @@ func TestUpstreamErrorEnvelopeInjected(t *testing.T) {
 		io.WriteString(w, `{"type":"error","error":{"type":"invalid_request_error","message":"native"}}`)
 	}))
 	defer srv2.Close()
-	resp2, _ := http.Get(srv2.URL)
+	resp2, errGet := http.Get(srv2.URL)
+	if errGet != nil {
+		t.Fatalf("GET srv2: %v", errGet)
+	}
 	defer resp2.Body.Close()
 	w2 := httptest.NewRecorder()
 	writeUpstreamErrorForProto(w2, resp2, `{"type":"error","error":{"type":"invalid_request_error","message":"native"}}`, protocolAnthropic)
@@ -1076,6 +1081,9 @@ func TestGatewayAliasSubtreeVariants(t *testing.T) {
 		"/api/v1/ultra-zai/anthropic/v1/messages",
 		"/api/v1/ultra-zai/anthropic/v1/messages/count_tokens",
 		"/api/v1/ultra/anthropic/v1/messages/",
+		"/api/v1/highspeed/anthropic/v1/messages",
+		"/api/v1/highspeed/anthropic/v1/messages/count_tokens",
+		"/api/v1/zcode-plan/anthropic/v1/messages",
 	} {
 		w := httptest.NewRecorder()
 		mux.ServeHTTP(w, httptest.NewRequest(http.MethodPost, path, strings.NewReader(`{"model":"GLM-5.3","messages":"x"}`)))

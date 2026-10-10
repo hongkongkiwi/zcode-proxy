@@ -31,19 +31,34 @@ const (
 )
 
 // modelNameMap 上游模型名大小写敏感，客户端小写别名 → 官方名
+// （全表对齐 zai-org/ZCode official-glm-selection 迁移 SQL 的官方大小写）
 var modelNameMap = map[string]string{
 	"glm-5.3":       "GLM-5.3",
 	"glm-5.3-flash": "GLM-5.3-Flash",
+	"glm-5v-turbo":  "GLM-5V-Turbo",
 	"glm-5.2":       "GLM-5.2",
+	"glm-5.1":       "GLM-5.1",
+	"glm-5":         "GLM-5",
 	"glm-5-turbo":   "GLM-5-Turbo",
 	"glm-turbo":     "GLM-5-Turbo",
-	"glm-5.1":       "GLM-5.1",
 	"glm-4.7":       "GLM-4.7",
 	"glm-4.6":       "GLM-4.6",
 	"glm-4.5":       "GLM-4.5",
 	"glm-4.5-air":   "GLM-4.5-Air",
 	"glm-4.5v":      "GLM-4.5V",
 	"glm-4.5-flash": "GLM-4.5-Flash",
+	// 客户端历史选型迁移表中的旧代模型（大小写归一用，上游不返回则照常报错）
+	"glm-5.1-highspeed":        "GLM-5.1-Highspeed",
+	"glm-4.7-flash":            "GLM-4.7-Flash",
+	"glm-4.7-flashx":           "GLM-4.7-FlashX",
+	"glm-4.6v":                 "GLM-4.6V",
+	"glm-4.6v-flash":           "GLM-4.6V-Flash",
+	"glm-4.6v-flashx":          "GLM-4.6V-FlashX",
+	"glm-4.1v-thinking-flash":  "GLM-4.1V-Thinking-Flash",
+	"glm-4.1v-thinking-flashx": "GLM-4.1V-Thinking-FlashX",
+	"glm-4-flash-250414":       "GLM-4-Flash-250414",
+	"glm-4-flashx-250414":      "GLM-4-FlashX-250414",
+	"glm-4v-flash":             "GLM-4V-Flash",
 }
 
 // relayOutcome 单次转发结果
@@ -971,11 +986,20 @@ func (z *ZCodeAPI) buildUpstreamRequest(a *Account, verifyParam, region string, 
 		}
 	}
 
-	// 白名单透传客户端 header
+	// 白名单透传客户端 header。
+	// 凭证类 header 一律不透传：x-coding-plan-api-key 与 x-bigmodel-authorization 都是
+	// 客户端自己的项目令牌 / coding-plan 凭证（官方客户端 off-peak 模式把前者当首选
+	// apiKey 用，后者即其 reserved-auth 里的 codingPlanAuthorization）——透传会被上游
+	// 优先识别，用量记到客户端账号，被拒时还会误判到池账号头上。上游鉴权只认本代理
+	// 注入的池凭证。x-zcode-query-source（出现源标注，非凭证）与高速卡通道的
+	// 目标/卡片元数据仍透传。
 	forwardSet := map[string]bool{
 		"accept-language": true, "cache-control": true, "anthropic-beta": true,
 		"anthropic-dangerous-direct-browser-access": true, "traceparent": true,
 		"tracestate": true, "x-client-request-id": true,
+		"x-zcode-query-source": true,
+		"x-highspeed-card-id":  true,
+		"bigmodel-target-type": true, "bigmodel-organization": true, "bigmodel-project": true,
 	}
 	for k, vals := range r.Header {
 		lk := strings.ToLower(k)
@@ -1028,12 +1052,36 @@ func isCloudflareChallenge(header http.Header, text string) bool {
 func isCaptchaError(text string) bool {
 	low := strings.ToLower(text)
 	for _, m := range []string{"captcha", "verify token", "verify failed", "verifycode", "human verification",
-		"人机验证", "请完成验证", "安全验证"} {
+		"人机验证", "请完成验证", "安全验证", "安全校验"} {
 		if strings.Contains(low, m) {
 			return true
 		}
 	}
-	return false
+	// 3007 = zcode-plan 安全校验拒绝（官方客户端归 AuthFailed+AuthRefresh，重试一次后
+	// 降级）：与 3012 同族的安全/校验类拒绝，绝不能落进 401/403 凭证分支误杀账号
+	return hasBizCode(low, "3007")
+}
+
+// hasBizCode 精确匹配 JSON 业务码：`"code":` 后允许空格，码后必须是非数字边界
+// （纯 Contains 会把 "code":3007 误中 "code":30071 这类更长码）
+func hasBizCode(text, code string) bool {
+	const needle = `"code":`
+	for i := 0; ; {
+		j := strings.Index(text[i:], needle)
+		if j < 0 {
+			return false
+		}
+		k := i + j + len(needle)
+		for k < len(text) && text[k] == ' ' {
+			k++
+		}
+		if strings.HasPrefix(text[k:], code) {
+			if end := k + len(code); end >= len(text) || text[end] < '0' || text[end] > '9' {
+				return true
+			}
+		}
+		i = k
+	}
 }
 
 func isExhaustedError(statusCode int, text string) bool {
@@ -1055,7 +1103,7 @@ func isExhaustedError(statusCode int, text string) bool {
 // isRiskBlocked 风控拦截识别（code 3012 / unusual activity）：账号级临时封禁，冷却处理
 func isRiskBlocked(text string) bool {
 	low := strings.ToLower(text)
-	return strings.Contains(low, "unusual activity") || strings.Contains(low, `"code":3012`)
+	return strings.Contains(low, "unusual activity") || hasBizCode(low, "3012")
 }
 
 // ---- 请求体处理 ----
