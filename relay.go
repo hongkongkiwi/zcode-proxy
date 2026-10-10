@@ -991,8 +991,10 @@ func (z *ZCodeAPI) buildUpstreamRequest(a *Account, verifyParam, region string, 
 		"accept-language": true, "cache-control": true, "anthropic-beta": true,
 		"anthropic-dangerous-direct-browser-access": true, "traceparent": true,
 		"tracestate": true, "x-client-request-id": true,
-		// 3.15.1 闲时 PAT 鉴权与高速卡通道身份头（客户端可能随模型请求携带）
+		// 3.15.1 闲时 PAT 鉴权与高速卡通道身份头（客户端可能随模型请求携带）；
+		// x-zcode-query-source 为 3.15.1 起客户端按请求用途自带的出现源标注
 		"x-coding-plan-api-key": true,
+		"x-zcode-query-source":  true,
 		"x-highspeed-card-id":   true, "x-bigmodel-authorization": true,
 		"bigmodel-target-type": true, "bigmodel-organization": true, "bigmodel-project": true,
 	}
@@ -1047,12 +1049,36 @@ func isCloudflareChallenge(header http.Header, text string) bool {
 func isCaptchaError(text string) bool {
 	low := strings.ToLower(text)
 	for _, m := range []string{"captcha", "verify token", "verify failed", "verifycode", "human verification",
-		"人机验证", "请完成验证", "安全验证"} {
+		"人机验证", "请完成验证", "安全验证", "安全校验"} {
 		if strings.Contains(low, m) {
 			return true
 		}
 	}
-	return false
+	// 3007 = zcode-plan 安全校验拒绝（官方客户端归 AuthFailed+AuthRefresh，重试一次后
+	// 降级）：与 3012 同族的安全/校验类拒绝，绝不能落进 401/403 凭证分支误杀账号
+	return hasBizCode(low, "3007")
+}
+
+// hasBizCode 精确匹配 JSON 业务码：`"code":` 后允许空格，码后必须是非数字边界
+// （纯 Contains 会把 "code":3007 误中 "code":30071 这类更长码）
+func hasBizCode(text, code string) bool {
+	const needle = `"code":`
+	for i := 0; ; {
+		j := strings.Index(text[i:], needle)
+		if j < 0 {
+			return false
+		}
+		k := i + j + len(needle)
+		for k < len(text) && text[k] == ' ' {
+			k++
+		}
+		if strings.HasPrefix(text[k:], code) {
+			if end := k + len(code); end >= len(text) || text[end] < '0' || text[end] > '9' {
+				return true
+			}
+		}
+		i = k
+	}
 }
 
 func isExhaustedError(statusCode int, text string) bool {
@@ -1074,7 +1100,7 @@ func isExhaustedError(statusCode int, text string) bool {
 // isRiskBlocked 风控拦截识别（code 3012 / unusual activity）：账号级临时封禁，冷却处理
 func isRiskBlocked(text string) bool {
 	low := strings.ToLower(text)
-	return strings.Contains(low, "unusual activity") || strings.Contains(low, `"code":3012`)
+	return strings.Contains(low, "unusual activity") || hasBizCode(low, "3012")
 }
 
 // ---- 请求体处理 ----

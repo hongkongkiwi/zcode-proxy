@@ -671,6 +671,7 @@ func TestGatewayAliasRouting(t *testing.T) {
 		"/api/v1/ultra/anthropic/v1/messages",
 		"/api/v1/ultra-zai/anthropic/v1/messages",
 		"/api/v1/highspeed/anthropic/v1/messages",
+		"/api/v1/zcode-plan/anthropic/v1/messages",
 	} {
 		t.Run(path, func(t *testing.T) {
 			// 无凭证：必须 401（别名路径不得成为未认证模型端点）
@@ -1082,6 +1083,7 @@ func TestGatewayAliasSubtreeVariants(t *testing.T) {
 		"/api/v1/ultra/anthropic/v1/messages/",
 		"/api/v1/highspeed/anthropic/v1/messages",
 		"/api/v1/highspeed/anthropic/v1/messages/count_tokens",
+		"/api/v1/zcode-plan/anthropic/v1/messages",
 	} {
 		w := httptest.NewRecorder()
 		mux.ServeHTTP(w, httptest.NewRequest(http.MethodPost, path, strings.NewReader(`{"model":"GLM-5.3","messages":"x"}`)))

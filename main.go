@@ -395,4 +395,8 @@ func registerModelRoutes(mux *http.ServeMux, zapi *ZCodeAPI) {
 	mux.HandleFunc("/api/v1/ultra/", zapi.HandleMessages)
 	mux.HandleFunc("/api/v1/ultra-zai/", zapi.HandleMessages)
 	mux.HandleFunc("/api/v1/highspeed/", zapi.HandleMessages)
+	// /api/v1/zcode-plan/anthropic 是 zcodePlanAnthropicBaseUrl 的直连形状：
+	// start-plan provider 的 baseUrl 直接 = {origin}/api/v1/zcode-plan/anthropic
+	// （也是本代理 DefaultUpstream 的形状），客户端指向本代理时原样打到该路径
+	mux.HandleFunc("/api/v1/zcode-plan/anthropic/", zapi.HandleMessages)
 }

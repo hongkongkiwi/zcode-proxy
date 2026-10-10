@@ -40,6 +40,10 @@ func TestIsCaptchaError(t *testing.T) {
 		{`{"msg":"HUMAN VERIFICATION NEEDED"}`, true},
 		{"请完成人机验证后重试", true},
 		{"安全验证失败", true},
+		{`{"code":3007,"msg":"安全校验失败"}`, true},
+		{`{"code": 3007}`, true},
+		{`{"code":30071}`, false},
+		{`{"code":30071,"msg":"安全校验失败"}`, true},
 		{`{"msg":"quota exhausted"}`, false},
 		{"", false},
 	}
