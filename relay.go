@@ -986,16 +986,19 @@ func (z *ZCodeAPI) buildUpstreamRequest(a *Account, verifyParam, region string, 
 		}
 	}
 
-	// 白名单透传客户端 header
+	// 白名单透传客户端 header。
+	// 凭证类 header 一律不透传：x-coding-plan-api-key 与 x-bigmodel-authorization 都是
+	// 客户端自己的项目令牌 / coding-plan 凭证（官方客户端 off-peak 模式把前者当首选
+	// apiKey 用，后者即其 reserved-auth 里的 codingPlanAuthorization）——透传会被上游
+	// 优先识别，用量记到客户端账号，被拒时还会误判到池账号头上。上游鉴权只认本代理
+	// 注入的池凭证。x-zcode-query-source（出现源标注，非凭证）与高速卡通道的
+	// 目标/卡片元数据仍透传。
 	forwardSet := map[string]bool{
 		"accept-language": true, "cache-control": true, "anthropic-beta": true,
 		"anthropic-dangerous-direct-browser-access": true, "traceparent": true,
 		"tracestate": true, "x-client-request-id": true,
-		// 3.15.1 闲时 PAT 鉴权与高速卡通道身份头（客户端可能随模型请求携带）；
-		// x-zcode-query-source 为 3.15.1 起客户端按请求用途自带的出现源标注
-		"x-coding-plan-api-key": true,
-		"x-zcode-query-source":  true,
-		"x-highspeed-card-id":   true, "x-bigmodel-authorization": true,
+		"x-zcode-query-source": true,
+		"x-highspeed-card-id":  true,
 		"bigmodel-target-type": true, "bigmodel-organization": true, "bigmodel-project": true,
 	}
 	for k, vals := range r.Header {
